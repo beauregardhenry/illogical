@@ -53,17 +53,26 @@ control-deploy: static
     cp {{target_dir}}/x86_64-unknown-linux-musl/release/illogical-control {{target_dir}}/x86_64-unknown-linux-musl/release/illogicald packaging/control/Dockerfile packaging/control/fly.toml "$ctx"/
     cd "$ctx" && fly deploy --local-only --ha=false
 
+# The macOS daemon and CLI for Intel Macs, cross-compiled on Apple silicon
+# (or built natively on an Intel Mac): target/x86_64-apple-darwin/release/.
+# Then `just dist` and `just desktop x86_64`.
+build-macos-x86_64: web
+    rustup target add x86_64-apple-darwin >/dev/null
+    {{cargo}} build --release --target x86_64-apple-darwin -p illogicald -p illogical
+
 # Release tarballs in dist/: illogical-VERSION-TARGET.tar.gz with both
 # binaries and the licenses, for the targets already built (`just static`,
-# `just static aarch64`, `just build` on a Mac).
+# `just static aarch64`, `just build` and `just build-macos-x86_64` on a Mac).
 dist:
     #!/usr/bin/env bash
     set -euo pipefail
     v=$({{cargo}} pkgid -p illogicald | sed 's/.*[#@]//')
+    host=$(rustc -vV | sed -n 's/^host: //p')
     mkdir -p dist
-    for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin; do
+    for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin; do
       d={{target_dir}}/$t/release
-      if [ "$t" = aarch64-apple-darwin ] && [ "$(uname -s)" = Darwin ]; then d={{target_dir}}/release; fi
+      # The Mac's own architecture builds without --target (`just build`).
+      if [ "$t" = "$host" ] && [ -x {{target_dir}}/release/illogicald ]; then d={{target_dir}}/release; fi
       [ -x "$d/illogicald" ] || continue
       n=illogical-$v-$t; s=$(mktemp -d)/$n; mkdir -p "$s"
       cp "$d/illogicald" "$d/illogical" LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md README.md "$s/"
@@ -74,23 +83,42 @@ dist:
 
 # The desktop app (crates/desktop, M46), carrying this build's illogicald
 # and illogical: run after `just static x86_64` (Linux; the static binaries
-# run anywhere) or `just build` (macOS). Writes dist/illogical-desktop-*,
-# named without the version so the site's download links always find the
-# latest release.
-desktop:
+# run anywhere) or `just build` (macOS). On a Mac, `just desktop x86_64`
+# after `just build-macos-x86_64` makes the Intel app. Writes
+# dist/illogical-desktop-*, named without the version so the site's download
+# links always find the latest release.
+desktop arch="":
     #!/usr/bin/env bash
     set -euo pipefail
     command -v cargo-tauri >/dev/null || cargo install tauri-cli --version "^2" --locked
-    case "$(uname -s)" in
-      Linux) src={{target_dir}}/x86_64-unknown-linux-musl/release; bundles=deb,appimage ;;
-      Darwin) src={{target_dir}}/release; bundles=app ;;
-    esac
     cd crates/desktop
     host=$(rustc -vV | sed -n 's/^host: //p')
+    out=${CARGO_TARGET_DIR:-$PWD/target}
+    flags=()
+    case "$(uname -s)" in
+      Linux)
+        [ -z "{{arch}}" ] || { echo "the Linux app is x86_64 only" >&2; exit 1; }
+        t=$host; src={{target_dir}}/x86_64-unknown-linux-musl/release; bundles=deb,appimage; out=$out/release ;;
+      Darwin)
+        a="{{arch}}"; t=${a:-${host%%-*}}-apple-darwin
+        case "$t" in
+          aarch64-apple-darwin) name=macos-arm64 ;;
+          x86_64-apple-darwin) name=macos-x86_64 ;;
+          *) echo "no macOS app for $t" >&2; exit 1 ;;
+        esac
+        src={{target_dir}}/$t/release
+        if [ "$t" = "$host" ] && [ -x {{target_dir}}/release/illogicald ]; then src={{target_dir}}/release; fi
+        bundles=app
+        if [ "$t" = "$host" ]; then out=$out/release; else
+          rustup target add "$t" >/dev/null
+          flags=(--target "$t"); out=$out/$t/release
+        fi ;;
+    esac
     mkdir -p binaries
-    for b in illogicald illogical; do install -m 755 "$src/$b" "binaries/$b-$host"; done
-    cargo tauri build --bundles "$bundles"
-    out=${CARGO_TARGET_DIR:-$PWD/target}/release/bundle
+    for b in illogicald illogical; do install -m 755 "$src/$b" "binaries/$b-$t"; done
+    # ${flags[@]+…}: macOS bash 3.2 calls an empty array unbound.
+    cargo tauri build --bundles "$bundles" ${flags[@]+"${flags[@]}"}
+    out=$out/bundle
     dist={{justfile_directory()}}/dist
     mkdir -p "$dist"
     # This version's bundles: a kept target dir (CI) holds older ones too.
@@ -101,8 +129,8 @@ desktop:
         cp "$out/appimage/illogical_${v}_amd64.AppImage" "$dist/illogical-desktop-linux-x86_64.AppImage" ;;
       Darwin)
         # A zip of the app: ditto keeps its signature and symlinks.
-        rm -f "$dist/illogical-desktop-macos-arm64.zip"
-        ditto -c -k --keepParent "$out/macos/illogical.app" "$dist/illogical-desktop-macos-arm64.zip" ;;
+        rm -f "$dist/illogical-desktop-$name.zip"
+        ditto -c -k --keepParent "$out/macos/illogical.app" "$dist/illogical-desktop-$name.zip" ;;
     esac
     ls -la "$dist"/illogical-desktop-*
 
@@ -191,12 +219,13 @@ check: test
     {{cargo}} fmt --all --check
     {{cargo}} clippy --workspace --all-targets -- -D warnings
 
-# Type-check and lint the macOS (Apple silicon) build from Linux. Zig is the
-# C compiler; this compiles but doesn't link, so build and test on a Mac too.
-check-macos:
-    rustup target add aarch64-apple-darwin >/dev/null
-    CC_aarch64_apple_darwin="$PWD/scripts/zig-cc-macos" AR_aarch64_apple_darwin="$PWD/scripts/zig-ar" \
-      {{cargo}} clippy --target aarch64-apple-darwin --workspace --all-targets -- -D warnings
+# Type-check and lint the macOS build from Linux: ARCH is aarch64 (Apple
+# silicon) or x86_64 (Intel). Zig is the C compiler; this compiles but
+# doesn't link, so build and test on a Mac too.
+check-macos arch="aarch64":
+    rustup target add {{arch}}-apple-darwin >/dev/null
+    ZIG_MACOS_ARCH={{arch}} CC_{{arch}}_apple_darwin="$PWD/scripts/zig-cc-macos" AR_{{arch}}_apple_darwin="$PWD/scripts/zig-ar" \
+      {{cargo}} clippy --target {{arch}}-apple-darwin --workspace --all-targets -- -D warnings
 
 # Run the daemon the way it runs for real (port 7681, behind `tailscale serve`).
 run *args: build
