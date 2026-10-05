@@ -277,12 +277,15 @@ fn a_quiet_agent_doesnt_want_you_its_screen_says_when_it_does() {
     let deadline = Instant::now() + Duration::from_secs(10);
     // (The shell has handed the terminal over: the only other program here
     // is the stand-in.)
+    // (409 until the pane's shell is up.)
+    let process = || d.raw("GET", "/api/panes/1/process", None);
     let running = || {
-        let p = d.get("/api/panes/1/process");
-        p["foreground"] != p["pid"]
+        let (status, body) = process();
+        let p: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        status == 200 && p["foreground"] != p["pid"]
     };
     while !running() {
-        assert!(Instant::now() < deadline, "{}", d.get("/api/panes/1/process"));
+        assert!(Instant::now() < deadline, "{:?}", process());
         std::thread::sleep(Duration::from_millis(50));
     }
     // It prints a line, then goes quiet: that's not "needs you".
