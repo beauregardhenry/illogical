@@ -77,7 +77,12 @@ pub fn handle(app: &AppHandle, url: String) {
             },
         };
         let a = app.clone();
+        #[cfg(not(windows))]
         let _ = app.run_on_main_thread(move || crate::open_pane(&a, pane));
+        // No local daemon on Windows (M54), so no pane of its to open: the
+        // app, shown, as for a link it can't follow.
+        #[cfg(windows)]
+        let _ = (pane, app.run_on_main_thread(move || crate::focus_or_open(&a)));
     });
 }
 
