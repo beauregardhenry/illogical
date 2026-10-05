@@ -272,6 +272,19 @@ fn a_quiet_agent_doesnt_want_you_its_screen_says_when_it_does() {
         }
     };
     d.send(1, &fake_claude(&d));
+    // Running before it's typed to: a line typed while the shell still has
+    // the terminal in raw mode keeps its \r, and `read` never sees it end.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // (The shell has handed the terminal over: the only other program here
+    // is the stand-in.)
+    let running = || {
+        let p = d.get("/api/panes/1/process");
+        p["foreground"] != p["pid"]
+    };
+    while !running() {
+        assert!(Instant::now() < deadline, "{}", d.get("/api/panes/1/process"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // It prints a line, then goes quiet: that's not "needs you".
     d.send(1, "hello");
     never_needs(4);
