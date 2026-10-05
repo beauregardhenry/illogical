@@ -49,7 +49,13 @@ tests use a stand-in chant). `just screenshots` regenerates the images in
 3. `install.sh` picks up the latest release by itself. If the page
    changed, `just site-deploy` publishes it (wrangler's login on geek).
 
-CI runs on two self-hosted GitHub Actions runners in the arugula-salad
+In this repo (beauregardhenry/illogical), `check.yml` runs on GitHub's
+hosted runners instead: Ubuntu, and macOS on both Apple silicon and Intel
+(`macos-15-intel`, Sequoia). `.github/actions/tools` installs what the
+self-hosted machines already had. `release.yml` still names the
+self-hosted runners below, so a tag doesn't release from here.
+
+Upstream, CI runs on two self-hosted GitHub Actions runners in the arugula-salad
 org's `illogical` runner group, which only this repo may use: geek
 (`linux-x86_64`, a systemd user service,
 `~/.config/systemd/user/actions-runner-illogical.service`, runner in

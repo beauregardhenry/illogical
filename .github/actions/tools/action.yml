@@ -1,0 +1,29 @@
+# The tools CI needs on a fresh GitHub-hosted runner: the Rust toolchain
+# pinned in rust-toolchain.toml, mise (it brings the Zig libghostty needs,
+# from .mise.toml), just, Node and pnpm. Then cargo's build cache.
+name: tools
+description: Rust, mise, just, Node and pnpm for illogical's CI
+runs:
+  using: composite
+  steps:
+    - name: Rust (rust-toolchain.toml's)
+      shell: bash
+      run: |
+        command -v rustup >/dev/null || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none; echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
+        export PATH="$HOME/.cargo/bin:$PATH"
+        rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal -c rustfmt,clippy
+    - name: mise
+      shell: bash
+      run: |
+        curl -fsSL https://mise.run | sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: just
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+    - uses: pnpm/action-setup@v4
+      with:
+        version: 10
+    - uses: Swatinem/rust-cache@v2
