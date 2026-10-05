@@ -278,6 +278,14 @@ fn a_quiet_agent_doesnt_want_you_its_screen_says_when_it_does() {
     // A long think: its screen says it's working, however quiet it is.
     d.send(1, "work");
     until("working");
+    // As below: typing says "working" at once, and the screen must have
+    // read as working too before the quiet spell (a busy machine can take
+    // a while to look), or the typing wears off first.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.get("/api/panes/1/detection")["shown"] != "working" {
+        assert!(Instant::now() < deadline, "{}", d.get("/api/panes/1/detection"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
     never_needs(4);
     assert_eq!(attention(), "working");
     // A permission prompt wants you, and says for what.
