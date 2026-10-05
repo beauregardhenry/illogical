@@ -45,6 +45,9 @@ jobs:
       # The box's binaries, for the ssh tests in `just check` and the
       # control profile.
       - run: just static
+      # Before `just check`: reboot.rs drives Chromium.
+      - name: Playwright's browsers
+        run: just browsers
       - run: just check
       - name: The testnet's control profile (M52 end to end)
         run: just testnet down && just testnet up control && just testnet test control && just testnet break control
@@ -66,8 +69,6 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo --entrypoint sh ghcr.io/gitleaks/gitleaks:latest \
             -c 'git config --global --add safe.directory /repo && gitleaks git --no-banner --redact .'
-      - name: Playwright's browsers
-        run: just browsers
       # team-swarm-phones' variant across networks runs a box in a container
       # behind tc netem, with just static's illogicald (built above).
       - name: The Playwright specs, in Chromium and WebKit
