@@ -108,7 +108,7 @@ async function person(browser: Browser, login: string, opts: BrowserContextOptio
 async function machine(owner: Page, name: string, team?: string): Promise<string> {
   const state = temp(name);
   const args = ["join", base, "--name", name, "--state-dir", state, ...(team ? ["--team", team] : [])];
-  const joining = spawn("../target/debug/illogicald", args, { stdio: ["ignore", "pipe", "ignore"] });
+  const joining = spawn("../target/debug/illogicald", args, { stdio: ["pipe", "pipe", "ignore"] });
   procs.push(joining);
   const link = await new Promise<string>((res) => {
     let out = "";
@@ -120,7 +120,10 @@ async function machine(owner: Page, name: string, team?: string): Promise<string
   });
   const exited = new Promise<number | null>((r) => joining.on("exit", r));
   await owner.goto(link);
+  // The machine asks whether the account is the one this browser shows.
+  const account = await owner.locator("[data-join-account]").getAttribute("data-join-account");
   await owner.locator("[data-approve-join]").click();
+  joining.stdin!.end(`${account}\n`);
   expect(await exited).toBe(0);
   procs.push(
     spawn(
@@ -307,14 +310,18 @@ test("a notification's Allow answers over the service worker's own channel", asy
   await expect.poll(() => askOf(sam, pane), { timeout: 15_000 }).toMatchObject({ kind: "permission", id: "toolu_push" });
   // Close the app's card view on this page so the answer can only come from
   // the worker: deliver the push the daemon would send, and press Allow.
+  // This page's registration: listen before enabling (enable reports the
+  // registrations at once), and take the one for control's scope, not the
+  // first in a list that can hold others.
   const cdp = await ctx.newCDPSession(sam);
-  await cdp.send("ServiceWorker.enable");
-  const registrationId = await new Promise<string>((resolve) => {
+  const registered = new Promise<string>((resolve) => {
     cdp.on("ServiceWorker.workerRegistrationUpdated", (e) => {
-      const r = e.registrations.find((x) => !x.isDeleted);
+      const r = e.registrations.find((x) => !x.isDeleted && x.scopeURL === `${base}/`);
       if (r) resolve(r.registrationId);
     });
   });
+  await cdp.send("ServiceWorker.enable");
+  const registrationId = await registered;
   const payload = {
     title: "Needs you",
     body: "Bash: cargo publish --dry-run",

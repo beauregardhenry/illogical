@@ -1,6 +1,10 @@
-# Every push: `just check` on Linux, build and test on macOS (Apple silicon
-# and Intel), on GitHub's hosted runners. Each run starts clean but for
-# cargo's cache (.github/actions/tools).
+# Every push, on GitHub's hosted runners: the testnet's claims, `just check`
+# and the Playwright specs (Chromium and WebKit) on Linux; build, test and
+# the WebKit specs on macOS (Apple silicon and Intel). The testnet
+# (testnet/README.md) and the ssh tests in `just test` need Docker, which
+# only the Linux runner has: the macOS jobs skip them, loudly
+# (ILLOGICAL_SKIP_DOCKER), and Linux runs them. Each run starts clean but
+# for cargo's cache (.github/actions/tools).
 name: check
 on:
   push:
@@ -34,21 +38,46 @@ jobs:
         with:
           tool: cargo-about
       - run: just bootstrap
+      # The testnet's claims on fresh boxes, then each under BREAK=1, where
+      # it must fail.
+      - name: The testnet's ssh profile
+        run: just testnet down && just testnet up ssh && just testnet test ssh && just testnet break ssh
+      # The box's binaries, for the ssh tests in `just check` and the
+      # control profile.
+      - run: just static
       - run: just check
+      - name: The testnet's control profile (M52 end to end)
+        run: just testnet down && just testnet up control && just testnet test control && just testnet break control
+        env:
+          ILLOGICAL_TESTNET_BINARIES: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release
       - run: just check-macos
       - run: just check-macos x86_64
       - name: The desktop app
         run: just desktop-check
-      - name: install.sh
-        run: shellcheck -s sh scripts/install.sh && shellcheck -s bash scripts/tests/*.sh
+      - name: install.sh and the release's glibc check
+        run: shellcheck -s sh scripts/install.sh scripts/glibc-floor && shellcheck -s bash scripts/tests/*.sh
       - name: Release scripts and ratchets
         run: just test-scripts
+      - name: The test stack's scripts
+        run: shellcheck -x testnet/*.sh testnet/forges/*.sh testnet/hosts/*.sh testnet/editors/*.sh && shellcheck -s sh testnet/editors/box/entrypoint.sh testnet/sshd/entrypoint.sh testnet/sshd-systemd/keys.sh testnet/git/entrypoint.sh testnet/tailnet/entrypoint.sh
       - name: THIRD_PARTY.md is current
         run: just notices && git diff --exit-code THIRD_PARTY.md crates/desktop/THIRD_PARTY.md
       - name: No secrets
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo --entrypoint sh ghcr.io/gitleaks/gitleaks:latest \
             -c 'git config --global --add safe.directory /repo && gitleaks git --no-banner --redact .'
+      - name: Playwright's browsers
+        run: just browsers
+      # team-swarm-phones' variant across networks runs a box in a container
+      # behind tc netem, with just static's illogicald (built above).
+      - name: The Playwright specs, in Chromium and WebKit
+        run: just e2e
+        env:
+          E2E_CHROMIUM: "1"
+          E2E_PORT: "7769"
+      - name: Take the test stack down
+        if: always()
+        run: just testnet down
 
   macos-build:
     name: macos (${{ matrix.os }})
@@ -58,6 +87,10 @@ jobs:
         # Apple silicon, and Sequoia on Intel.
         os: [macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
+    env:
+      # No Docker on GitHub's macOS runners: the ssh tests (ssh.rs,
+      # reboot.rs) say they didn't run, and the Linux job runs them.
+      ILLOGICAL_SKIP_DOCKER: "1"
     steps:
       - uses: actions/checkout@v7
       - name: bash 4.4+ (macOS ships 3.2; the shell integration tests need PS0)
@@ -66,7 +99,13 @@ jobs:
           bash -c '[ "${BASH_VERSINFO[0]}${BASH_VERSINFO[1]}" -ge 44 ] && echo "$BASH $BASH_VERSION"'
       - uses: ./.github/actions/tools
       - run: just bootstrap
+      - name: Playwright's browsers
+        run: just browsers
       - run: just test
+      - name: The WebKit specs (Safari's engine)
+        run: just e2e-webkit
+        env:
+          E2E_PORT: "7769"
 
   # The check main's ruleset requires: one `macos` for both runners above.
   macos:

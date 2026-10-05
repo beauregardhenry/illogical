@@ -6,15 +6,21 @@ illogical is MIT OR Apache-2.0. Its binaries include the software below.
   Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors.
   <https://github.com/ghostty-org/ghostty>
   Its license is at the end of the Rust crates' section.
+- **herdr** (agent detection rules): Apache-2.0, herdr contributors.
+  <https://github.com/herdrdev/herdr> The screen rules for Claude Code and
+  Codex in `crates/vt/src/detect.rs` follow the shape of herdr's agent
+  manifests (`src/detect/manifests/`) and adapt some of their patterns.
+  The Apache License 2.0 text is below.
 - **The web client** bundles npm packages: xterm.js, preact, fzstd and three.js (below). three.js draws the swarm's city and loads only when that theme is picked.
 - **Rust crates**, by license:
 
-- Apache License 2.0 (243)
-- MIT License (67)
+- Apache License 2.0 (275)
+- MIT License (69)
 - ISC License (21)
 - Unicode License v3 (19)
 - BSD 3-Clause "New" or "Revised" License (11)
 - zlib License (2)
+- Community Data License Agreement Permissive 2.0 (1)
 
 ## Apache License 2.0
 
@@ -4172,6 +4178,7 @@ Used by:
 - [log 0.4.34](https://github.com/rust-lang/log)
 - [mime 0.3.17](https://github.com/hyperium/mime)
 - [num-bigint 0.4.8](https://github.com/rust-num/num-bigint)
+- [num-bigint 0.5.1](https://github.com/rust-num/num-bigint)
 - [num-integer 0.1.47](https://github.com/rust-num/num-integer)
 - [num-traits 0.2.19](https://github.com/rust-num/num-traits)
 - [oid-registry 0.8.1](https://github.com/rusticata/oid-registry.git)
@@ -4418,6 +4425,7 @@ limitations under the License.
 ## Apache License 2.0
 
 Used by:
+- [bcrypt-pbkdf 0.11.0](https://github.com/RustCrypto/password-hashes)
 - [ff 0.14.0](https://github.com/zkcrypto/ff)
 
 ```
@@ -5261,11 +5269,16 @@ Used by:
 - [aes-gcm 0.11.1](https://github.com/RustCrypto/AEADs)
 - [aes 0.8.4](https://github.com/RustCrypto/block-ciphers)
 - [aes 0.9.3](https://github.com/RustCrypto/block-ciphers)
+- [argon2 0.6.0](https://github.com/RustCrypto/password-hashes)
 - [base16ct 1.0.0](https://github.com/RustCrypto/formats)
 - [base64ct 1.8.3](https://github.com/RustCrypto/formats)
 - [blake2 0.10.6](https://github.com/RustCrypto/hashes)
+- [blake2 0.11.0](https://github.com/RustCrypto/hashes)
 - [block-buffer 0.10.4](https://github.com/RustCrypto/utils)
 - [block-buffer 0.12.1](https://github.com/RustCrypto/utils)
+- [block-padding 0.4.2](https://github.com/RustCrypto/utils)
+- [blowfish 0.10.0](https://github.com/RustCrypto/block-ciphers)
+- [cbc 0.2.1](https://github.com/RustCrypto/block-modes)
 - [chacha20 0.10.2](https://github.com/RustCrypto/stream-ciphers)
 - [chacha20 0.9.1](https://github.com/RustCrypto/stream-ciphers)
 - [chacha20poly1305 0.10.1](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305)
@@ -5286,26 +5299,43 @@ Used by:
 - [elliptic-curve 0.14.1](https://github.com/RustCrypto/traits)
 - [ghash 0.5.1](https://github.com/RustCrypto/universal-hashes)
 - [ghash 0.6.0](https://github.com/RustCrypto/universal-hashes)
+- [hex-literal 1.1.0](https://github.com/RustCrypto/utils)
 - [hmac 0.13.0](https://github.com/RustCrypto/MACs)
 - [hybrid-array 0.4.15](https://github.com/RustCrypto/hybrid-array)
 - [inout 0.1.4](https://github.com/RustCrypto/utils)
 - [inout 0.2.2](https://github.com/RustCrypto/utils)
+- [keccak 0.2.2](https://github.com/RustCrypto/sponges)
+- [ml-kem 0.3.2](https://github.com/RustCrypto/KEMs)
+- [module-lattice 0.2.3](https://github.com/RustCrypto/KEMs)
 - [opaque-debug 0.3.1](https://github.com/RustCrypto/utils)
 - [p256 0.14.0](https://github.com/RustCrypto/elliptic-curves)
+- [p384 0.14.0](https://github.com/RustCrypto/elliptic-curves)
+- [p521 0.14.0](https://github.com/RustCrypto/elliptic-curves)
+- [pbkdf2 0.13.0](https://github.com/RustCrypto/password-hashes)
 - [pem-rfc7468 1.0.0](https://github.com/RustCrypto/formats)
+- [pkcs5 0.8.1](https://github.com/RustCrypto/formats)
 - [pkcs8 0.11.0](https://github.com/RustCrypto/formats)
 - [poly1305 0.8.0](https://github.com/RustCrypto/universal-hashes)
+- [poly1305 0.9.1](https://github.com/RustCrypto/universal-hashes)
 - [polyval 0.6.2](https://github.com/RustCrypto/universal-hashes)
 - [polyval 0.7.3](https://github.com/RustCrypto/universal-hashes)
 - [primefield 0.14.0](https://github.com/RustCrypto/elliptic-curves)
 - [primeorder 0.14.0](https://github.com/RustCrypto/elliptic-curves)
+- [salsa20 0.11.0](https://github.com/RustCrypto/stream-ciphers)
+- [scrypt 0.12.0](https://github.com/RustCrypto/password-hashes)
 - [sec1 0.8.1](https://github.com/RustCrypto/formats)
 - [sha1 0.10.7](https://github.com/RustCrypto/hashes)
 - [sha1 0.11.0](https://github.com/RustCrypto/hashes)
 - [sha2 0.10.9](https://github.com/RustCrypto/hashes)
 - [sha2 0.11.0](https://github.com/RustCrypto/hashes)
+- [sha3 0.11.0](https://github.com/RustCrypto/hashes)
+- [sha3 0.12.0](https://github.com/RustCrypto/hashes)
 - [signature 3.0.0](https://github.com/RustCrypto/traits)
 - [spki 0.8.0](https://github.com/RustCrypto/formats)
+- [sponge-cursor 0.1.0](https://github.com/RustCrypto/utils)
+- [ssh-cipher 0.3.0](https://github.com/RustCrypto/SSH)
+- [ssh-encoding 0.3.0](https://github.com/RustCrypto/SSH)
+- [ssh-key 0.7.0-rc.11](https://github.com/RustCrypto/SSH)
 - [universal-hash 0.5.1](https://github.com/RustCrypto/traits)
 - [universal-hash 0.6.1](https://github.com/RustCrypto/traits)
 - [wnaf 0.14.1](https://github.com/RustCrypto/elliptic-curves)
@@ -6350,26 +6380,31 @@ limitations under the License.
 
 Used by:
 - [libghostty-vt 0.2.1](https://github.com/uzaaft/libghostty-rs)
-- [illogical 0.15.0](https://github.com/arugula-salad/illogical)
-- [illogical-control 0.15.0](https://github.com/arugula-salad/illogical)
-- [illogical-core 0.15.0](https://github.com/arugula-salad/illogical)
-- [illogicald 0.15.0](https://github.com/arugula-salad/illogical)
-- [illogical-e2e 0.15.0](https://github.com/arugula-salad/illogical)
-- [illogical-proto 0.15.0](https://github.com/arugula-salad/illogical)
-- [illogical-vt 0.15.0](https://github.com/arugula-salad/illogical)
+- [illogical 0.18.0](https://github.com/arugula-salad/illogical)
+- [illogical-control 0.18.0](https://github.com/arugula-salad/illogical)
+- [illogical-core 0.18.0](https://github.com/arugula-salad/illogical)
+- [illogicald 0.18.0](https://github.com/arugula-salad/illogical)
+- [illogical-e2e 0.18.0](https://github.com/arugula-salad/illogical)
+- [illogical-proto 0.18.0](https://github.com/arugula-salad/illogical)
+- [illogical-testkit 0.18.0](https://github.com/arugula-salad/illogical)
+- [illogical-vt 0.18.0](https://github.com/arugula-salad/illogical)
 - [libghostty-vt-sys 0.2.1](https://github.com/uzaaft/libghostty-rs)
 - [allocator-api2 0.2.21](https://github.com/zakarumych/allocator-api2)
 - [anyhow 1.0.104](https://github.com/dtolnay/anyhow)
 - [asn1-rs-impl 0.2.0](https://github.com/rusticata/asn1-rs.git)
 - [async-trait 0.1.92](https://github.com/dtolnay/async-trait)
 - [aws-lc-sys 0.45.0](https://github.com/aws/aws-lc-rs)
+- [delegate 0.13.5](https://github.com/kobzol/rust-delegate)
 - [dyn-clone 1.0.20](https://github.com/dtolnay/dyn-clone)
+- [enum_dispatch 0.3.13](https://gitlab.com/antonok/enum_dispatch)
 - [half 2.7.1](https://github.com/VoidStarKat/half-rs)
 - [ident_case 1.0.1](https://github.com/TedDriggs/ident_case)
 - [indoc 2.0.7](https://github.com/dtolnay/indoc)
 - [int-enum 1.2.0](https://github.com/Juici/int-enum-rs)
 - [itoa 1.0.18](https://github.com/dtolnay/itoa)
+- [kem 0.3.0](https://github.com/RustCrypto/traits)
 - [libc 0.2.189](https://github.com/rust-lang/libc)
+- [md5 0.8.1](https://github.com/stainless-steel/md5)
 - [num-conv 0.2.2](https://github.com/jhpratt/num-conv)
 - [paste 1.0.15](https://github.com/dtolnay/paste)
 - [pastey 0.2.3](https://github.com/as1100k/pastey)
@@ -6384,6 +6419,9 @@ Used by:
 - [ref-cast-impl 1.0.27](https://github.com/dtolnay/ref-cast)
 - [ref-cast 1.0.27](https://github.com/dtolnay/ref-cast)
 - [rmcp 3.5.0](https://github.com/modelcontextprotocol/rust-sdk/)
+- [russh-cryptovec 0.62.0](https://github.com/warp-tech/russh)
+- [russh-util 0.52.0](https://github.com/warp-tech/russh)
+- [russh 0.64.0](https://github.com/warp-tech/russh)
 - [rustversion 1.0.23](https://github.com/dtolnay/rustversion)
 - [ryu 1.0.23](https://github.com/dtolnay/ryu)
 - [serde 1.0.229](https://github.com/serde-rs/serde)
@@ -7019,6 +7057,76 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
 ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+## Community Data License Agreement Permissive 2.0
+
+Used by:
+- [webpki-root-certs 1.0.9](https://github.com/rustls/webpki-roots)
+
+```
+# Community Data License Agreement - Permissive - Version 2.0
+
+This is the Community Data License Agreement - Permissive, Version
+2.0 (the "agreement"). Data Provider(s) and Data Recipient(s) agree
+as follows:
+
+## 1. Provision of the Data
+
+1.1. A Data Recipient may use, modify, and share the Data made
+available by Data Provider(s) under this agreement if that Data
+Recipient follows the terms of this agreement.
+
+1.2. This agreement does not impose any restriction on a Data
+Recipient's use, modification, or sharing of any portions of the
+Data that are in the public domain or that may be used, modified,
+or shared under any other legal exception or limitation.
+
+## 2. Conditions for Sharing Data
+
+2.1. A Data Recipient may share Data, with or without modifications, so
+long as the Data Recipient makes available the text of this agreement
+with the shared Data.
+
+## 3. No Restrictions on Results
+
+3.1. This agreement does not impose any restriction or obligations
+with respect to the use, modification, or sharing of Results.
+
+## 4. No Warranty; Limitation of Liability
+
+4.1. All Data Recipients receive the Data subject to the following
+terms:
+
+THE DATA IS PROVIDED ON AN "AS IS" BASIS, WITHOUT REPRESENTATIONS,
+WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED
+INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OR CONDITIONS OF TITLE,
+NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+NO DATA PROVIDER SHALL HAVE ANY LIABILITY FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING
+WITHOUT LIMITATION LOST PROFITS), HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE DATA OR RESULTS,
+EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+## 5. Definitions
+
+5.1. "Data" means the material received by a Data Recipient under
+this agreement.
+
+5.2. "Data Provider" means any person who is the source of Data
+provided under this agreement and in reliance on a Data Recipient's
+agreement to its terms.
+
+5.3. "Data Recipient" means any person who receives Data directly
+or indirectly from a Data Provider and agrees to the terms of this
+agreement.
+
+5.4. "Results" means any outcome obtained by computational analysis
+of Data, including for example machine learning models and models'
+insights.
 
 ```
 
@@ -8738,6 +8846,7 @@ SOFTWARE.
 
 Used by:
 - [aho-corasick 1.1.5](https://github.com/BurntSushi/aho-corasick)
+- [byteorder 1.5.0](https://github.com/BurntSushi/byteorder)
 - [memchr 2.8.3](https://github.com/BurntSushi/memchr)
 - [walkdir 2.5.0](https://github.com/BurntSushi/walkdir)
 
@@ -9080,6 +9189,7 @@ SOFTWARE.
 
 Used by:
 - [generic-array 0.14.7](https://github.com/fizyk20/generic-array.git)
+- [generic-array 1.4.5](https://github.com/fizyk20/generic-array.git)
 
 ```
 The MIT License (MIT)

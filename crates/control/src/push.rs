@@ -123,10 +123,17 @@ pub async fn unsubscribe(State(app): State<Arc<App>>, s: Session, Json(b): Json<
     Ok(Json(json!({})))
 }
 
-/// The accounts a daemon serves: its own, its team's, and those it lets in.
+/// The accounts a daemon serves: its own, its team's, and those it lets in
+/// that control routes to it (teams.rs): never someone who has no say in
+/// it, whatever list it sent.
 fn served(app: &App, daemon: &str, own: &str) -> anyhow::Result<Vec<String>> {
     let mut a = vec![own.to_owned()];
-    a.extend(app.db.daemon_accounts(daemon)?);
+    let rel = crate::teams::Relations::of(app, daemon, own)?;
+    for x in app.db.daemon_accounts(daemon)? {
+        if rel.routes(app, &x)? {
+            a.push(x);
+        }
+    }
     if let Some(team) = app.db.daemon_team(daemon)?
         && let Some(body) = app.db.latest_roster(&team)?
     {
@@ -166,7 +173,8 @@ fn hour() -> u32 {
 /// push service's status. A subscription that's gone is forgotten.
 async fn post(app: &App, endpoint: &str, body: Vec<u8>, ttl: u32, urgency: Option<&str>) -> Result<u16, ApiError> {
     let url = url::Url::parse(endpoint).map_err(|_| err(StatusCode::BAD_REQUEST, "endpoint"))?;
-    let audience = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    // RFC 8292: the push resource's origin, with its port if it has one.
+    let audience = url.origin().ascii_serialization();
     let urgency = match urgency {
         Some(u @ ("very-low" | "low" | "normal" | "high")) => u.to_owned(),
         _ => "high".to_owned(),
@@ -222,7 +230,7 @@ pub fn notify(app: &Arc<App>, accounts: Vec<String>, tag: &str, title: String, b
 }
 
 async fn send_own(app: &App, sub: &PushSub, msg: &[u8]) -> Result<(), ApiError> {
-    app.limits.check(crate::limit::PUSHES, std::net::IpAddr::from([0, 0, 0, 0]))?;
+    app.limits.check_all(crate::limit::PUSHES)?;
     let bad = |_| err(StatusCode::BAD_REQUEST, "subscription keys");
     let (ua, auth) = (B64.decode(&sub.p256dh).map_err(bad)?, B64.decode(&sub.auth).map_err(bad)?);
     let body =
@@ -240,8 +248,9 @@ pub async fn daemon_send(State(app): State<Arc<App>>, d: DaemonAuth, Json(b): Js
     if !served(&app, &d.cert.device, &d.cert.account)?.contains(&account) {
         return Err(err(StatusCode::FORBIDDEN, "not someone this daemon serves"));
     }
-    // A global brake on how much control relays.
-    app.limits.check(crate::limit::PUSHES, std::net::IpAddr::from([0, 0, 0, 0]))?;
+    // A brake on how much one daemon has control relay, and on all of them.
+    app.limits.check_daemon(crate::limit::DAEMON_PUSHES, &d.cert.device)?;
+    app.limits.check_all(crate::limit::PUSHES)?;
     let body = base64::engine::general_purpose::STANDARD
         .decode(&b.body)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "body: base64"))?;

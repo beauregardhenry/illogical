@@ -1,12 +1,14 @@
 # Advanced setup
 
 Everything here is optional. The [quickstart](../README.md#install) gets you
-durable panes, the phone and agent blocks; these add VMs, web apps beside
-your terminals, more machines, and iTerm2.
+durable panes, the phone, your other machines through
+[illogical control](control.md), and agent blocks; these add VMs, web apps
+and VS Code beside your terminals, sandboxes, and iTerm2. The menus offer a
+VM or a sandbox only on a machine set up for them, and *Open a port…* and
+*Open in editor* say how to turn them on until they are.
 
 Examples call the machine that serves the page `home` and the tailnet
-`<tailnet>.ts.net`; use your own names. [geek.md](geek.md) has one real
-setup as a worked example.
+`<tailnet>.ts.net`; use your own names.
 
 - [Service and logs](#service-and-logs)
 - [Pane environment](#pane-environment)
@@ -15,7 +17,7 @@ setup as a worked example.
 - [Browser blocks on ports](#browser-blocks-on-ports)
 - [Editor blocks](#editor-blocks)
 - [Agents in a VM](#agents-in-a-vm)
-- [A Mac as another host](#a-mac-as-another-host)
+- [More machines](#more-machines)
 - [A sandbox on the tailnet](#a-sandbox-on-the-tailnet)
 - [A sandbox that can only dial out](#a-sandbox-that-can-only-dial-out)
 - [Sandboxes from a provider](#sandboxes-from-a-provider)
@@ -41,17 +43,66 @@ it. Flags after `--` are passed to the daemon on every start
   upgrade or a crash leaves the programs running, and the new daemon adopts
   them. Stopping it for good (`launchctl bootout`, logging out) ends them a
   minute later, if no daemon has come back.
+- **macOS with no GUI login** (a Mac you reach only over ssh, where that
+  user hasn't logged in to the desktop since it booted): there's no
+  `gui/$UID` domain, so `illogicald install` puts the same plist in the
+  background session (`user/$UID`, `LimitLoadToSessionType` Background).
+  It keeps running after you log out, but after a reboot it doesn't start
+  until you log in to the desktop or run `illogicald install` again (over
+  ssh is fine; `illogical --ssh` does it for you when the daemon isn't
+  running), and the install says so.
+- **macOS, from boot:** `illogicald install --system` installs a
+  LaunchDaemon, `/Library/LaunchDaemons/illogicald.$USER.plist`, that runs
+  the daemon as you from boot with nobody logged in. Run it as yourself,
+  not as root: it runs `sudo` for the two steps that need root and prints
+  them first, so you need to be an admin. It replaces the LaunchAgent (one
+  daemon per user). Later installs keep it; `illogicald uninstall` first
+  to go back to an agent. `sudo launchctl kickstart -k
+  system/illogicald.$USER` restarts it.
+- **Removing it:** `illogicald uninstall` stops and removes whichever is
+  installed (the agent, the background agent, the LaunchDaemon with sudo,
+  or on Linux the systemd user service). The binaries in `~/.local/bin`
+  and the state in `~/.local/state/illogical` stay.
 - **Without systemd on Linux** (a container, a box with another init): pass
   `--keep-panes` for the same behaviour.
+
+**Updates.** At most every 12 hours the daemon asks where GitHub's
+`releases/latest` redirects to (one request, with nothing about you or the
+machine in it) and keeps the answer in `update-check.json` in the state
+directory. When it's newer, the web client's top bar offers the command for
+this install (`GET /api/update` says it too). `--no-update-check`
+(`ILLOGICAL_NO_UPDATE_CHECK=true`) turns it off; a daemon run from where it
+was built (`target/`) doesn't check. The desktop app replaces an older
+daemon with the one it carries when that daemon runs as the service
+(`ILLOGICAL_NO_DAEMON_UPGRADE=1` stops it).
 
 State (layout, logs, checkpoints) is in `~/.local/state/illogical`, private
 to you (0700/0600). `--state-dir` moves it.
 
-**Who gets in.** On loopback, anyone on the machine who can reach the port
-(it's your machine). Over the tailnet, the daemon asks tailscaled who each
-caller is and lets in only the login that owns the node; `--owner` names
-someone else. Tagged nodes, Funnel and the internet never get in. Don't put
-it behind anything else that would forward requests to it.
+**Who gets in.** On this machine, you: the CLI over its Unix socket (in
+your private state directory), and anything on the TCP port that shows the
+daemon's **local token** (`local-token` in the state directory, made at
+the first start, 0600). Loopback is shared by every account and program on
+the machine, so being on it isn't enough:
+
+- **Your browser** gets the token as a cookie from a sign-in link:
+  `illogical web` opens `http://127.0.0.1:7681` through it (`--print`
+  prints the link, to open by hand or through an `ssh -L` forward). Once
+  per browser; it stays signed in until the token changes. A page opened
+  without it says to run `illogical web`. The desktop app signs its own
+  window in.
+- **Programs** send it as `Authorization: Bearer <token>` (`illogical
+  --host http://127.0.0.1:7681` does that for you). MCP clients use
+  `illogical mcp` (the socket) or an `illogical mcp token`.
+- **A new token** signs every browser and program out: delete
+  `local-token` and restart the daemon.
+
+Over the tailnet, the daemon asks tailscaled who each caller is and lets
+in only the login that owns the node; `--owner` names someone else. Behind
+`tailscale serve`, the identity serve adds is believed only from
+tailscaled's own connection (on Linux, the daemon checks which account
+owns the other end). Tagged nodes, Funnel and the internet never get in.
+Don't put it behind anything else that would forward requests to it.
 
 ## Pane environment
 
@@ -94,7 +145,8 @@ illogicald install -- --wisp-url http://127.0.0.1:7788 --wisp-token-file ~/.loca
 ```
 
 Those are the defaults, so with wispd installed the usual way, nothing is
-needed. Without the token, VM panes are off and the menus don't offer them.
+needed. Without the token, VM panes are off and the menus don't offer them
+(nor *Sandboxes…*).
 The base image is plain Ubuntu 24.04; install what you need in it (Claude
 Code: `curl -fsSL https://claude.ai/install.sh | bash`).
 
@@ -102,7 +154,13 @@ Code: `curl -fsSL https://claude.ai/install.sh | bash`).
 
 *Open a port…* (or `illogical open :5173`) shows a dev server beside its
 terminal. Each block is served on an origin of its own by the daemon, so it
-needs a listener and a wildcard name; without one they're off.
+needs a listener and a wildcard name; without one they're off, and *Open a
+port…* says how to turn them on (this section).
+
+The browser showing the block reaches that listener itself. Through
+[illogical control](control.md) from another device (your phone, another
+computer) blocks aren't relayed yet, so there they need the tailnet setup
+below.
 
 **On loopback only** (no names, no certificates; the browser on the same
 machine):
@@ -141,7 +199,8 @@ Callers are checked with `tailscale whois`: only the owner gets in.
 
 *Open in editor* and `illogical edit` run VS Code (code-server) and show it
 like a browser block on a port, so they need block sites
-(`--block-listen`, above); without them they say so.
+(`--block-listen`, above); without them *Open in editor* says how to turn
+them on.
 
 - **code-server:** the release illogical pins is downloaded the first time
   an editor opens (about 230 MB) into `$XDG_CACHE_HOME/illogical/code-server`
@@ -169,19 +228,26 @@ there needs credentials: a token from `claude setup-token` in
 its environment only: never the VM's disk, a URL, an argv, the log or the
 layout.
 
-## A Mac as another host
+## More machines
 
-Install it on the Mac the same way, then make it reachable from the home
-daemon's page:
+Install illogical on each machine (the desktop app, `install.sh` or
+Homebrew), then add it to your account on
+[illogical control](control.md):
 
-1. Serve it on the tailnet with the Tailscale app:
-   `/Applications/Tailscale.app/Contents/MacOS/Tailscale serve --bg --https=443 http://127.0.0.1:7681`
-2. Let the home page talk to it:
-   `illogicald install -- --allow-origin https://home.<tailnet>.ts.net`
-3. On the home host: `illogical hosts add mac https://mac.<tailnet>.ts.net`.
+```
+illogicald join https://control.illogical.widgets.wtf
+```
 
-The host switcher then shows it, and `illogical --host mac …` works from
-the home host. The same steps add any other Linux machine.
+Approve the code it prints on a signed-in device. Every machine you join
+shows in the host menu of control's page and of the desktop app, with its
+sessions and tabs, on every device you've added; nothing has to be wired
+from one machine to another. *Getting started*'s *Cloud* step does the same
+with a button. [control.md](control.md) has the rest: teams, phones,
+leaving, moving a machine.
+
+The CLI still reaches only the daemon on its own machine, or one on the
+tailnet with `illogical --host NAME …` once that daemon's list has it
+(`illogical hosts add NAME https://NAME.<tailnet>.ts.net`).
 
 ## A sandbox on the tailnet
 

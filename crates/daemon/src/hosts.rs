@@ -39,7 +39,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use illogical_proto::hosts::{
-    AddHost, Host, HostInfo, HostList, HostToken, Invite, JoinRequest, Joined, ProviderRef, Transport,
+    AddHost, Host, HostFeatures, HostInfo, HostList, HostToken, Invite, JoinRequest, Joined, ProviderRef, Transport,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -118,10 +118,8 @@ impl Hosts {
             .and_then(|b| serde_json::from_slice::<SavedTokens>(&b).ok())
             .map(|s| s.tokens)
             .unwrap_or_default();
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .expect("an HTTP client with default settings");
+        let http =
+            crate::roots::http().timeout(Duration::from_secs(5)).build().expect("an HTTP client with default settings");
         Arc::new(Self {
             name,
             path,
@@ -154,7 +152,7 @@ impl Hosts {
     /// Add (or replace) a host whose daemon lives in a provider's sandbox,
     /// reached through our tunnel with `token`.
     pub fn add_provider(&self, name: String, at: ProviderRef, token: String) -> Result<Host, String> {
-        let req = validate(AddHost { name, urls: vec![], transport: Transport::Provider }, &self.name)?;
+        let req = validate(AddHost { name, urls: vec![], transport: Transport::Provider, ssh: None }, &self.name)?;
         {
             let mut inner = self.inner.lock().unwrap();
             inner.provider_tokens.insert(req.name.clone(), token);
@@ -181,6 +179,7 @@ impl Hosts {
             urls: req.urls,
             transport: req.transport,
             provider,
+            ssh: req.ssh,
         };
         inner.hosts.push(host.clone());
         inner.hosts.sort_by(|a, b| a.name.cmp(&b.name));
@@ -216,7 +215,7 @@ impl Hosts {
     pub fn mint_token(&self, name: &str) -> Result<HostToken, String> {
         let exists = self.inner.lock().unwrap().hosts.iter().any(|h| h.name == name);
         if !exists {
-            self.add(AddHost { name: name.to_owned(), urls: vec![], transport: Transport::DialOut })?;
+            self.add(AddHost { name: name.to_owned(), urls: vec![], transport: Transport::DialOut, ssh: None })?;
         }
         let token = format!("ilh_{}", hex(&random::<24>()));
         let mut inner = self.inner.lock().unwrap();
@@ -286,6 +285,10 @@ impl Hosts {
             // Spent even if the host turns out to be bad: one try per token.
             inner.invites.remove(i);
             self.save_invites(&inner);
+        }
+        // An ssh host names where clients ssh to: only the owner adds those.
+        if req.host.transport == Transport::Ssh {
+            return Err("an invite adds a daemon, not an ssh host".into());
         }
         let dial_out = req.host.transport == Transport::DialOut;
         let host = self.add(req.host)?;
@@ -371,7 +374,15 @@ impl Hosts {
         for (name, urls) in targets {
             let mut seen = false;
             for url in &urls {
-                let ok = self.http.get(format!("{url}/api/host")).send().await.is_ok_and(|r| r.status().is_success());
+                // A daemon that wants a credential we don't show it (one on
+                // this machine's loopback, which wants its local token) is
+                // there all the same.
+                let ok = self
+                    .http
+                    .get(format!("{url}/api/host"))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success() || r.status() == reqwest::StatusCode::UNAUTHORIZED);
                 if ok {
                     seen = true;
                     break;
@@ -434,6 +445,21 @@ fn validate(mut req: AddHost, this: &str) -> Result<AddHost, String> {
         Transport::Tailnet if req.urls.is_empty() => return Err("a host needs at least one URL".into()),
         // Reached through the home daemon, never at a URL of its own.
         Transport::DialOut if !req.urls.is_empty() => return Err("a dial-out host has no URLs".into()),
+        // Each client runs ssh to it; we keep its destination and nothing
+        // else, and it must never read as one of ssh's options.
+        Transport::Ssh => {
+            if !req.urls.is_empty() {
+                return Err("an ssh host has no URLs".into());
+            }
+            let dest = req.ssh.as_deref().map(str::trim).unwrap_or_default();
+            if dest.is_empty()
+                || dest.starts_with('-')
+                || !dest.bytes().all(|b| b.is_ascii_alphanumeric() || b"@._-:[]%+/".contains(&b))
+            {
+                return Err(format!("bad ssh destination {dest:?}: want user@host or a Host from ~/.ssh/config"));
+            }
+            req.ssh = Some(dest.to_owned());
+        }
         // Reached through the home daemon's provider tunnel; URLs are
         // optional (tailnet ones to upgrade to).
         _ => {}
@@ -503,7 +529,40 @@ async fn host(State(app): AppState) -> Json<HostInfo> {
             .and_then(|s| s.roster.as_ref().map(|r| r.name.clone()).or_else(|| Some(s.team.as_ref()?.team.clone()))),
         // M45b: only where the runner's unit is; from what was last read.
         fountain_runner: crate::fountain::runner::host_info(&app.mux.shell_env),
+        features: Some(features(&app)),
     })
+}
+
+/// What this machine is set up for, so the menus offer only that (#180)
+/// or say how to turn it on (#171). Cheap: nothing here asks anyone.
+fn features(app: &App) -> HostFeatures {
+    HostFeatures {
+        blocks: crate::sites::get().is_some(),
+        vms: app.mux.provider.is_some(),
+        fountain: fountain_login_here(&app.mux.shell_env),
+        studio: crate::apps::studio::get().and_then(|s| s.url()).is_some(),
+    }
+}
+
+/// A Fountain login the catalog would find (`fountain::login`'s order): a
+/// key in the daemon's or the shell's environment, or the CLI's
+/// credentials file.
+fn fountain_login_here(shell_env: &crate::shellenv::ShellEnv) -> bool {
+    let shell = shell_env.local_now();
+    let var = |k: &str| {
+        shell
+            .as_ref()
+            .and_then(|r| r.get(k).map(str::to_owned))
+            .or_else(|| std::env::var(k).ok())
+            .filter(|v| !v.is_empty())
+    };
+    if var("FOUNTAIN_API_KEY").is_some() {
+        return true;
+    }
+    let file = var("ILLOGICAL_FOUNTAIN_CREDENTIALS")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".fountain/credentials")));
+    file.is_some_and(|f| f.is_file())
 }
 
 async fn list(State(app): AppState) -> Json<HostList> {
@@ -593,7 +652,7 @@ mod tests {
     }
 
     fn req(name: &str, url: &str) -> AddHost {
-        AddHost { name: name.into(), urls: vec![url.into()], transport: Transport::Tailnet }
+        AddHost { name: name.into(), urls: vec![url.into()], transport: Transport::Tailnet, ssh: None }
     }
 
     #[test]
@@ -628,10 +687,10 @@ mod tests {
         assert!(h.add(req("x", "https://x.example/path")).is_err());
         assert!(h.add(req("x", "https://user@x.example")).is_err());
         assert!(h.add(req("x", "javascript:alert(1)")).is_err());
-        assert!(h.add(AddHost { name: "x".into(), urls: vec![], transport: Transport::Tailnet }).is_err());
+        assert!(h.add(AddHost { name: "x".into(), urls: vec![], transport: Transport::Tailnet, ssh: None }).is_err());
         assert!(h.add(req("..", "https://x.example")).is_err(), "a directory name");
         assert!(h.add(req(".x", "https://x.example")).is_err());
-        let dial = |urls: Vec<String>| AddHost { name: "d".into(), urls, transport: Transport::DialOut };
+        let dial = |urls: Vec<String>| AddHost { name: "d".into(), urls, transport: Transport::DialOut, ssh: None };
         assert!(h.add(dial(vec!["https://x.example".into()])).is_err(), "dial-out hosts have no URL");
         assert!(h.list().hosts.is_empty());
         std::fs::remove_dir_all(d).unwrap();
@@ -690,7 +749,7 @@ mod tests {
         assert_eq!(h.host_for_token(&other.token), None);
         // Joining as dial-out hands one out.
         let inv = h.invite(60);
-        let req = AddHost { name: "joiner".into(), urls: vec![], transport: Transport::DialOut };
+        let req = AddHost { name: "joiner".into(), urls: vec![], transport: Transport::DialOut, ssh: None };
         let (_, token) = h.join(JoinRequest { token: inv.token, host: req }).unwrap();
         assert_eq!(h.host_for_token(&token.unwrap()).as_deref(), Some("joiner"));
         std::fs::remove_dir_all(d).unwrap();
@@ -703,7 +762,7 @@ mod tests {
         let at = ProviderRef { provider: "wisp".into(), sandbox: "s1".into(), port: 7681 };
         let host = h.add_provider("res".into(), at.clone(), "ilp_x".into()).unwrap();
         assert_eq!(host.transport, Transport::Provider);
-        assert!(h.add(AddHost { name: "y".into(), urls: vec![], transport: Transport::Provider }).is_err());
+        assert!(h.add(AddHost { name: "y".into(), urls: vec![], transport: Transport::Provider, ssh: None }).is_err());
         let ilh = h.mint_token("res").unwrap().token;
         assert_eq!(h.provider_tunnel("res").unwrap().1, "ilp_x");
         // Neither token is in what clients get.
@@ -719,6 +778,29 @@ mod tests {
         assert!(h.remove("res"));
         assert!(h.provider_tunnel("res").is_none());
         assert!(!std::fs::read_to_string(d.join("provider-tokens.json")).unwrap().contains("ilp_y"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn ssh_hosts_keep_only_their_destination() {
+        let d = dir();
+        let h = Hosts::open(&d, "geek".into(), None);
+        let ssh = |urls: Vec<String>, dest: Option<&str>| AddHost {
+            name: "box".into(),
+            urls,
+            transport: Transport::Ssh,
+            ssh: dest.map(String::from),
+        };
+        let added = h.add(ssh(vec![], Some(" illo@box-bare "))).unwrap();
+        assert_eq!(
+            (added.transport, added.ssh.as_deref(), added.urls.len()),
+            (Transport::Ssh, Some("illo@box-bare"), 0)
+        );
+        assert!(h.add(ssh(vec!["https://box".into()], Some("box"))).is_err(), "no URLs");
+        assert!(h.add(ssh(vec![], None)).is_err(), "needs a destination");
+        for bad in ["-oProxyCommand=sh", "box; id", "a b", "$(id)"] {
+            assert!(h.add(ssh(vec![], Some(bad))).is_err(), "{bad}");
+        }
         std::fs::remove_dir_all(d).unwrap();
     }
 }

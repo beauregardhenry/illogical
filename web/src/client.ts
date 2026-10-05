@@ -16,6 +16,7 @@ import {
   type ClientMsg,
   type Delta,
   type Driver,
+  type HostFeatures,
   type Intent,
   type PaneId,
   type PaneInfo,
@@ -243,12 +244,21 @@ export class Client {
     }
     const res = await fetch(this.base + path, {
       method,
+      // Another daemon (on this machine, its sign-in cookie; it allows
+      // credentials only from our exact origin).
+      credentials: /^https?:/.test(this.base) ? "include" : "same-origin",
       ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
     });
     return { ok: res.ok, status: res.status, json: <T,>() => res.json() as Promise<T>, text: () => res.text() };
   }
 
   state: State | null = null;
+  /** What this daemon is set up for (`GET /api/host`'s `features`, #180),
+   * read on each hello and when a menu opens; `null` until read, or from
+   * a daemon too old to say (then menus offer everything, as before). */
+  features: HostFeatures | null = null;
+  /** This machine has the Fountain runner's unit (M45b). */
+  fountainRunner = false;
   clientId: number | null = null;
   connected = false;
   error: string | null = null;
@@ -456,6 +466,29 @@ export class Client {
     return (this.state?.panes ?? []).filter((p) => p.host === machine).map((p) => p.id);
   }
 
+  /** Read what this daemon is set up for again (#180). Menus show what
+   * was last read; a change (a studio linked, say) shows next time. */
+  async loadFeatures() {
+    try {
+      const res = await this.request("GET", "/api/host");
+      if (!res.ok) return;
+      const h = await res.json<{ features?: HostFeatures; fountain_runner?: unknown }>();
+      const features = h.features ?? null;
+      const runner = !!h.fountain_runner;
+      if (JSON.stringify(features) === JSON.stringify(this.features) && runner === this.fountainRunner) return;
+      this.features = features;
+      this.fountainRunner = runner;
+      this.emit();
+    } catch {
+      // as it was
+    }
+  }
+
+  /** Is `f` set up here? Yes when the daemon didn't say. */
+  has(f: keyof HostFeatures): boolean {
+    return this.features?.[f] ?? true;
+  }
+
   /** POST to the API; a failure shows as a toast. */
   async api(path: string, body: unknown = {}, failure = "that didn't work") {
     try {
@@ -483,6 +516,25 @@ export class Client {
       return url;
     } catch {
       this.toast("couldn't share it");
+      return null;
+    }
+  }
+
+  /** An ssh invite to a terminal pane for someone with only OpenSSH (M65):
+   * read-only, one login, an hour. The command to send them, copied to the
+   * clipboard when the browser lets us. */
+  async guestInvite(pane: PaneId): Promise<string | null> {
+    try {
+      const res = await this.request("POST", "/api/guests", { pane });
+      const body = await res.json<{ command?: string; error?: string }>().catch(() => null);
+      if (!res.ok || !body?.command) {
+        this.toast(body?.error ?? `couldn't make an invite (${res.status})`);
+        return null;
+      }
+      await navigator.clipboard?.writeText(body.command).catch(() => {});
+      return body.command;
+    } catch {
+      this.toast("couldn't make an invite");
       return null;
     }
   }
@@ -794,6 +846,7 @@ export class Client {
         for (const pane of this.editorFollows.keys()) this.send({ type: "follow", pane, on: true });
         this.applyState(msg.state, true);
         if (msg.state.roles) void this.loadNotify();
+        void this.loadFeatures();
         break;
       case "state":
         this.applyState(msg.state, false);

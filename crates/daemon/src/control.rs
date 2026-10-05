@@ -3,9 +3,12 @@
 //!
 //! `illogicald join URL` makes this daemon's keys (`<state>/daemon.key`),
 //! asks control for a code, and waits until someone approves it from a
-//! device of theirs. It then pins that account's root device and saves it
-//! all in `<state>/control.json`. The running daemon notices the file
-//! (within a few seconds), and from then on:
+//! device of theirs. It then shows the account's fingerprint (its root
+//! device's id), which the person checks against the device they approved
+//! on: control could otherwise hand back an account of its own. Only then
+//! does it pin that root and save it all in `<state>/control.json`. The
+//! running daemon notices the file (within a few seconds), and from then
+//! on:
 //!
 //! - it keeps the account's certificates fresh from control, but decides
 //!   for itself which devices to trust ([`Trust::evaluate`] against the
@@ -72,6 +75,10 @@ pub struct Saved {
     pub roster: Option<Roster>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub team_certs: AccountCerts,
+    /// The team's members' names as they set them (#208); the roster has
+    /// one word each ("Sam-Stranger").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub team_names: BTreeMap<String, String>,
     /// The team is locked: only its owners get in.
     #[serde(default)]
     pub locked: bool,
@@ -97,6 +104,9 @@ pub struct SharedTeam {
     pub roster: Roster,
     #[serde(default)]
     pub certs: AccountCerts,
+    /// Members' names as they set them (#208).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub names: BTreeMap<String, String>,
     #[serde(default)]
     pub locked: bool,
 }
@@ -119,6 +129,7 @@ fn take_move(saved: &mut Saved, m: Move) {
         saved.team = m.team;
         saved.roster = None;
         saved.team_certs = Default::default();
+        saved.team_names = Default::default();
         saved.locked = false;
     }
     saved.moved_at = m.at;
@@ -171,7 +182,8 @@ impl Enrolled {
                     TeamRole::Editor | TeamRole::Viewer => {
                         let role = if m.role == TeamRole::Editor { Role::Editor } else { Role::Viewer };
                         team_roles.insert(format!("account:{}", m.account), role);
-                        Principal::User { id: format!("account:{}", m.account), name: m.name.clone(), pic: None }
+                        let name = saved.team_names.get(&m.account).unwrap_or(&m.name).clone();
+                        Principal::User { id: format!("account:{}", m.account), name, pic: None }
                     }
                 };
                 for c in r.devices(&m.account, &saved.team_certs).devices.into_values() {
@@ -205,7 +217,7 @@ impl Enrolled {
                 }
                 let id = format!("account:{}", m.account);
                 roles.insert(id.clone(), if m.role == TeamRole::Viewer { Role::Viewer } else { Role::Editor });
-                let who = Principal::User { id, name: m.name.clone(), pic: None };
+                let who = Principal::User { id, name: t.names.get(&m.account).unwrap_or(&m.name).clone(), pic: None };
                 for c in t.roster.devices(&m.account, &t.certs).devices.into_values().filter(|c| c.kind.connects()) {
                     others.push((c, who.clone()));
                 }
@@ -239,6 +251,8 @@ pub struct Control {
     pub changed: watch::Sender<u64>,
     /// Direct URLs to give the directory.
     pub direct_urls: Vec<String>,
+    /// The control to join when nobody names one (`--control`, #207).
+    pub default_url: String,
     /// Control said the account's devices changed: refresh now.
     nudge: tokio::sync::Notify,
     http: reqwest::Client,
@@ -247,6 +261,8 @@ pub struct Control {
     /// Reached through a provider's proxy (a hosted sandbox, M20): no relay
     /// socket, so certificates are fetched more often instead of nudged.
     pub no_relay: bool,
+    /// Control takes v2 request signatures (see [`auth_header`]).
+    auth_v2: std::sync::atomic::AtomicBool,
 }
 
 fn read_saved(dir: &Path) -> anyhow::Result<Option<Saved>> {
@@ -262,27 +278,49 @@ fn write_saved(dir: &Path, s: &Saved) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A request signature for control: see control's `auth.rs`.
-pub fn auth_header(keys: &DeviceKeys, method: &str, path: &str) -> String {
-    let ms = now_ms();
-    let msg = format!("illogical daemon auth\n{method}\n{path}\n{ms}\n");
-    format!("{} {ms} {}", keys.id(), hex::encode(keys.signature(msg.as_bytes())))
+/// A request signature for control: see control's `auth.rs`. It covers the
+/// method, path and query, the time, a fresh nonce and the body's hash
+/// (`v2`), or for a control from before 0.17 the method, path and time.
+pub fn auth_header(keys: &DeviceKeys, method: &str, path_and_query: &str, body: &[u8], v2: bool) -> String {
+    if !v2 {
+        let ms = now_ms();
+        let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+        let msg = format!("illogical daemon auth\n{method}\n{path}\n{ms}\n");
+        return format!("{} {ms} {}", keys.id(), hex::encode(keys.signature(msg.as_bytes())));
+    }
+    illogical_e2e::cert::request_auth(keys, method, path_and_query, body)
+}
+
+/// Whether the control at `url` takes signatures over the body and a
+/// nonce (it says `daemon_auth: 2` in `control.json`).
+async fn takes_v2(http: &reqwest::Client, url: &str) -> bool {
+    let Ok(r) = http.get(format!("{url}/control.json")).send().await else { return false };
+    let v: serde_json::Value = r.json().await.unwrap_or_default();
+    v["daemon_auth"].as_u64().is_some_and(|n| n >= 2)
 }
 
 const AUTH: &str = "x-illogical-auth";
 
 impl Control {
-    pub fn new(state_dir: &Path, direct_urls: Vec<String>, acl: Arc<Acl>, no_relay: bool) -> Arc<Self> {
+    pub fn new(
+        state_dir: &Path,
+        direct_urls: Vec<String>,
+        default_url: String,
+        acl: Arc<Acl>,
+        no_relay: bool,
+    ) -> Arc<Self> {
         let me = Arc::new(Self {
             state_dir: state_dir.to_owned(),
             acl,
             now: RwLock::new(None),
             changed: watch::channel(0).0,
             direct_urls,
+            default_url,
             nudge: tokio::sync::Notify::new(),
-            http: reqwest::Client::builder().timeout(Duration::from_secs(20)).build().expect("http client"),
+            http: crate::roots::http().timeout(Duration::from_secs(20)).build().expect("http client"),
             published: Default::default(),
             no_relay,
+            auth_v2: Default::default(),
         });
         me.reload();
         me
@@ -309,7 +347,8 @@ impl Control {
         if account == e.saved.cert.account {
             return Some(e.saved.login.clone()).filter(|l| !l.is_empty());
         }
-        e.saved.roster.as_ref()?.member(account).map(|m| m.name.clone())
+        let m = e.saved.roster.as_ref()?.member(account)?;
+        Some(e.saved.team_names.get(account).unwrap_or(&m.name).clone())
     }
 
     /// Who a Noise key belongs to, if this daemon lets them in: a device of
@@ -377,12 +416,34 @@ impl Control {
         self.install(next);
     }
 
+    /// A signature for a request to control (see [`auth_header`]).
+    fn sign(&self, e: &Enrolled, method: &str, path_and_query: &str, body: &[u8]) -> String {
+        let v2 = self.auth_v2.load(std::sync::atomic::Ordering::Relaxed);
+        auth_header(&e.keys, method, path_and_query, body, v2)
+    }
+
+    /// Ask control how it takes signatures, until it says v2.
+    async fn check_auth(&self, e: &Enrolled) {
+        if !self.auth_v2.load(std::sync::atomic::Ordering::Relaxed) && takes_v2(&self.http, &e.saved.url).await {
+            self.auth_v2.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// POST JSON to control, signed over exactly the bytes sent.
+    fn post_json(&self, e: &Enrolled, path: &str, body: &serde_json::Value) -> reqwest::RequestBuilder {
+        let bytes = serde_json::to_vec(body).unwrap_or_default();
+        self.http
+            .post(format!("{}{path}", e.saved.url))
+            .header(AUTH, self.sign(e, "POST", path, &bytes))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes)
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(&self, e: &Enrolled, path_and_query: &str) -> anyhow::Result<T> {
-        let path = path_and_query.split('?').next().unwrap_or(path_and_query);
         let res = self
             .http
             .get(format!("{}{path_and_query}", e.saved.url))
-            .header(AUTH, auth_header(&e.keys, "GET", path))
+            .header(AUTH, self.sign(e, "GET", path_and_query, b""))
             .send()
             .await?;
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -401,6 +462,7 @@ impl Control {
     /// with); keep what checks out against what this daemon pinned.
     async fn refresh(&self) -> anyhow::Result<bool> {
         let Some(e) = self.enrolled() else { return Ok(false) };
+        self.check_auth(&e).await;
         #[derive(Deserialize)]
         struct Own {
             certs: Vec<Cert>,
@@ -422,6 +484,8 @@ impl Control {
                 locked: bool,
                 rosters: Vec<Roster>,
                 certs: AccountCerts,
+                #[serde(default)]
+                names: BTreeMap<String, String>,
             }
             let since = saved.roster.as_ref().map_or(0, |r| r.version);
             let t: TeamNow = self.get(&e, &format!("/api/daemon/team?since={since}&features={}", features())).await?;
@@ -440,8 +504,11 @@ impl Control {
             if let Some(r) = &cur {
                 certs.retain(|a, _| r.member(a).is_some());
             }
+            let mut names = t.names;
+            names.retain(|a, _| cur.as_ref().is_some_and(|r| r.member(a).is_some()));
             saved.roster = cur;
             saved.team_certs = certs;
+            saved.team_names = names;
             saved.locked = t.locked;
         }
 
@@ -480,6 +547,8 @@ impl Control {
                 locked: bool,
                 rosters: Vec<Roster>,
                 certs: AccountCerts,
+                #[serde(default)]
+                names: BTreeMap<String, String>,
             }
             let ids: Vec<&str> = pins.keys().map(String::as_str).collect();
             let got: BTreeMap<String, Got> =
@@ -498,7 +567,9 @@ impl Control {
                 if let Some(roster) = cur {
                     let mut certs = g.certs;
                     certs.retain(|a, _| roster.member(a).is_some());
-                    saved.shared_teams.insert(team, SharedTeam { roster, certs, locked: g.locked });
+                    let mut names = g.names;
+                    names.retain(|a, _| roster.member(a).is_some());
+                    saved.shared_teams.insert(team, SharedTeam { roster, certs, names, locked: g.locked });
                 }
             }
         }
@@ -519,7 +590,8 @@ impl Control {
                 e.saved.locked,
                 e.saved.peers.clone(),
             )
-            || saved.team_certs != e.saved.team_certs;
+            || saved.team_certs != e.saved.team_certs
+            || saved.team_names != e.saved.team_names;
         if changed {
             write_saved(&self.state_dir, &saved)?;
         }
@@ -571,15 +643,8 @@ impl Control {
                 ) else {
                     continue;
                 };
-                let path = "/api/daemon/push";
                 let req = serde_json::json!({ "endpoint": s.endpoint, "body": base64::engine::general_purpose::STANDARD.encode(body) });
-                let res = me
-                    .http
-                    .post(format!("{}{path}", e.saved.url))
-                    .header(AUTH, auth_header(&e.keys, "POST", path))
-                    .json(&req)
-                    .send()
-                    .await;
+                let res = me.post_json(&e, "/api/daemon/push", &req).send().await;
                 if let Err(err) = res {
                     warn!(error = %err, "can't push through control");
                 }
@@ -592,12 +657,8 @@ impl Control {
     /// account's GitHub login. Never logged.
     pub async fn github_token(&self, repo: &str) -> Result<serde_json::Value, String> {
         let e = self.enrolled().ok_or("not joined to illogical control")?;
-        let path = "/api/daemon/github/token";
         let res = self
-            .http
-            .post(format!("{}{path}", e.saved.url))
-            .header(AUTH, auth_header(&e.keys, "POST", path))
-            .json(&serde_json::json!({ "repo": repo }))
+            .post_json(&e, "/api/daemon/github/token", &serde_json::json!({ "repo": repo }))
             .send()
             .await
             .map_err(|e| format!("can't reach control: {e}"))?;
@@ -619,7 +680,7 @@ impl Control {
             let r = me
                 .http
                 .post(format!("{}{path}", e.saved.url))
-                .header(AUTH, auth_header(&e.keys, "POST", path))
+                .header(AUTH, me.sign(&e, "POST", path, b""))
                 .send()
                 .await;
             if let Err(err) = r {
@@ -655,14 +716,7 @@ impl Control {
         if self.published.lock().unwrap().as_ref() == Some(&body) {
             return;
         }
-        let path = "/api/daemon/access";
-        let res = self
-            .http
-            .post(format!("{}{path}", e.saved.url))
-            .header(AUTH, auth_header(&e.keys, "POST", path))
-            .json(&body)
-            .send()
-            .await;
+        let res = self.post_json(e, "/api/daemon/access", &body).send().await;
         match res {
             Ok(r) if r.status().is_success() => *self.published.lock().unwrap() = Some(body),
             Ok(r) => warn!(status = %r.status(), "control refused the access list"),
@@ -755,7 +809,9 @@ async fn relay_once(
     url.query_pairs_mut().append_pair("urls", &serde_json::to_string(&control.direct_urls)?);
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
     url.set_scheme(scheme).map_err(|()| anyhow::anyhow!("bad control URL"))?;
-    let ws = crate::dial::open_ws(&url, &[(AUTH, &auth_header(&e.keys, "GET", path))]).await?;
+    control.check_auth(e).await;
+    let signed = format!("{}?{}", url.path(), url.query().unwrap_or_default());
+    let ws = crate::dial::open_ws(&url, &[(AUTH, &control.sign(e, "GET", &signed, b""))]).await?;
     info!(control = e.saved.url, "connected to control's relay");
     // M40: forge subscriptions out, pokes and heartbeats in.
     let texts = crate::forge::live::watch_messages()
@@ -813,6 +869,24 @@ async fn control_said(res: reqwest::Response) -> String {
     }
 }
 
+/// Why control refuses this machine's signature, if it does: what it said
+/// ("this machine's account was deleted", or that it left or was
+/// revoked). `None` when control still knows it, or can't be asked.
+async fn forgotten(s: &Saved, keys: &DeviceKeys) -> Option<String> {
+    let http = crate::roots::http().timeout(Duration::from_secs(10)).build().ok()?;
+    let v2 = takes_v2(&http, &s.url).await;
+    let path = "/api/daemon/trust";
+    let res =
+        http.get(format!("{}{path}", s.url)).header(AUTH, auth_header(keys, "GET", path, b"", v2)).send().await.ok()?;
+    if res.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    let said = control_said(res).await;
+    let said = said.strip_prefix("control says: ").map(str::to_owned).unwrap_or(said);
+    // Not a clock that's off or a replayed signature: control has no such machine.
+    (said.contains("account was deleted") || said.contains("not an enrolled daemon")).then_some(said)
+}
+
 /// Who a saved enrollment belongs to, in words.
 fn whose(s: &Saved) -> String {
     match (&s.roster, &s.team) {
@@ -844,6 +918,7 @@ impl JoinPending {
 }
 
 /// A finished join: where this machine went, and who approved it.
+#[derive(Clone)]
 pub struct Joined {
     /// "the team X" or "your account".
     pub place: String,
@@ -851,7 +926,67 @@ pub struct Joined {
     /// The team asked for, when the approver kept it to their account.
     pub not_team: Option<String>,
     pub key: String,
-    pub root: String,
+    /// The account's fingerprint: its root device's id, in groups.
+    pub account: String,
+}
+
+/// An approval that checks out against the account control sent, not yet
+/// saved: control picks that account, so the person first checks its
+/// fingerprint against the device they approved on ([`Approved::save`]).
+pub struct Approved {
+    saved: Saved,
+    pub joined: Joined,
+}
+
+impl Approved {
+    /// Whether `typed` is this account's fingerprint (any case, with or
+    /// without the dashes).
+    pub fn is_account(&self, typed: &str) -> bool {
+        same_fingerprint(&self.saved.trust.root, typed)
+    }
+
+    /// Pin the account and save `control.json` (a running daemon picks it
+    /// up).
+    pub fn save(self, state_dir: &Path) -> anyhow::Result<Joined> {
+        write_saved(state_dir, &self.saved)?;
+        Ok(self.joined)
+    }
+
+    /// Turned down here: ask control to drop the machine again (best
+    /// effort), and start over with a new key, so a later join isn't held
+    /// up by this approval.
+    pub async fn refuse(self, state_dir: &Path) {
+        let key = state_dir.join(KEY_FILE);
+        if let Ok(keys) = DeviceKeys::load(&key) {
+            let path = "/api/daemon/leave";
+            let http = crate::roots::client();
+            let v2 = takes_v2(&http, &self.saved.url).await;
+            let _ = http
+                .post(format!("{}{path}", self.saved.url))
+                .header(AUTH, auth_header(&keys, "POST", path, b"", v2))
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+        }
+        let _ = std::fs::remove_file(key);
+    }
+}
+
+/// `typed` names the device `id`: its hex digits, ignoring case, spaces and
+/// dashes.
+pub fn same_fingerprint(id: &str, typed: &str) -> bool {
+    let typed: String =
+        typed.chars().filter(|c| !c.is_whitespace() && *c != '-').map(|c| c.to_ascii_lowercase()).collect();
+    !id.is_empty() && typed == id
+}
+
+/// A fingerprint as `--account` takes it: 16 hex digits, dashes optional.
+pub fn parse_fingerprint(typed: &str) -> anyhow::Result<String> {
+    let id: String = typed.chars().filter(|c| *c != '-').map(|c| c.to_ascii_lowercase()).collect();
+    if id.len() != 16 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("an account fingerprint is 16 hex digits, like 1a2b-3c4d-5e6f-7a8b");
+    }
+    Ok(id)
 }
 
 /// Ask control to add this machine: the code to approve. The person
@@ -868,19 +1003,36 @@ pub async fn join_start(
     if !url.starts_with("https://") && !private_http(&url) {
         bail!("control's URL must be https:// (or http on loopback or a private network, for testing)");
     }
+    let keys = DeviceKeys::load_or_create(&state_dir.join(KEY_FILE))?;
     if let Some(s) = read_saved(state_dir)? {
+        // Control may have forgotten it (its account deleted, or it was
+        // removed): say so, rather than that it's still in (#208).
+        if let Some(why) = forgotten(&s, &keys).await {
+            bail!(
+                "this machine was in {} on {}, but control doesn't know it any more ({why}); run `illogicald leave` to forget that here, then join again",
+                whose(&s),
+                s.url
+            );
+        }
         bail!(
             "this machine is already in {} on {}; to move it, run `illogicald leave`, then join again",
             whose(&s),
             s.url
         );
     }
-    let keys = DeviceKeys::load_or_create(&state_dir.join(KEY_FILE))?;
     let ask = Cert { account: String::new(), ..Cert::new(&keys, "", Kind::Daemon, name) };
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
+    // That this is the key's holder asking, not someone with its certificate.
+    let ms = now_ms();
+    let proof = serde_json::json!({
+        "ms": ms,
+        "sig": hex::encode(keys.signature(illogical_e2e::cert::join_proof_body(&ask, ms).as_bytes())),
+    });
+    let http = crate::roots::http().timeout(Duration::from_secs(20)).build()?;
     let res = http
         .post(format!("{url}/api/join"))
-        .json(&serde_json::json!({ "cert": ask, "urls": [], "team": team, "ticket": ticket, "features": features() }))
+        .json(&serde_json::json!({
+            "cert": ask, "urls": [], "team": team, "ticket": ticket, "features": features(), "proof": proof,
+        }))
         .send()
         .await
         .with_context(|| format!("can't reach control at {url}"))?;
@@ -905,10 +1057,10 @@ pub async fn join_start(
     })
 }
 
-/// Wait for someone to approve it, check the approval, pin the team the
-/// approving device chose, and save `control.json` (which a running
-/// daemon picks up).
-pub async fn join_finish(p: JoinPending, state_dir: &Path) -> anyhow::Result<Joined> {
+/// Wait for someone to approve it and check the approval and the team the
+/// approving device chose. Nothing is saved until the person confirms the
+/// account ([`Approved::save`]).
+pub async fn join_finish(p: JoinPending) -> anyhow::Result<Approved> {
     let JoinPending { url, code, expires_in_secs, team_name, poll, ask, http } = p;
     let mins = expires_in_secs / 60;
     let deadline = std::time::Instant::now() + Duration::from_secs(expires_in_secs);
@@ -970,14 +1122,14 @@ pub async fn join_finish(p: JoinPending, state_dir: &Path) -> anyhow::Result<Joi
         team: pin.clone(),
         roster: None,
         team_certs: Default::default(),
+        team_names: Default::default(),
         locked: false,
         peers: Default::default(),
         shared_teams: Default::default(),
         login: String::new(),
         moved_at: 0,
     };
-    write_saved(state_dir, &saved)?;
-    Ok(Joined {
+    let joined = Joined {
         place: match &got.team {
             Some(t) => format!("the team {}", t.name),
             None => "your account".into(),
@@ -985,18 +1137,22 @@ pub async fn join_finish(p: JoinPending, state_dir: &Path) -> anyhow::Result<Joi
         approver: approver.map(|c| c.name.clone()).unwrap_or_default(),
         not_team: team_name.filter(|_| got.team.is_none()),
         key: fingerprint(&cert.device),
-        root: fingerprint(&trust.root),
-    })
+        account: fingerprint(&trust.root),
+    };
+    Ok(Approved { saved, joined })
 }
 
-/// `illogicald join URL [--team ID]`: ask, show the code, wait, pin, save.
+/// `illogicald join URL [--team ID] [--account FINGERPRINT]`: ask, show
+/// the code, wait, check the account with the person, pin, save.
 pub async fn join(
     url: &str,
     name: &str,
     team: Option<&str>,
+    account: Option<&str>,
     ticket: Option<&str>,
     state_dir: &Path,
 ) -> anyhow::Result<()> {
+    let account = account.map(parse_fingerprint).transpose()?;
     let p = join_start(url, name, team, ticket, state_dir).await?;
     let to = match &p.team_name {
         Some(t) => format!("the team {t}"),
@@ -1015,15 +1171,67 @@ pub async fn join(
     println!();
     println!("  Waiting for approval (the code lasts {} minutes)…", p.expires_in_secs / 60);
     let url = p.url.clone();
-    let j = join_finish(p, state_dir).await?;
+    let a = join_finish(p).await?;
+    let fp = a.joined.account.clone();
+    let checked = match &account {
+        Some(want) if !a.is_account(want) => Err(anyhow::anyhow!(
+            "control approved this machine into the account {fp}, not {}; not joining",
+            fingerprint(want)
+        )),
+        Some(_) => Ok(()),
+        // A hosted sandbox runs on control's own provider: there is no
+        // second device to check against.
+        None if ticket.is_some() => Ok(()),
+        None => confirm_account(&a),
+    };
+    if let Err(e) = checked {
+        a.refuse(state_dir).await;
+        return Err(e);
+    }
+    let j = a.save(state_dir)?;
     println!();
     println!("  Joined. This machine is in {}, approved on \"{}\".", j.place, j.approver);
     if let Some(t) = &j.not_team {
         println!("  (Not the team {t}: the approver kept it to their account.)");
     }
-    println!("  Its key is {}; the account's first device is {}.", j.key, j.root);
+    println!("  Its key is {}; the account is {}.", j.key, j.account);
     println!("  Open {url}; it's in the host menu.");
     Ok(())
+}
+
+/// Ask the person whether the account control sent is theirs: its
+/// fingerprint here against the one on the device they approved on.
+fn confirm_account(a: &Approved) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    println!();
+    println!("  Approved on \"{}\". Before this machine trusts it, check the account:", a.joined.approver);
+    println!();
+    println!("    {}", a.joined.account);
+    println!();
+    println!("  The device you approved on shows its account's fingerprint when it approves,");
+    println!("  and under Devices and machines… in the host menu.");
+    print!("  Is it the same? [y/N, or type the fingerprint] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line)?;
+    let said = line.trim();
+    if n == 0 {
+        bail!(
+            "no answer, so not joining; to confirm without a prompt, pass --account with the fingerprint your device shows"
+        );
+    }
+    if matches!(said.to_ascii_lowercase().as_str(), "y" | "yes") || a.is_account(said) {
+        return Ok(());
+    }
+    if parse_fingerprint(said).is_ok() {
+        bail!(
+            "that's not the account control approved this machine into ({}); not joining. Don't add machines through this control.",
+            a.joined.account
+        );
+    }
+    bail!(
+        "not joining. If the fingerprints differ, control isn't telling the truth about your account: don't add machines through it"
+    )
 }
 
 /// A hosted sandbox's side of joining (M20): its key, made here and never
@@ -1057,11 +1265,10 @@ pub async fn leave(state_dir: &Path, listen: &str) -> anyhow::Result<()> {
     let Some(s) = read_saved(state_dir)? else { bail!("this machine isn't joined to any control") };
     let keys = DeviceKeys::load(&state_dir.join(KEY_FILE))?;
     let path = "/api/daemon/leave";
-    let res = reqwest::Client::new()
-        .post(format!("{}{path}", s.url))
-        .header(AUTH, auth_header(&keys, "POST", path))
-        .send()
-        .await;
+    let http = crate::roots::client();
+    let v2 = takes_v2(&http, &s.url).await;
+    let res =
+        http.post(format!("{}{path}", s.url)).header(AUTH, auth_header(&keys, "POST", path, b"", v2)).send().await;
     match res {
         Ok(r) if r.status().is_success() => println!("Left {} ({}).", s.url, whose(&s)),
         Ok(r) => println!("{} (leaving anyway)", control_said(r).await),
@@ -1091,6 +1298,74 @@ mod tests {
         Move { team: team.cloned(), at, by: by.device.clone(), sig }
     }
 
+    #[test]
+    fn fingerprints_compare_as_typed() {
+        assert!(same_fingerprint("0123456789abcdef", "0123-4567-89AB-cdef"));
+        assert!(same_fingerprint("0123456789abcdef", " 0123456789abcdef\n"));
+        assert!(!same_fingerprint("0123456789abcdef", "0123-4567-89ab-cdee"));
+        assert!(!same_fingerprint("", ""));
+        assert_eq!(parse_fingerprint("0123-4567-89AB-cdef").unwrap(), "0123456789abcdef");
+        assert!(parse_fingerprint("0123-4567").is_err());
+        assert!(parse_fingerprint("y").is_err());
+    }
+
+    /// A control that approves the machine into an account of its own:
+    /// nothing is saved unless the account is the one the person expects.
+    #[tokio::test]
+    async fn a_join_saves_only_the_account_the_person_confirms() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        let (theirs, mut root) = device("evil", Kind::Browser);
+        root.approver = root.device.clone();
+        root.sig = hex::encode(theirs.signature(root.body().as_bytes()));
+        let asked: Arc<std::sync::Mutex<Option<Cert>>> = Default::default();
+        let (a1, a2) = (asked.clone(), asked.clone());
+        let (root2, theirs) = (root.clone(), Arc::new(theirs));
+        let app = Router::new()
+            .route(
+                "/api/join",
+                post(move |Json(b): Json<serde_json::Value>| async move {
+                    let c: Cert = serde_json::from_value(b["cert"].clone()).unwrap();
+                    let code = join_code(&c);
+                    *a1.lock().unwrap() = Some(c);
+                    Json(serde_json::json!({ "code": code, "poll": "p", "expires_in_secs": 60 }))
+                }),
+            )
+            .route(
+                "/api/join/{code}",
+                get(move || async move {
+                    let mut c = a2.lock().unwrap().clone().unwrap();
+                    c.account = "evil".into();
+                    c.sign_with(&theirs);
+                    Json(serde_json::json!({
+                        "approved": true, "cert": c, "trust": { "account": "evil", "root": root2.device },
+                        "certs": [root2], "revocations": [],
+                    }))
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await });
+        let dir = std::env::temp_dir().join(format!("illogical-join-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mine = DeviceKeys::generate().id();
+        let e = join(&url, "box", None, Some(&mine), None, &dir).await.expect_err("refused");
+        assert!(e.to_string().contains("not joining"), "{e}");
+        assert!(read_saved(&dir).unwrap().is_none(), "nothing pinned");
+
+        // The approval itself checks out: only the account is wrong.
+        let a = join_finish(join_start(&url, "box", None, None, &dir).await.unwrap()).await.unwrap();
+        assert_eq!(a.joined.account, fingerprint(&root.device));
+        assert!(!a.is_account(&mine) && a.is_account(&fingerprint(&root.device)));
+
+        join(&url, "box", None, Some(&fingerprint(&root.device)), None, &dir).await.unwrap();
+        assert_eq!(read_saved(&dir).unwrap().unwrap().trust.root, root.device);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #100: a move signed by the account's own device is taken; one by
     /// anyone else, or an older one control replays, isn't.
     #[test]
@@ -1107,6 +1382,7 @@ mod tests {
             team: None,
             roster: None,
             team_certs: Default::default(),
+            team_names: Default::default(),
             locked: false,
             peers: Default::default(),
             shared_teams: Default::default(),
@@ -1129,5 +1405,59 @@ mod tests {
         // Control replays the move into the team: too old.
         take_move(&mut saved, into);
         assert_eq!(saved.team, None);
+    }
+
+    /// #208: a team member is called what they set ("Sam Stranger"), not
+    /// the roster's one-word form, once control says it.
+    #[test]
+    fn team_members_go_by_the_names_they_set() {
+        let (keys, root) = device("a", Kind::Browser);
+        let (_, daemon) = device("a", Kind::Daemon);
+        let (_, sam) = device("s", Kind::Browser);
+        let roster = Roster {
+            v: 1,
+            team: "t1".into(),
+            name: "Acme".into(),
+            version: 1,
+            at: 1,
+            members: vec![illogical_e2e::team::Member {
+                account: "s".into(),
+                root: sam.device.clone(),
+                role: TeamRole::Editor,
+                name: "Sam-Stranger".into(),
+            }],
+            spent: vec![],
+            redeem: None,
+            by: String::new(),
+            sig: String::new(),
+        };
+        let mut saved = Saved {
+            url: String::new(),
+            trust: Trust { account: "a".into(), root: root.device.clone() },
+            cert: daemon,
+            certs: vec![root],
+            revocations: vec![],
+            team: None,
+            roster: Some(roster),
+            team_certs: [("s".to_owned(), (vec![sam], vec![]))].into_iter().collect(),
+            team_names: Default::default(),
+            locked: false,
+            peers: Default::default(),
+            shared_teams: Default::default(),
+            login: String::new(),
+            moved_at: 0,
+        };
+        let dir = std::env::temp_dir().join(format!("illogical-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let acl = Acl::open(&dir);
+        let keys = Arc::new(keys);
+        let name = |saved: &Saved| match &Enrolled::build(saved.clone(), keys.clone(), &acl).others[0].1 {
+            Principal::User { name, .. } => name.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(name(&saved), "Sam-Stranger");
+        saved.team_names.insert("s".into(), "Sam Stranger".into());
+        assert_eq!(name(&saved), "Sam Stranger");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

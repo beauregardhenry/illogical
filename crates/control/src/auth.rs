@@ -3,10 +3,19 @@
 //! - **People** sign in with GitHub (OAuth, as a GitHub App) and get a
 //!   session cookie for control's own API: the directory, approvals, joins.
 //!   A session never reaches a daemon. Daemons trust devices, by key.
+//! - **The CLI** (M49) is a `cli` device: it joins with a code, as a
+//!   daemon does, and then signs each request as a daemon does (below).
+//!   A signed request from an approved CLI device is a session for its
+//!   account, with no cookie to ride on, so it needs no origin.
 //! - **Daemons** sign each request with their enrolled Ed25519 key:
-//!   `x-illogical-auth: <device id> <ms> <sig>` over
-//!   `illogical daemon auth\n<METHOD>\n<path>\n<ms>\n`, within five
-//!   minutes of now.
+//!   `x-illogical-auth: v2 <device id> <ms> <nonce> <sig>` over
+//!   `illogical daemon auth v2\n<METHOD>\n<path and query>\n<ms>\n<nonce>\n<sha256 of the body, hex>\n`,
+//!   within five minutes of now. Each signature is good once: control
+//!   remembers the ones it took until they'd be too old anyway.
+//!   Daemons from before 0.17 sign `<device id> <ms> <sig>` over
+//!   `illogical daemon auth\n<METHOD>\n<path>\n<ms>\n` (no query, no body);
+//!   control takes those too, once each, until it's started with
+//!   `--refuse-old-daemon-signatures`, when they're told to update.
 //!
 //! Cookie-authenticated requests that change anything, and every WebSocket
 //! upgrade, must come from control's own origin (no cross-site requests
@@ -19,7 +28,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
     response::{IntoResponse, Redirect, Response},
 };
-use illogical_e2e::{Cert, now_ms};
+use illogical_e2e::{Cert, Kind, now_ms};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -66,6 +75,13 @@ impl FromRequestParts<Arc<App>> for Session {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &Arc<App>) -> Result<Self, ApiError> {
+        // A CLI device's signature (M49): no cookie, so no origin to check.
+        match parts.extensions.get::<Signed>() {
+            Some(Signed(Ok(cert))) if cert.kind == Kind::Cli => return Ok(Session { account: cert.account.clone() }),
+            Some(Signed(Ok(_))) => return Err(err(StatusCode::UNAUTHORIZED, "sign in first")),
+            Some(Signed(Err((status, msg)))) => return Err(crate::ApiError(*status, msg.clone())),
+            None => {}
+        }
         let upgrade = parts.headers.contains_key(header::UPGRADE);
         if parts.method != Method::GET || upgrade {
             let origin = parts.headers.get(header::ORIGIN).and_then(|o| o.to_str().ok());
@@ -83,36 +99,143 @@ impl FromRequestParts<Arc<App>> for Session {
     }
 }
 
-/// An enrolled daemon, by its signature.
+/// An enrolled daemon, by its signature (checked by [`verify_daemon`],
+/// which sees the body).
 pub struct DaemonAuth {
     pub cert: Cert,
 }
 
+/// What a pre-0.17 daemon signs.
 pub fn daemon_auth_message(method: &str, path: &str, ms: u64) -> String {
     format!("illogical daemon auth\n{method}\n{path}\n{ms}\n")
+}
+
+/// What a daemon signs: the request's method, path and query, time, a
+/// nonce, and its body's hash.
+pub fn daemon_auth_message_v2(method: &str, path_and_query: &str, ms: u64, nonce: &str, body: &[u8]) -> String {
+    let body = hex::encode(Sha256::digest(body));
+    format!("illogical daemon auth v2\n{method}\n{path_and_query}\n{ms}\n{nonce}\n{body}\n")
+}
+
+/// The most a signed request's body may be.
+const MAX_SIGNED_BODY: usize = 1 << 20;
+
+/// Signatures (or other one-time proofs) already taken, until they'd be
+/// too old to take anyway.
+#[derive(Default)]
+pub struct Replays(std::sync::Mutex<std::collections::HashMap<String, u64>>);
+
+impl Replays {
+    /// Whether this is the first time `key` is used; remembered until
+    /// `until` (ms).
+    pub fn first(&self, key: &str, until: u64) -> bool {
+        let now = now_ms();
+        let mut m = self.0.lock().unwrap();
+        if m.len() > 50_000 {
+            m.retain(|_, u| *u > now);
+        }
+        match m.get(key) {
+            Some(u) if *u > now => false,
+            _ => {
+                m.insert(key.to_owned(), until);
+                true
+            }
+        }
+    }
+}
+
+/// The outcome of checking a request's daemon signature, for
+/// [`DaemonAuth`] to hand over.
+#[derive(Clone)]
+struct Signed(Result<Cert, (StatusCode, String)>);
+
+/// Checks `x-illogical-auth` on any request that has one, with its body.
+pub async fn verify_daemon(
+    State(app): State<Arc<App>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !req.headers().contains_key(AUTH_HEADER) {
+        return next.run(req).await;
+    }
+    let (mut parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_SIGNED_BODY).await else {
+        return err(StatusCode::PAYLOAD_TOO_LARGE, "a signed request's body is at most 1 MB").into_response();
+    };
+    let checked = check_daemon(&app, &parts, &bytes).map_err(|e| (e.0, e.1));
+    parts.extensions.insert(Signed(checked));
+    next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes))).await
+}
+
+fn check_daemon(app: &App, parts: &Parts, body: &[u8]) -> Result<Cert, ApiError> {
+    let bad = || err(StatusCode::UNAUTHORIZED, "bad daemon signature");
+    let h = parts.headers.get(AUTH_HEADER).and_then(|v| v.to_str().ok()).ok_or_else(bad)?;
+    let f: Vec<&str> = h.split_whitespace().collect();
+    let (id, ms, sig, msg) = match f.as_slice() {
+        ["v2", id, ms, nonce, sig] => {
+            if !(16..=64).contains(&nonce.len()) || !nonce.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err(bad());
+            }
+            let ms: u64 = ms.parse().map_err(|_| bad())?;
+            let pq = parts.uri.path_and_query().map_or_else(|| parts.uri.path(), |p| p.as_str());
+            (*id, ms, *sig, daemon_auth_message_v2(parts.method.as_str(), pq, ms, nonce, body))
+        }
+        [id, ms, sig] => {
+            if !app.cfg.old_daemon_signatures {
+                return Err(err(
+                    StatusCode::UPGRADE_REQUIRED,
+                    "this machine's illogical is too old for this control: update illogical (0.17 or newer) and restart it",
+                ));
+            }
+            let ms: u64 = ms.parse().map_err(|_| bad())?;
+            (*id, ms, *sig, daemon_auth_message(parts.method.as_str(), parts.uri.path(), ms))
+        }
+        _ => return Err(bad()),
+    };
+    if now_ms().abs_diff(ms) > SKEW_MS {
+        return Err(err(StatusCode::UNAUTHORIZED, "clock skew: check this machine's time"));
+    }
+    let cert = match app.db.daemon_cert(id)? {
+        Some(c) => c,
+        None => match cli_cert(app, id)? {
+            Some(c) => c,
+            None if app.db.daemon_account_deleted(id)? => {
+                return Err(err(StatusCode::UNAUTHORIZED, "this machine's account was deleted"));
+            }
+            None => return Err(err(StatusCode::UNAUTHORIZED, "not an enrolled daemon (left, or revoked?)")),
+        },
+    };
+    if !illogical_e2e::cert::verify_hex(&cert.sign, msg.as_bytes(), sig) {
+        return Err(bad());
+    }
+    // Once each: a copy of a request (from a log, a proxy) does nothing.
+    if !app.daemon_sigs.first(&format!("{id} {sig}"), ms + SKEW_MS + 60_000) {
+        return Err(err(StatusCode::UNAUTHORIZED, "that signature was used already"));
+    }
+    Ok(cert)
+}
+
+/// An approved CLI device (M49) that its account still trusts: one that
+/// was revoked, or whose approver was, signs nothing here.
+fn cli_cert(app: &App, id: &str) -> Result<Option<Cert>, ApiError> {
+    let Some(cert) = app.db.approved_cert(id, Kind::Cli)? else { return Ok(None) };
+    let Some(root) = app.db.account(&cert.account)?.and_then(|a| a.root) else { return Ok(None) };
+    let (certs, _) = app.db.devices(&cert.account)?;
+    let revs = app.db.revocations(&cert.account)?;
+    let trust = illogical_e2e::Trust { account: cert.account.clone(), root };
+    Ok(trust.evaluate(&certs, &revs).get(id).filter(|c| **c == cert).cloned())
 }
 
 impl FromRequestParts<Arc<App>> for DaemonAuth {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, app: &Arc<App>) -> Result<Self, ApiError> {
-        let bad = || err(StatusCode::UNAUTHORIZED, "bad daemon signature");
-        let h = parts.headers.get(AUTH_HEADER).and_then(|v| v.to_str().ok()).ok_or_else(bad)?;
-        let f: Vec<&str> = h.split_whitespace().collect();
-        let [id, ms, sig] = f.as_slice() else { return Err(bad()) };
-        let ms: u64 = ms.parse().map_err(|_| bad())?;
-        if now_ms().abs_diff(ms) > SKEW_MS {
-            return Err(err(StatusCode::UNAUTHORIZED, "clock skew: check this machine's time"));
+    async fn from_request_parts(parts: &mut Parts, _app: &Arc<App>) -> Result<Self, ApiError> {
+        match parts.extensions.get::<Signed>() {
+            Some(Signed(Ok(cert))) if cert.kind == Kind::Daemon => Ok(DaemonAuth { cert: cert.clone() }),
+            Some(Signed(Ok(_))) => Err(err(StatusCode::UNAUTHORIZED, "not an enrolled daemon")),
+            Some(Signed(Err((status, msg)))) => Err(crate::ApiError(*status, msg.clone())),
+            None => Err(err(StatusCode::UNAUTHORIZED, "bad daemon signature")),
         }
-        let cert = app
-            .db
-            .daemon_cert(id)?
-            .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "not an enrolled daemon (left, or revoked?)"))?;
-        let msg = daemon_auth_message(parts.method.as_str(), parts.uri.path(), ms);
-        if !illogical_e2e::cert::verify_hex(&cert.sign, msg.as_bytes(), sig) {
-            return Err(bad());
-        }
-        Ok(DaemonAuth { cert })
     }
 }
 

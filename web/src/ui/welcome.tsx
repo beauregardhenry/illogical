@@ -18,6 +18,7 @@ import { notifyBlocker, pushNow, serveCommand, subscribePush } from "./notify";
 import { startAgent } from "./agent-dialog";
 
 const DOCS = "https://github.com/arugula-salad/illogical/blob/main/docs";
+/** illogical cloud, unless the daemon was started with `--control` (#207). */
 const CONTROL = "https://control.illogical.widgets.wtf";
 const SEEN_KEY = "illogical.getting-started";
 
@@ -44,6 +45,8 @@ interface Setup {
     joined?: string;
     team?: string;
     pending?: { code: string; approve: string; expires_ms: number };
+    /** Approved: the account's fingerprint, to check before it's saved. */
+    confirm?: { account: string; approver: string; place: string };
     error?: string;
     url: string;
   };
@@ -184,16 +187,25 @@ function GettingStarted({ client, section, close }: { client: Client | null; sec
       setManual(true);
     }
   };
+  // The cloud step's part comes back first (the rest asks Tailscale and
+  // Claude Code): which control the button joins, at once (#207).
+  const [early, setEarly] = useState<Setup["control"] | null>(null);
   useEffect(() => {
     void refresh();
+    fetch("/api/setup?part=control")
+      .then((r) => (r.ok ? (r.json() as Promise<Pick<Setup, "control">>) : null))
+      .then((r) => r && setEarly(r.control))
+      .catch(() => {});
     fetch("/api/host")
       .then((r) => (r.ok ? (r.json() as Promise<HostInfo>) : null))
       .then(setHost)
       .catch(() => {});
   }, []);
 
-  // While a join waits for approval, look for the answer.
-  const waiting = !!setup?.control.pending;
+  // While a join waits for approval (or was just confirmed and the daemon
+  // is picking it up), look for the answer.
+  const [confirmed, setConfirmed] = useState(false);
+  const waiting = !!setup?.control.pending || (confirmed && !setup?.control.joined);
   useEffect(() => {
     if (!waiting) return;
     const t = setInterval(async () => {
@@ -260,7 +272,9 @@ function GettingStarted({ client, section, close }: { client: Client | null; sec
           </div>
           {id === "welcome" && <Welcome name={name} client={client} />}
           {id === "phone" && <Phone name={name} setup={setup} host={host} manual={manual} refresh={refresh} />}
-          {id === "cloud" && <Cloud setup={setup} host={host} manual={manual} refresh={refresh} setSetup={setSetup} />}
+          {id === "cloud" && (
+            <Cloud setup={setup} early={early} host={host} manual={manual} refresh={refresh} setSetup={setSetup} onConfirmed={() => setConfirmed(true)} />
+          )}
           {id === "agents" && <Agents client={client} setup={setup} manual={manual} refresh={refresh} close={close} />}
           {id === "ready" && <Ready done={done} go={go} />}
         </div>
@@ -418,6 +432,11 @@ function Phone({ name, setup, host, manual, refresh }: { name: string; setup: Se
             </button>
           )}
           <Said outcome={outcome} />
+          {ts?.state === "missing" && (
+            <p class="start-dim" data-start-no-tailscale>
+              No Tailscale? The next step, the cloud, reaches this machine from your phone too.
+            </p>
+          )}
         </>
       )}
       {url && (ts?.serving ?? true) && (
@@ -437,31 +456,55 @@ function Phone({ name, setup, host, manual, refresh }: { name: string; setup: Se
   );
 }
 
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
 function Cloud({
   setup,
+  early,
   host,
   manual,
   refresh,
   setSetup,
+  onConfirmed,
 }: {
   setup: Setup | null;
+  early: Setup["control"] | null;
   host: HostInfo | null;
   manual: boolean;
   refresh: () => Promise<void>;
   setSetup: (fn: (s: Setup | null) => Setup | null) => void;
+  onConfirmed: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const c = setup?.control;
   const joined = c?.joined ?? host?.control;
   const team = c?.team ?? host?.team;
+  // The control this daemon joins by default: its own, if it has one.
+  const control = c?.url || early?.url || CONTROL;
+  const ours = control === CONTROL;
   const connect = async () => {
     setBusy(true);
     setError(null);
-    const r = await post("/api/setup/control");
+    const r = await post("/api/setup/control", { url: control });
     if (r.error) setError(r.error);
     else if (r.pending) setSetup((s) => (s ? { ...s, control: { ...s.control, pending: r.pending as NonNullable<Setup["control"]["pending"]> } } : s));
     await refresh();
+    setBusy(false);
+  };
+  // The person compared the account's fingerprints: keep the join, or drop it.
+  const confirm = async (same: boolean) => {
+    setBusy(true);
+    const r = await post("/api/setup/control/confirm", { same });
+    const got = (r as { control?: Setup["control"] }).control;
+    if (got) setSetup((s) => (s ? { ...s, control: got } : s));
+    if (same) onConfirmed();
     setBusy(false);
   };
   return (
@@ -474,7 +517,7 @@ function Cloud({
       {manual ? (
         <>
           <p>On this machine:</p>
-          <CopyText text={`illogicald join ${CONTROL}`} data-join-command />
+          <CopyText text={`illogicald join ${control}`} data-join-command />
         </>
       ) : joined ? (
         <ul class="start-checks">
@@ -485,6 +528,25 @@ function Cloud({
             </a>
           </Check>
         </ul>
+      ) : c?.confirm ? (
+        <div class="start-code" data-start-confirm>
+          <div class="start-kicker">Approved on {c.confirm.approver || "your device"}. Is this your account?</div>
+          <div class="start-code-big start-fp" data-start-account={c.confirm.account}>
+            {c.confirm.account}
+          </div>
+          <p class="start-dim">
+            The device you approved on shows your account's fingerprint in the approval and under Devices and machines… Check they're the same before this
+            machine trusts the account.
+          </p>
+          <div class="start-confirm">
+            <button class="start-btn primary" disabled={busy} onClick={() => void confirm(true)} data-start-same>
+              They match
+            </button>
+            <button class="start-btn" disabled={busy} onClick={() => void confirm(false)} data-start-different>
+              They don't
+            </button>
+          </div>
+        </div>
       ) : c?.pending ? (
         <div class="start-code" data-start-pending>
           <div class="start-kicker">Approve this code on a signed-in device</div>
@@ -501,7 +563,7 @@ function Cloud({
       ) : (
         <>
           <button class="start-btn primary big" disabled={busy || !setup} onClick={connect} data-start-connect>
-            {busy ? "Asking the cloud…" : "Connect to illogical cloud"}
+            {busy ? "Asking the cloud…" : ours ? "Connect to illogical cloud" : `Connect to ${hostOf(control)}`}
           </button>
           {(error ?? c?.error) && (
             <div class="start-said" data-start-error>

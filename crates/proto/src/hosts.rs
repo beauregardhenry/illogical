@@ -21,6 +21,10 @@ pub enum Transport {
     /// daemon in a sandbox that sleeps. Its URLs, if any, are tailnet ones
     /// to upgrade to once it's awake.
     Provider,
+    /// Over ssh, from each client (M51): `illogical --host NAME` runs the
+    /// system `ssh` to [`Host::ssh`]. No URLs; the web and the phone can't
+    /// reach it, only a terminal can.
+    Ssh,
 }
 
 /// Where a resident daemon lives: a sandbox, and its daemon's port there.
@@ -45,6 +49,10 @@ pub struct Host {
     /// For [`Transport::Provider`]: where it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderRef>,
+    /// For [`Transport::Ssh`]: ssh's destination (`user@box`, or a Host
+    /// from the client's `~/.ssh/config`). Nothing else is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
     #[serde(default)]
     pub added_ms: u64,
     /// When the home daemon last reached it (for a provider host: last
@@ -73,6 +81,9 @@ pub struct AddHost {
     pub urls: Vec<String>,
     #[serde(default)]
     pub transport: Transport,
+    /// For [`Transport::Ssh`]: its destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
 }
 
 /// `GET /api/host`: who this daemon is.
@@ -98,6 +109,25 @@ pub struct HostInfo {
     /// `fountain-runner` unit): what was last read of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fountain_runner: Option<FountainRunnerInfo>,
+    /// What this machine is set up for (#171, #180): the menus offer only
+    /// these, or say how to turn them on. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<HostFeatures>,
+}
+
+/// The optional parts of a machine, as `GET /api/host` reports them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostFeatures {
+    /// Browser blocks on ports and editor blocks: block sites are on
+    /// (`--block-listen`).
+    pub blocks: bool,
+    /// VM tabs and panes and *Sandboxes…*: a sandbox provider (wisp).
+    pub vms: bool,
+    /// A Fountain login here: `FOUNTAIN_API_KEY`, or the CLI's
+    /// credentials file.
+    pub fountain: bool,
+    /// A studio is linked (`illogical studio login`).
+    pub studio: bool,
 }
 
 /// A machine's Fountain runner, for its line in the machine panel and the

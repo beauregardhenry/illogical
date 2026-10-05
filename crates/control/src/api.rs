@@ -149,6 +149,9 @@ pub async fn enroll(State(app): State<Arc<App>>, s: Session, Json(b): Json<Enrol
         }
         Some(root) => {
             let new = app.db.device(&s.account, &c.device)?.is_none();
+            if new {
+                app.limits.check_account(crate::limit::ENROLLS, &s.account)?;
+            }
             app.db.put_device(&Cert { approver: String::new(), sig: String::new(), ..c.clone() }, false, now_ms())?;
             // The account's other devices hear of it once (#104), not on
             // every reload of the waiting page.
@@ -310,6 +313,39 @@ pub struct JoinReq {
     /// What the daemon understands, comma-separated (older ones send none).
     #[serde(default)]
     features: String,
+    /// Its signature with the key it asks with (0.17 and newer).
+    #[serde(default)]
+    proof: Option<JoinProof>,
+}
+
+#[derive(Deserialize)]
+pub struct JoinProof {
+    ms: u64,
+    sig: String,
+}
+
+/// How far a join proof's time may be from control's clock.
+const PROOF_SKEW_MS: u64 = 5 * 60 * 1000;
+
+/// What an older daemon is told when a join would need its key.
+const JOIN_NEEDS_UPDATE: &str =
+    "this machine was joined before: update illogical (0.17 or newer) on it, then run join again";
+
+/// Whether the join request comes from the key's holder: an error if it
+/// says so and doesn't, `false` if it doesn't say (an older daemon).
+fn join_proven(app: &App, b: &JoinReq) -> Result<bool, ApiError> {
+    let Some(p) = &b.proof else { return Ok(false) };
+    let body = illogical_e2e::cert::join_proof_body(&b.cert, p.ms);
+    if !illogical_e2e::cert::verify_hex(&b.cert.sign, body.as_bytes(), &p.sig) {
+        return Err(err(StatusCode::UNAUTHORIZED, "the join request isn't signed by the key it asks with"));
+    }
+    if now_ms().abs_diff(p.ms) > PROOF_SKEW_MS {
+        return Err(err(StatusCode::UNAUTHORIZED, "clock skew: check this machine's time"));
+    }
+    if !app.daemon_sigs.first(&format!("join {}", p.sig), p.ms + PROOF_SKEW_MS + 60_000) {
+        return Err(err(StatusCode::UNAUTHORIZED, "that join request was used already; run join again"));
+    }
+    Ok(true)
 }
 
 /// A daemon that can't check this team's rosters (one was written with a
@@ -344,10 +380,23 @@ pub async fn join(
 ) -> R {
     app.limits.check(crate::limit::JOINS, app.limits.client_ip(peer, &headers))?;
     b.cert.check_request().map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
-    if b.cert.kind != Kind::Daemon {
-        return Err(err(StatusCode::BAD_REQUEST, "a daemon certificate"));
+    // A daemon, or the CLI (M49), which joins the same way: a code shown
+    // where it runs, approved on a signed-in device.
+    match b.cert.kind {
+        Kind::Daemon => {}
+        Kind::Cli if b.urls.is_empty() && b.team.is_none() && b.ticket.is_none() && b.proof.is_some() => {}
+        Kind::Cli => {
+            return Err(err(StatusCode::BAD_REQUEST, "a CLI joins with its key's proof and nothing else"));
+        }
+        _ => return Err(err(StatusCode::BAD_REQUEST, "a daemon certificate")),
     }
     check_urls(&b.urls)?;
+    // A daemon control knows joins again only with its key: anyone may
+    // have its certificate.
+    let proven = join_proven(&app, &b)?;
+    if !proven && app.db.device_known(&b.cert.device)? {
+        return Err(err(StatusCode::UPGRADE_REQUIRED, JOIN_NEEDS_UPDATE));
+    }
     let code = join_code(&b.cert);
     let poll = token();
     let team_name = match &b.team {
@@ -372,6 +421,7 @@ pub async fn join(
         b.team.as_deref(),
         sandbox.as_deref(),
         &b.features,
+        proven,
         now_ms(),
     )?;
     Ok(Json(
@@ -454,11 +504,27 @@ pub async fn join_approve(
             err(StatusCode::NOT_FOUND, "no such code (expired?)")
         })?;
     let c = b.cert;
-    if c.account != s.account || c.kind != Kind::Daemon || !c.same_request(&j.cert) {
+    if c.account != s.account || c.kind != j.cert.kind || !c.same_request(&j.cert) {
         refused("join_approve", &s.account, &c, "not the daemon that asked");
         return Err(err(StatusCode::BAD_REQUEST, "that's not the daemon that asked"));
     }
     approval_ok(&app, &s.account, &c, "join_approve")?;
+    // The CLI (M49): one of the account's devices from now on, like a
+    // browser it approved. The account's machines learn of it now.
+    if c.kind == Kind::Cli {
+        if b.team.is_some() {
+            return Err(err(StatusCode::BAD_REQUEST, "a CLI joins your account, not a team"));
+        }
+        app.db.put_device(&c, true, now_ms())?;
+        app.db.approve_join(&code, &c, None)?;
+        nudge(&app, &s.account);
+        return Ok(Json(json!({ "approved": true, "device": c.device })));
+    }
+    let known = app.db.device_known(&c.device)?;
+    if known && !j.proven {
+        refused("join_approve", &s.account, &c, "a known daemon's join without its key");
+        return Err(err(StatusCode::CONFLICT, JOIN_NEEDS_UPDATE));
+    }
     // A team's machine: only its owners add one, and the approving device
     // signs it in, for the daemon to check.
     let team = match &b.team {
@@ -476,6 +542,11 @@ pub async fn join_approve(
         }
         None => None,
     };
+    // Its holder joined it again: whatever it was before goes.
+    if known {
+        app.db.drop_daemon(&c.device)?;
+        app.relay.drop_daemon(&c.device);
+    }
     app.db.put_device(&c, true, now_ms())?;
     app.db.put_daemon(&s.account, &c.device, &c.name, &j.urls)?;
     app.db.set_daemon_features(&c.device, &j.features)?;
@@ -630,5 +701,12 @@ pub async fn directory(State(app): State<Arc<App>>, s: Session) -> R {
             "account": owner, "owner_name": owner_name, "team": team, "chain": crate::teams::chain_of(&app, &owner)?,
         }));
     }
-    Ok(Json(json!({ "daemons": daemons })))
+    // Sessions someone offers to share with me, for me to answer first.
+    let mut offers = Vec::new();
+    for id in app.db.offers_for(&s.account)? {
+        let Some((owner, d)) = app.db.daemon_row(&id)? else { continue };
+        let Some(who) = app.db.account(&owner)? else { continue };
+        offers.push(json!({ "daemon": d.id, "name": d.name, "account": owner, "owner_name": who.name, "owner_login": who.login }));
+    }
+    Ok(Json(json!({ "daemons": daemons, "offers": offers })))
 }

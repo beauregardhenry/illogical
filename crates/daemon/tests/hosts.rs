@@ -4,101 +4,71 @@
 //! kept out of it (`--tailscale-socket` points nowhere), and a fake tailnet
 //! name stands in for serve.
 
-mod listen;
-mod strays;
-
 use std::{
-    io::{Read, Write},
-    net::TcpStream,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
-    time::{Duration, Instant},
+    process::{Command, Output},
+    time::Duration,
 };
 
+use illogical_testkit::{Daemon, illogicald};
 use serde_json::{Value, json};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
 const PUBLIC: &str = "box.example.ts.net";
 const OWNER: &str = "me@example.com";
 
-struct Daemon {
-    child: Child,
-    port: u16,
-    state: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        strays::remove(&self.state);
-    }
+/// One local token for every daemon here, and the CLI: two daemons on one
+/// machine, as one person's (the CLI's `--host URL` shows it to both).
+fn token_file() -> PathBuf {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::env::temp_dir().join(format!("ilg-hosts-token-{}", std::process::id()));
+    // Made once, before any daemon starts (they'd race to make it).
+    static MADE: std::sync::Once = std::sync::Once::new();
+    MADE.call_once(|| {
+        let mut w = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&f).unwrap();
+        w.write_all(format!("ilt_hosts{:032x}", std::process::id() as u128 * 7919).as_bytes()).unwrap();
+    });
+    f
 }
 
 fn start(name: &str, extra: &[&str]) -> Daemon {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let state =
-        std::env::temp_dir().join(format!("ilg-hosts-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-    let _ = std::fs::remove_dir_all(&state);
-    let child = Command::new(env!("CARGO_BIN_EXE_illogicald"))
-        .args(["--listen", listen::ANY, "--shell", "bash --norc --noprofile", "--no-manager-env"])
-        .args(["--name", name, "--tailscale-socket", "/nonexistent/tailscaled.sock"])
+    illogicald!("hosts")
+        .args(["--name", name])
+        .no_tailscale()
         .args(["--public-host", PUBLIC, "--owner", OWNER])
         .args(extra)
-        .arg("--state-dir")
-        .arg(&state)
         .env("PS1", "$ ")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut d = Daemon { child, port: 0, state };
-    d.port = listen::wait_port(&d.state);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while std::os::unix::net::UnixStream::connect(d.sock()).is_err()
-        || TcpStream::connect(("127.0.0.1", d.port)).is_err()
-    {
-        assert!(Instant::now() < deadline, "daemon did not start");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    d
+        .env("ILLOGICAL_LOCAL_TOKEN_FILE", token_file())
+        .start()
 }
 
-impl Daemon {
-    fn sock(&self) -> PathBuf {
-        match std::fs::read_to_string(self.state.join("sock.path")) {
-            Ok(p) => PathBuf::from(p.trim()),
-            Err(_) => self.state.join("sock"),
-        }
-    }
+trait Http {
+    fn http(&self, method: &str, path: &str, headers: &[(&str, &str)], body: Option<Value>) -> (u16, String, String);
+}
 
-    fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
+impl Http for Daemon {
     /// One HTTP request over TCP with these headers; status, headers, body.
     fn http(&self, method: &str, path: &str, headers: &[(&str, &str)], body: Option<Value>) -> (u16, String, String) {
-        let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
         let body = body.map(|b| b.to_string()).unwrap_or_default();
-        let mut req = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
-        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
-            req.push_str(&format!("Host: 127.0.0.1:{}\r\n", self.port));
-        }
-        for (k, v) in headers {
-            req.push_str(&format!("{k}: {v}\r\n"));
+        let mut headers = headers.to_vec();
+        // A program on this machine shows the local token (serve's
+        // requests carry an identity instead, and hosts' paths a token of
+        // their own).
+        let own_credential = ["/api/sync/", "/api/hosts/join", "/api/dial"].iter().any(|p| path.starts_with(p));
+        let bearer = self.bearer();
+        if !own_credential
+            && !self.token().is_empty()
+            && !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("tailscale-user-login"))
+        {
+            headers.push(("Authorization", &bearer));
         }
         if !body.is_empty() {
-            req.push_str("Content-Type: application/json\r\n");
+            headers.push(("Content-Type", "application/json"));
         }
-        req.push_str("\r\n");
-        req.push_str(&body);
-        s.write_all(req.as_bytes()).unwrap();
-        let mut res = String::new();
-        s.read_to_string(&mut res).unwrap();
-        let (head, body) = res.split_once("\r\n\r\n").unwrap_or((&res, ""));
-        let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
-        (status, head.to_ascii_lowercase(), body.to_owned())
+        self.tcp(method, path, &headers, Some(&body))
     }
 }
 
@@ -112,7 +82,14 @@ fn cli_bin() -> PathBuf {
 }
 
 fn cli(home: &Daemon, args: &[&str]) -> Output {
-    Command::new(cli_bin()).arg("--socket").arg(home.sock()).args(args).env_remove("ILLOGICAL_PANE").output().unwrap()
+    Command::new(cli_bin())
+        .arg("--socket")
+        .arg(home.sock())
+        .args(args)
+        .env_remove("ILLOGICAL_PANE")
+        .env("ILLOGICAL_LOCAL_TOKEN_FILE", token_file())
+        .output()
+        .unwrap()
 }
 
 fn stdout(o: &Output) -> String {
@@ -120,12 +97,8 @@ fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !f() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+fn wait_for(what: &str, f: impl FnMut() -> bool) {
+    illogical_testkit::wait_for(what, Duration::from_secs(15), f);
 }
 
 #[test]
@@ -174,6 +147,7 @@ async fn another_daemon_accepts_the_home_page_and_nobody_else() {
     let ws = |origin: &str| {
         let mut req = format!("ws://127.0.0.1:{}/ws", other.port).into_client_request().unwrap();
         req.headers_mut().insert("origin", origin.parse().unwrap());
+        req.headers_mut().insert("authorization", format!("Bearer {}", other.token()).parse().unwrap());
         connect_async(req)
     };
     assert!(ws(&home.url()).await.is_ok(), "the home daemon's page may connect");
@@ -183,6 +157,7 @@ async fn another_daemon_accepts_the_home_page_and_nobody_else() {
     // The home daemon itself doesn't accept the other's page.
     let mut req = format!("ws://127.0.0.1:{}/ws", home.port).into_client_request().unwrap();
     req.headers_mut().insert("origin", other.url().parse().unwrap());
+    req.headers_mut().insert("authorization", format!("Bearer {}", home.token()).parse().unwrap());
     assert!(connect_async(req).await.is_err());
 
     let (other, home_url) = (std::sync::Arc::new(other), home.url());

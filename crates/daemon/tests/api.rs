@@ -1,126 +1,34 @@
 //! M3 end to end: shell integration, the HTTP API over the Unix socket, and
 //! attention, against the real binary running real bash.
 
-mod listen;
-mod strays;
-
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     os::unix::net::UnixStream,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU32, Ordering},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
+use illogical_testkit::{Daemon, illogicald};
 use serde_json::{Value, json};
 
-struct Daemon {
-    child: Child,
-    port: u16,
-    state: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        strays::remove(&self.state);
-    }
-}
-
 fn start() -> Daemon {
-    static N: AtomicU32 = AtomicU32::new(0);
-    // Short: Unix socket paths are limited to ~100 bytes.
-    let state =
-        std::env::temp_dir().join(format!("ilg-api-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-    let _ = std::fs::remove_dir_all(&state);
-    let child = Command::new(env!("CARGO_BIN_EXE_illogicald"))
-        .args(["--listen", listen::ANY, "--shell", "bash --norc --noprofile", "--no-manager-env"])
-        .arg("--state-dir")
-        .arg(&state)
-        .env("PS1", "$ ")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut d = Daemon { child, port: 0, state };
-    d.port = listen::wait_port(&d.state);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while UnixStream::connect(d.sock()).is_err() {
-        assert!(Instant::now() < deadline, "daemon did not start");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    start_with(&[])
+}
+
+fn start_with(env: &[(&str, &std::ffi::OsStr)]) -> Daemon {
+    let d = illogicald!("api").env("PS1", "$ ").envs(env.iter().copied()).wait_secs(10).start();
     // The first shell's first prompt (the integration is loaded).
-    d.wait_for(|| d.get("/api/panes")[0]["cwd"].is_string());
+    d.wait_for("the first prompt", || d.get("/api/panes")[0]["cwd"].is_string());
     d
 }
 
-impl Daemon {
-    fn sock(&self) -> PathBuf {
-        match std::fs::read_to_string(self.state.join("sock.path")) {
-            Ok(p) => PathBuf::from(p.trim()),
-            Err(_) => self.state.join("sock"),
-        }
-    }
+trait Panes {
+    fn send(&self, pane: u64, text: &str);
+    fn pane(&self, id: u64) -> Value;
+}
 
-    /// One HTTP request over the socket; the whole body.
-    fn raw(&self, method: &str, path: &str, body: Option<Value>) -> (u16, String) {
-        let mut s = UnixStream::connect(self.sock()).unwrap();
-        let body = body.map(|b| b.to_string()).unwrap_or_default();
-        s.write_all(
-            format!(
-                "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        let mut r = BufReader::new(s);
-        let mut line = String::new();
-        r.read_line(&mut line).unwrap();
-        let status = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-        let mut chunked = false;
-        loop {
-            line.clear();
-            r.read_line(&mut line).unwrap();
-            if line.trim().is_empty() {
-                break;
-            }
-            chunked |= line.to_ascii_lowercase().starts_with("transfer-encoding: chunked");
-        }
-        let mut out = Vec::new();
-        if chunked {
-            loop {
-                line.clear();
-                r.read_line(&mut line).unwrap();
-                let n = usize::from_str_radix(line.trim(), 16).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                let mut chunk = vec![0; n + 2];
-                r.read_exact(&mut chunk).unwrap();
-                out.extend_from_slice(&chunk[..n]);
-            }
-        } else {
-            r.read_to_end(&mut out).unwrap();
-        }
-        (status, String::from_utf8_lossy(&out).into_owned())
-    }
-
-    fn get(&self, path: &str) -> Value {
-        let (status, body) = self.raw("GET", path, None);
-        assert_eq!(status, 200, "{path}: {body}");
-        serde_json::from_str(&body).unwrap_or(Value::String(body))
-    }
-
-    fn post(&self, path: &str, body: Value) -> Value {
-        let (status, text) = self.raw("POST", path, Some(body));
-        assert_eq!(status, 200, "{path}: {text}");
-        serde_json::from_str(&text).unwrap()
-    }
-
+impl Panes for Daemon {
     fn send(&self, pane: u64, text: &str) {
         self.post(&format!("/api/panes/{pane}/send"), json!({"text": text, "enter": true}));
     }
@@ -128,14 +36,20 @@ impl Daemon {
     fn pane(&self, id: u64) -> Value {
         self.get("/api/panes").as_array().unwrap().iter().find(|p| p["id"] == id).cloned().unwrap_or(Value::Null)
     }
+}
 
-    fn wait_for(&self, f: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !f() {
-            assert!(Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
+/// A machine with no CA certificates (no `ca-certificates` package): the
+/// daemon falls back to its bundled roots instead of going down at start.
+#[test]
+fn starts_on_a_machine_without_ca_certificates() {
+    let dir = std::env::temp_dir().join(format!("ilg-noca-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("empty.pem"), "").unwrap();
+    // rustls-native-certs reads only these when they're set.
+    let d = start_with(&[("SSL_CERT_FILE", dir.join("empty.pem").as_os_str()), ("SSL_CERT_DIR", dir.as_os_str())]);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(d.get("/api/panes").as_array().is_some_and(|p| !p.is_empty()));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -145,7 +59,7 @@ fn shell_integration_reports_commands_exit_codes_and_cwd() {
     let w = d.get("/api/panes/1/wait?until=command-end&timeout=10");
     assert_eq!((w["result"].as_str(), w["exit"].as_i64()), (Some("command_end"), Some(1)), "{w}");
     assert_eq!(w["text"], "cd /tmp && false");
-    d.wait_for(|| d.pane(1)["cwd"] == "/tmp");
+    d.wait_for("the cwd", || d.pane(1)["cwd"] == "/tmp");
     assert_eq!(d.pane(1)["last"]["exit"], 1);
 
     // send then wait, back to back, always sees the new command.
@@ -202,15 +116,15 @@ fn run_wait_capture_history_search_export() {
     let msg = json!({"text": "\r", "enter": false});
     d.post(&format!("/api/panes/{pane}/send"), msg);
     d.send(pane, "exit");
-    d.wait_for(|| d.pane(pane).is_null());
+    d.wait_for("the pane to close", || d.pane(pane).is_null());
     // The pane leaves the list at once; its history moves to the closed
     // ones once its program has gone.
-    d.wait_for(|| d.get(&format!("/api/history?pane={pane}"))[0]["open"] == false);
+    d.wait_for("its history to move", || d.get(&format!("/api/history?pane={pane}"))[0]["open"] == false);
 
     // A script can close what it opened, even while it's running.
     let long = d.post("/api/run", json!({"command": "sleep 600"}))["pane"].as_u64().unwrap();
     d.post(&format!("/api/panes/{long}/close"), json!({}));
-    d.wait_for(|| d.pane(long).is_null());
+    d.wait_for("the pane to close", || d.pane(long).is_null());
     assert_eq!(d.raw("POST", &format!("/api/panes/{long}/close"), Some(json!({}))).0, 404);
 }
 
@@ -237,8 +151,7 @@ fn a_pane_closed_as_it_starts_takes_its_program_even_if_the_daemon_dies() {
     let cmd = format!("sleep 600; : {}/", d.state.display());
     let pane = d.post("/api/run", json!({ "command": cmd }))["pane"].as_u64().unwrap();
     d.post(&format!("/api/panes/{pane}/close"), json!({}));
-    let _ = d.child.kill();
-    let _ = d.child.wait();
+    d.kill();
     assert!(gone_within(&d.state, 6), "the program outlived its pane");
 
     // A program that shrugs off the hangup: the shim kills it, with no
@@ -247,12 +160,11 @@ fn a_pane_closed_as_it_starts_takes_its_program_even_if_the_daemon_dies() {
     let hup = d.state.join("hup");
     let cmd = format!("trap 'touch {}' HUP; while :; do sleep 0.1; done", hup.display());
     let pane = d.post("/api/run", json!({ "command": cmd }))["pane"].as_u64().unwrap();
-    d.wait_for(|| d.pane(pane)["running"] == true);
+    d.wait_for("the program", || d.pane(pane)["running"] == true);
     std::thread::sleep(Duration::from_millis(300));
     d.post(&format!("/api/panes/{pane}/close"), json!({}));
-    d.wait_for(|| hup.exists());
-    let _ = d.child.kill();
-    let _ = d.child.wait();
+    d.wait_for("the hangup", || hup.exists());
+    d.kill();
     assert!(gone_within(&d.state, 6), "the shim didn't kill what ignored the hangup");
 }
 
@@ -260,12 +172,12 @@ fn a_pane_closed_as_it_starts_takes_its_program_even_if_the_daemon_dies() {
 fn keys_and_mouse_reach_the_program_encoded() {
     let d = start();
     d.send(1, r"printf '\e[?1000h\e[?1006h'; cat -v");
-    d.wait_for(|| d.pane(1)["current"]["text"].as_str().is_some_and(|t| t.contains("cat -v")));
+    d.wait_for("cat", || d.pane(1)["current"]["text"].as_str().is_some_and(|t| t.contains("cat -v")));
     std::thread::sleep(Duration::from_millis(300));
     d.post("/api/panes/1/keys", json!({"keys": ["C-a", "Up", "Enter"]}));
     d.post("/api/panes/1/mouse", json!({"x": 5, "y": 3}));
     d.post("/api/panes/1/keys", json!({"keys": ["Enter"]}));
-    d.wait_for(|| d.raw("GET", "/api/panes/1/capture", None).1.contains("^[[<0;5;3M^[[<0;5;3m"));
+    d.wait_for("the mouse", || d.raw("GET", "/api/panes/1/capture", None).1.contains("^[[<0;5;3M^[[<0;5;3m"));
     let screen = d.raw("GET", "/api/panes/1/capture", None).1;
     assert!(screen.contains("^A^[[A"), "{screen}");
     let p = d.get("/api/panes/1/process");
@@ -304,13 +216,94 @@ fn events_stream_and_attention() {
 
     // Typing in the pane answers it.
     d.send(1, "true");
-    d.wait_for(|| d.pane(1)["attention"] != "needs_input");
+    d.wait_for("attention to clear", || d.pane(1)["attention"] != "needs_input");
     // (After `true` has finished, or its end would reset what follows.)
-    d.wait_for(|| d.pane(1)["last"]["text"] == "true");
+    d.wait_for("the command", || d.pane(1)["last"]["text"] == "true");
 
     // An agent hook sets it directly.
     d.post("/api/panes/1/attention", json!({"state": "done"}));
     assert_eq!(d.pane(1)["attention"], "done");
+}
+
+/// A stand-in `claude` that draws what it's told to: Claude Code's screens,
+/// as `crates/vt/fixtures/screens` has them, or a line and silence.
+fn fake_claude(d: &Daemon) -> String {
+    let bin = d.state.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let agent = bin.join("claude");
+    let script = r#"#!/bin/bash
+rule() { printf '%.0s─' {1..60}; printf '\r\n'; }
+box() { rule; printf '❯ \r\n'; rule; printf '  %s\r\n' "$1"; }
+while read -r l; do
+  printf '\e[2J\e[H'
+  case "$l" in
+    work) printf '✽ Thinking… (3s · ↓ 20 tokens)\r\n\r\n'; box '⏸ manual mode on · esc to interrupt' ;;
+    ask) printf '● Removing the build\r\n\r\n'; rule
+         printf ' Bash command\r\n'; printf '%.0s╌' {1..60}; printf '\r\n rm -rf build\r\n'
+         printf '%.0s╌' {1..60}; printf '\r\n Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel · Tab to amend\r\n' ;;
+    idle) printf '● Done.\r\n\r\n'; box '⏸ manual mode on · ? for shortcuts' ;;
+    notify) printf '\e]9;Claude needs your attention\a' ;;
+    *) echo "ok $l" ;;
+  esac
+done
+"#;
+    std::fs::write(&agent, script).unwrap();
+    std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    agent.display().to_string()
+}
+
+#[test]
+fn a_quiet_agent_doesnt_want_you_its_screen_says_when_it_does() {
+    let d = start();
+    let attention = || d.pane(1)["attention"].as_str().unwrap_or_default().to_owned();
+    // Quiet `secs` long without wanting you.
+    let never_needs = |secs| {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            assert_ne!(attention(), "needs_input", "a quiet agent wanted you");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let until = |want: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while attention() != want {
+            assert!(Instant::now() < deadline, "not {want}: {} {}", d.pane(1), d.get("/api/panes/1/capture"));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    d.send(1, &fake_claude(&d));
+    // It prints a line, then goes quiet: that's not "needs you".
+    d.send(1, "hello");
+    never_needs(4);
+    // A long think: its screen says it's working, however quiet it is.
+    d.send(1, "work");
+    until("working");
+    never_needs(4);
+    assert_eq!(attention(), "working");
+    // A permission prompt wants you, and says for what.
+    d.send(1, "ask");
+    until("needs_input");
+    let items = d.get("/api/attention");
+    let item = items.as_array().unwrap().iter().find(|i| i["pane"] == 1).cloned().unwrap();
+    assert_eq!(item["reason"]["headline"], "Claude Code asks to run `rm -rf build`", "{item}");
+    // Answering it, then the turn ending: no longer wanted (nobody is
+    // watching, so it's done).
+    d.send(1, "work");
+    until("working");
+    // Typing set "working" already; the turn only counts once the screen
+    // has read as working too (a busy machine can take a while to look).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.get("/api/panes/1/detection")["shown"] != "working" {
+        assert!(Instant::now() < deadline, "{}", d.get("/api/panes/1/detection"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    d.send(1, "idle");
+    until("done");
+    // A notification (or a hook) still wants you, over an idle screen.
+    d.send(1, "notify");
+    until("needs_input");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(attention(), "needs_input");
 }
 
 #[test]
@@ -320,8 +313,9 @@ fn the_api_over_tcp_refuses_other_sites() {
     let body = r#"{"command":"touch /tmp/pwned"}"#;
     s.write_all(
         format!(
-            "POST /api/run HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /api/run HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             d.port,
+            d.token(),
             body.len()
         )
         .as_bytes(),
@@ -332,7 +326,13 @@ fn the_api_over_tcp_refuses_other_sites() {
     assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
     // No Origin (a program) is fine.
     let mut s = std::net::TcpStream::connect(("127.0.0.1", d.port)).unwrap();
-    write!(s, "GET /api/panes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", d.port).unwrap();
+    write!(
+        s,
+        "GET /api/panes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        d.port,
+        d.token()
+    )
+    .unwrap();
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");

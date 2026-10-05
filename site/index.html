@@ -5,13 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>illogical — Keep track of your agents without checking every session.</title>
 <meta name="description" content="See which agents need input and what your teammates are working on. Leave unfinished work open, come back later, or join a teammate’s session to help.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="illogical">
 <meta property="og:title" content="illogical — Keep track of your agents without checking every session.">
 <meta property="og:description" content="See which agents need input and what your teammates are working on. Leave unfinished work open, come back later, or join a teammate’s session to help.">
-<meta property="og:image" content="https://illogical.widgets.wtf/img/swarm.png">
+<meta property="og:image" content="https://illogical.widgets.wtf/img/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The swarm: agent sessions grouped by project, with questions and approvals collected in the Needs You rail">
 <meta property="og:url" content="https://illogical.widgets.wtf/">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image:alt" content="The swarm: agent sessions grouped by project, with questions and approvals collected in the Needs You rail">
+<link rel="canonical" href="https://illogical.widgets.wtf/">
 <meta name="color-scheme" content="dark">
-<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="48x48">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@500;800&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -40,7 +49,7 @@
   }
   * { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
-  body { margin: 0; overflow-x: hidden; background: var(--void); color: var(--ink); font: 17px/1.6 var(--f-ui); }
+  body { margin: 0; background: var(--void); color: var(--ink); font: 17px/1.6 var(--f-ui); }
   a { color: var(--ink); text-decoration-color: color-mix(in srgb, var(--s-ask) 70%, transparent); text-underline-offset: 3px; }
   code, pre { font-family: var(--f-mono); }
   code { font-size: 0.86em; background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 3px; }
@@ -57,7 +66,7 @@
   .seg .on, .seg [aria-pressed="true"], .seg [aria-pressed="true"]:hover { background: var(--ink); color: var(--void); }
 
   /* ── Hero ── */
-  .hero { padding: 64px 0 40px; }
+  .hero { padding-block: 64px 40px; }
   .hero h1 { font: 800 clamp(52px, 9vw, 112px)/0.88 var(--f-display); text-transform: uppercase; letter-spacing: 0.005em; margin: 0 0 28px; max-width: 13ch; }
   .hero h1 span { color: var(--mute); font-weight: 500; }
   .hero .row { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: end; }
@@ -175,11 +184,16 @@
   .kinds { display: grid; grid-template-columns: 1fr 1fr; gap: 48px 36px; }
   .kind h3 { font: 800 28px/1 var(--f-display); text-transform: uppercase; margin: 18px 0 8px; }
   .kind p { font-size: 15.5px; margin: 0; }
+  .kind h3 .optin { font: 500 12px/1 var(--f-mono); text-transform: none; color: var(--mute); border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; vertical-align: middle; white-space: nowrap; }
   .also { margin-top: 44px; }
   .also strong { color: var(--ink); }
 
   section.get { padding: 96px 0 72px; }
+  section.hosted { padding: 24px 0 96px; }
+  section.hosted .lead { max-width: 760px; }
   .ways { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 8px; }
+  .ways.four { grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 1100px) { .ways.four { grid-template-columns: repeat(2, 1fr); } }
   .ways .card { padding: 14px 14px 14px 18px; min-width: 0; display: flex; flex-direction: column; }
   .ways .card .ch b { font-size: 24px; }
   .ways pre { background: rgba(0,0,0,0.35); border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; font-size: 12.5px; line-height: 1.55; overflow-x: auto; margin: 4px 0 10px; color: var(--ink); }
@@ -200,7 +214,7 @@
     body { font-size: 16px; }
     .wrap { padding: 0 16px; }
     .brand { font-size: 26px; }
-    .hero { padding: 36px 0 28px; }
+    .hero { padding-block: 36px 28px; }
     .hero .row { grid-template-columns: 1fr; gap: 22px; }
     .install code { font-size: 12.5px; }
     .bar { left: 16px; right: 16px; top: 14px; gap: 8px 14px; }
@@ -220,7 +234,8 @@
     section.feature.flip .text { order: 0; }
     .kinds { grid-template-columns: 1fr; gap: 40px; }
     section.blocks, section.get { padding: 60px 0; }
-    .ways { grid-template-columns: 1fr; }
+    section.hosted { padding: 12px 0 60px; }
+    .ways, .ways.four { grid-template-columns: 1fr; }
     .pane .ph .path { display: none; }
   }
 </style>
@@ -244,7 +259,7 @@
       <p class="lede">See which agents need input and what your teammates are working on. Leave unfinished work open, come back later, or join a teammate’s session to help.</p>
       <div>
         <a class="dl" id="dl-main" href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-arm64.zip"><b>Download for macOS</b><span>Apple silicon · free</span></a>
-        <p class="small dl-alt" id="dl-alt">Intel Mac: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-x86_64.zip">.zip</a> · Linux: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.AppImage">AppImage</a> · <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.deb">.deb</a> · <a href="#install">servers, without a screen</a></p>
+        <p class="small dl-alt" id="dl-alt">Intel Mac: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-x86_64.zip">.zip</a> · Linux: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.AppImage">AppImage</a> · <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.deb">.deb</a> · Windows: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-windows-x86_64-setup.exe">installer</a> · <a href="#install">servers, without a screen</a></p>
         <p class="small">free and open source · the app sets up everything it needs</p>
       </div>
     </div>
@@ -272,7 +287,7 @@
         <div class="peek" id="peek"><div class="ph"><b></b><span></span></div><pre></pre></div>
         <div class="opened" id="opened">
           <figure class="pane">
-            <figcaption class="ph"><b>%62</b> agent · jake-mini <span class="path">· ~/src/auth</span><span class="st">claude code · open</span></figcaption>
+            <figcaption class="ph"><b>%62</b> agent · workstation <span class="path">· ~/src/auth</span><span class="st">claude code · open</span></figcaption>
             <picture>
               <source srcset="img/agent.webp" type="image/webp">
               <img src="img/agent.png" width="2880" height="1800" alt="An agent working through a failing test beside a shell, with its commands and results visible">
@@ -305,7 +320,7 @@
           <p>Questions and approval requests lift out to one rail. Whoever answers first is named on the card.</p>
           <div class="card" aria-hidden="true">
             <div class="ch"><b>Claude Code asks</b></div>
-            <div class="cm">%62 · jake-mini · api</div>
+            <div class="cm">%62 · workstation · api</div>
             <div class="cq">Bash wants to run <code>cargo test -p auth</code></div>
             <div class="ca"><button type="button" class="pri" tabindex="-1">Allow</button><button type="button" tabindex="-1">Deny</button></div>
           </div>
@@ -345,12 +360,12 @@
 
     <section class="feature">
       <div class="text">
-        <p class="meta"><i style="background:var(--k-shell)"></i>jake-mini · restored · scrollback kept</p>
+        <p class="meta"><i style="background:var(--k-shell)"></i>workstation · restored · scrollback kept</p>
         <h2 class="cl">Close the browser. Keep sessions running.</h2>
         <p>Your sessions run on the host machine, independently of your browser. Reopen the workspace to see your terminals and their output.</p>
       </div>
       <figure class="pane opens" style="--c: var(--k-shell)">
-        <figcaption class="ph"><b>%41</b> shell · jake-mini <span class="path">· ~/src/auth</span><span class="st">restored</span></figcaption>
+        <figcaption class="ph"><b>%41</b> shell · workstation <span class="path">· ~/src/auth</span><span class="st">restored</span></figcaption>
         <picture>
           <source srcset="img/restored.webp" type="image/webp">
           <img src="img/restored.png" width="2880" height="1800" loading="lazy" alt="A restored workspace with earlier terminal output preserved above fresh prompts">
@@ -377,7 +392,7 @@
       <div class="text">
         <p class="meta"><i style="background:var(--k-pr)"></i>diff · port · editor · conversation</p>
         <h2 class="cl">Not just terminals.</h2>
-        <p>A terminal is one kind of block. The things you'd switch windows for open beside the pane they're about, in the same tabs and splits, on the same machine, a VM tab's too. They come back after a restart and show on every screen you open, your phone included.</p>
+        <p>A terminal is one kind of block. The things you'd switch windows for open beside the pane they're about, in the same tabs and splits, on the same machine, and they come back after a restart. Changes and conversations work as soon as it's installed; dev servers and VS Code are opt-in, because each needs a web origin of its own (<a href="https://github.com/arugula-salad/illogical/blob/main/docs/advanced.md#browser-blocks-on-ports">how to turn them on</a>).</p>
       </div>
       <div class="kinds">
         <div class="kind">
@@ -385,7 +400,7 @@
             <figcaption class="ph"><b>changes</b> · ~/src/auth <span class="st">read-only</span></figcaption>
             <picture>
               <source srcset="img/changes.webp" type="image/webp">
-              <img src="img/changes.png" width="2880" height="1800" loading="lazy" alt="A failing test run beside a diff block listing the changed files with their hunks, and a file block open at the new sweep function">
+              <img src="img/changes.png" width="2880" height="1800" loading="lazy" alt="A passing test run beside a diff block listing the changed files with their hunks, and a file block open at the new sweep function">
             </picture>
           </figure>
           <h3>What changed</h3>
@@ -399,19 +414,19 @@
               <img src="img/port.png" width="2880" height="1800" loading="lazy" alt="npm run dev in a terminal, and the app it serves in a browser block beside it">
             </picture>
           </figure>
-          <h3>Your dev server, beside it</h3>
-          <p><code>npm run dev</code> in a pane, then open its port: the app sits next to the terminal, hot reload and all, even from a VM or your phone. Each block is its own origin, so the page can't reach illogical. When the server dies the block says so, and the page comes back with it.</p>
+          <h3>Your dev server, beside it <span class="optin">opt-in</span></h3>
+          <p><code>npm run dev</code> in a pane, then open its port: the app sits next to the terminal, hot reload and all. Each block is its own origin, so the page can't reach illogical. When the server dies the block says so, and the page comes back with it. One daemon flag turns it on for the browser on that machine; <a href="https://github.com/arugula-salad/illogical/blob/main/docs/advanced.md#browser-blocks-on-ports">from your phone</a>, it also needs a domain of yours.</p>
         </div>
         <div class="kind">
           <figure class="pane opens" style="--c: var(--k-editor)">
-            <figcaption class="ph"><b>vs code</b> · session.rs:212 <span class="st">on jake-mini</span></figcaption>
+            <figcaption class="ph"><b>vs code</b> · session.rs:212 <span class="st">on workstation</span></figcaption>
             <picture>
               <source srcset="img/editor.webp" type="image/webp">
               <img src="img/editor.png" width="2880" height="1800" loading="lazy" alt="A passing test run beside VS Code, open on the same repository at the changed function">
             </picture>
           </figure>
-          <h3>VS Code where the pane runs</h3>
-          <p><em>Open in editor</em> starts VS Code on the pane's machine, at the file and line, with your settings and extensions kept. No ports, no SSH config, and it sleeps when nobody has it open.</p>
+          <h3>VS Code where the pane runs <span class="optin">opt-in</span></h3>
+          <p><em>Open in editor</em> starts VS Code on the pane's machine, at the file and line, with your settings and extensions kept, and it sleeps when nobody has it open. It's shown like a dev server, so it's turned on <a href="https://github.com/arugula-salad/illogical/blob/main/docs/advanced.md#editor-blocks">the same way</a>.</p>
         </div>
         <div class="kind">
           <figure class="pane opens" style="--c: var(--k-agent)">
@@ -431,7 +446,7 @@
     <section class="get" id="install">
       <p class="meta"><i style="background:var(--k-shell)"></i>your machine · the desktop app</p>
       <h2 class="cl">Get illogical.</h2>
-      <div class="ways">
+      <div class="ways four">
         <div class="card" style="--c: var(--k-agent)">
           <div class="ch"><b>macOS</b></div>
           <div class="cm">apple silicon or intel · .zip</div>
@@ -441,8 +456,14 @@
         <div class="card" style="--c: var(--k-agent)">
           <div class="ch"><b>Linux</b></div>
           <div class="cm">x86_64 · AppImage · .deb</div>
-          <p>The AppImage runs as is (<code>chmod +x</code> it first); the .deb puts it in your apps. It uses WebKitGTK, which desktops have.</p>
+          <p>The AppImage runs as is (<code>chmod +x</code> it first); the .deb puts it in your apps. Either needs Ubuntu 22.04, Debian 12, Fedora 36 or newer.</p>
           <div class="ca"><a class="pri" href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.AppImage" data-dl="linux">AppImage</a><a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.deb">.deb</a></div>
+        </div>
+        <div class="card" style="--c: var(--k-agent)">
+          <div class="ch"><b>Windows</b></div>
+          <div class="cm">x86_64 · installer · cloud client</div>
+          <p>Reaches every machine in your account. Panes don't run on Windows itself yet. It isn't signed yet: when SmartScreen stops it, choose <em>More info</em>, then <em>Run anyway</em>.</p>
+          <div class="ca"><a class="pri" href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-windows-x86_64-setup.exe" data-dl="windows">Download for Windows</a></div>
         </div>
         <div class="card" style="--c: var(--k-shell)">
           <div class="ch"><b>It sets itself up</b></div>
@@ -489,6 +510,30 @@ just bootstrap && just install</pre>
         <div class="ca"><a class="pri" href="https://github.com/arugula-salad/illogical/blob/main/docs/features.md">Features, integrations and restart behavior</a></div>
       </div>
     </section>
+
+    <section class="hosted" id="cloud">
+      <p class="meta"><i style="background:var(--k-server)"></i>illogical control · hosted · free beta</p>
+      <h2 class="cl">Every machine, from any device.</h2>
+      <p class="lead">illogical control is the hosted service behind <em>Getting started</em>'s cloud step. Sign in with GitHub or a passkey, add each machine with <code>illogicald join</code>, and open any of them from your phone, another browser or the desktop app, with or without a tailnet.</p>
+      <div class="ways">
+        <div class="card" style="--c: var(--k-server)">
+          <div class="ch"><b>What it does</b></div>
+          <div class="cm">accounts · devices · relay</div>
+          <p>Keeps your account, your devices and your machines, introduces them to each other, and relays between them when they can't connect directly. Teams share machines the same way.</p>
+        </div>
+        <div class="card" style="--c: var(--k-agent)">
+          <div class="ch"><b>What it can't see</b></div>
+          <div class="cm">end to end encrypted</div>
+          <p>What your terminals say. Every connection between a device and a machine is encrypted end to end, relayed ones included, and a new device gets in only when one you already have approves it.</p>
+        </div>
+        <div class="card done" style="--c: var(--s-done)">
+          <div class="ch"><b>What it costs</b></div>
+          <div class="cm">free during the beta</div>
+          <p>Nothing while illogical is in beta. It's provided as is, without an uptime promise; if pricing comes, it's announced before it applies. Or run your own: it's one binary in the repository.</p>
+        </div>
+      </div>
+      <p class="after"><a href="https://github.com/arugula-salad/illogical/blob/main/docs/control.md">How control works, and running your own</a> · <a href="https://control.illogical.widgets.wtf">Open control</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></p>
+    </section>
   </div>
 </main>
 
@@ -499,6 +544,7 @@ just bootstrap && just install</pre>
     </div>
     <p>Built by <a href="https://jakegaylor.com">Jake Gaylor</a> for your machines and the people you share them with.</p>
     <p>Terminal emulation by <a href="https://ghostty.org">libghostty</a> and <a href="https://xtermjs.org">xterm.js</a>. <a href="https://github.com/arugula-salad/illogical#quickstart">Docs</a> · <a href="https://github.com/arugula-salad/illogical">Source</a> · <a href="https://github.com/arugula-salad/illogical/releases">Releases</a> · MIT or Apache-2.0.</p>
+    <p><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="mailto:privacy@illogical.widgets.wtf">privacy@illogical.widgets.wtf</a></p>
   </div>
 </footer>
 
@@ -516,13 +562,30 @@ just bootstrap && just install</pre>
     });
   }
 
-  // The hero's button is for the visitor's own system: macOS unless it's Linux.
-  if (/Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent)) {
+  // The hero's button is for the visitor's own system: macOS unless it's Linux or Windows.
+  if (/Windows/.test(navigator.userAgent)) {
+    const main = document.getElementById("dl-main");
+    main.href = "https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-windows-x86_64-setup.exe";
+    main.innerHTML = "<b>Download for Windows</b><span>x86_64 · reaches your machines · free</span>";
+    document.getElementById("dl-alt").innerHTML =
+      'Also: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-arm64.zip">macOS</a> (<a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-x86_64.zip">Intel</a>) · <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.AppImage">Linux</a> · <a href="#install">servers, without a screen</a>';
+  } else if (/Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent)) {
     const main = document.getElementById("dl-main");
     main.href = "https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.AppImage";
     main.innerHTML = "<b>Download for Linux</b><span>x86_64 AppImage · free</span>";
     document.getElementById("dl-alt").innerHTML =
       'Also: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.deb">.deb</a> · <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-arm64.zip">macOS</a> (<a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-x86_64.zip">Intel</a>) · <a href="#install">servers, without a screen</a>';
+  } else if (/Macintosh/.test(navigator.userAgent) && navigator.userAgentData?.getHighEntropyValues) {
+    // Chromium browsers say which chip a Mac has; Safari and Firefox don't,
+    // so they keep Apple silicon with Intel beside it.
+    navigator.userAgentData.getHighEntropyValues(["architecture"]).then(({ architecture }) => {
+      if (architecture !== "x86") return;
+      const main = document.getElementById("dl-main");
+      main.href = "https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-x86_64.zip";
+      main.innerHTML = "<b>Download for macOS</b><span>Intel · free</span>";
+      document.getElementById("dl-alt").innerHTML =
+        'Apple silicon: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-macos-arm64.zip">.zip</a> · Linux: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.AppImage">AppImage</a> · <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-linux-x86_64.deb">.deb</a> · Windows: <a href="https://github.com/arugula-salad/illogical/releases/latest/download/illogical-desktop-windows-x86_64-setup.exe">installer</a> · <a href="#install">servers, without a screen</a>';
+    }, () => {});
   }
 
   const live = document.documentElement.classList.contains("live");
@@ -556,8 +619,8 @@ just bootstrap && just install</pre>
     const weighted = (pairs) => { let r = rnd() * pairs.reduce((s, p) => s + p[1], 0); for (const [v, w] of pairs) if ((r -= w) <= 0) return v; return pairs[0][0]; };
 
     const PROJ = [["api", 40], ["infra", 34], ["docs", 44], ["web", 30], ["mobile", 32], ["~/scratch", 26], ["/tmp", 22]];
-    const MACH = [["jake-mini", 3], ["build-01", 2], ["build-02", 2], ["team-box", 3], ["geek", 2], ["sam-laptop", 2]];
-    const WHO = [["jake", 4], ["sam", 3], ["priya", 3], ["ana", 2], ["devon", 2]];
+    const MACH = [["workstation", 3], ["build-01", 2], ["build-02", 2], ["team-box", 3], ["build-03", 2], ["sam-laptop", 2]];
+    const WHO = [["kim", 4], ["sam", 3], ["priya", 3], ["ana", 2], ["devon", 2]];
     const KINDW = [["shell", 22], ["build", 18], ["test", 20], ["agent", 16], ["server", 10], ["logs", 7], ["editor", 7]];
     const LINES = {
       shell: ["$ git status", "On branch main", "nothing to commit, clean", "$ ls", "Cargo.toml  src  web", "$ "],
@@ -575,7 +638,7 @@ just bootstrap && just install</pre>
       tiles.push({ id: id++, proj: p, mach: weighted(MACH), who: weighted(WHO), kind: weighted(KINDW), busy: rnd() < 0.76,
         x: 0, y: 0, tx: 0, ty: 0, jx: (rnd() - 0.5) * 1.6, jy: (rnd() - 0.5) * 1.2, ph: rnd() * 6.28, need: null, sh: (rnd() * 3) | 0 });
     const hero = tiles.find((t) => t.id === 62);
-    Object.assign(hero, { kind: "agent", mach: "jake-mini", who: "jake", busy: true, sh: 0 });
+    Object.assign(hero, { kind: "agent", mach: "workstation", who: "kim", busy: true, sh: 0 });
     document.getElementById("n-panes").textContent = tiles.length;
 
     const offs = [];

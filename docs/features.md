@@ -43,11 +43,25 @@ the daemon stopping, crashing, or the machine rebooting:
   from inside every pane (`ILLOGICAL_PANE` and `ILLOGICAL_SOCK` are set and
   it's on `PATH`). See below.
 - **Attention.** A pane that rings the bell, sends a notification (OSC 9,
-  777, 99), has an agent go quiet mid-command, or is told by a hook, shows a
+  777, 99), shows an agent's prompt waiting on you, or is told by a hook, shows a
   badge on its tab and pane (and in a "Needs you" list on the phone). A long
   command finishing while you're elsewhere shows "done". With *Notify this
   device* on (session menu; the phone's sheet), the phone gets a push notification; tapping it
   opens the pane.
+  - **Agents in terminal panes** (#145). For Claude Code and Codex the
+    daemon reads the bottom of the pane's screen and its title, as its own
+    terminal has them (never where someone has scrolled to), with no hooks
+    needed: a spinner or "esc to interrupt" is *working*, a permission or
+    trust prompt is *needs you* with what it asks ("Claude Code asks to run
+    `rm -rf build`"), and an empty prompt box is *idle*, or *done* when a
+    turn someone started ends while nobody is watching. The agent is found
+    by what runs in the pane's foreground, so `cd x && claude` counts. A turn has to look over in three reads
+    100 ms apart (or for 700 ms) before it counts as ended, and the first
+    second after an agent starts isn't read. Other agents (aider, gemini,
+    opencode...) are known as agents but not read yet; for any agent,
+    going quiet alone never means it wants you. Hooks, notifications and
+    the bell still say so whatever the screen shows. The rules are a small
+    table per agent in `crates/vt/src/detect.rs`.
   - **Why it wants you** (M24). Every pane that wants you says why: *ask*
     (an agent's question or permission request), *failed* (a command that
     ran a few seconds ended non-zero), *exited*, *input* (a bell or a
@@ -264,6 +278,17 @@ the daemon stopping, crashing, or the machine rebooting:
     it; it never picks the agent's own "always", which would write
     `.claude/settings.local.json` into your repo. Claude Code runs with no
     settings sources, so your own hooks don't fire inside it.
+  - *From now on…* on a card keeps a standing rule on this machine
+    (#166): the tool, or commands starting with a prefix, in the block's
+    directory and below or in every agent block. New blocks never ask for
+    what a rule allows. *Permission rules…* in the session menu (or
+    `illogical rules`) lists them, and forgets them.
+  - A block can start with rules and a mode (#163): `illogical agent
+    --allow Bash --permission-mode auto`, or `allow` and `permission_mode`
+    on MCP `start_agent`, so a lead pre-authorizes its subagents (an agent
+    can't start one in `bypassPermissions`). `--user-settings` gives Claude
+    Code your settings (allow and deny lists, default mode, `CLAUDE.md`)
+    with every hook off, as an opened conversation has.
   - The block's log is the JSON-RPC stream; `capture` is the transcript as
     Markdown, `history` lists the agent's commands and turns, `search`
     covers what agents said and ran.
@@ -553,9 +578,15 @@ the daemon stopping, crashing, or the machine rebooting:
     `.illogical/worktrees/`). The branch tracks nothing, so a plain `git
     push` can't land on main. The issue moves to a tab of its own (named
     `#N`), and Claude Code (or `{"agent": "codex"}`…) starts beside it in
-    the worktree with the issue's title, text and link as its prompt, told
-    to open a PR from the branch that closes the issue. *With
-    instructions…* adds to the prompt. The block looks for a PR from that
+    the worktree with the issue's link as its prompt, told to open a PR
+    from the branch that closes the issue. The issue's title and text go
+    in a marked block the prompt calls its author's, to read as a
+    description and not to follow as instructions (anyone who can open an
+    issue on the repository writes them), and the agent starts with
+    nothing allowed ahead of time (no rules, no permission mode, not your
+    own Claude Code settings): what it wants to do comes to you as a card
+    first. *With instructions…*
+    adds to the prompt (yours, outside that block). The block looks for a PR from that
     branch (every 30 s, faster while you look) and, when one appears, opens
     it beside the agent, once. `illogical issue agent %N` does the same.
   - **New issues.** `illogical issue new -t TITLE [-b TEXT]` (in a clone,
@@ -599,7 +630,7 @@ the daemon stopping, crashing, or the machine rebooting:
     ***Spec*** opens the agent-specs file
     that declares a `managed-by: chant` agent (a `.ts` under `src/agents`
     with its `name:`) as a file block; it looks in the checkout you pick
-    (`~/dev/jhgaylor/agent-specs` if it's there). Any other agent, or with
+    (`~/agent-specs` if it's there). Any other agent, or with
     no checkout, opens its page on Fountain.
   - **Read-only.** agent-specs stays the one place a curated agent is
     edited; the catalog never writes to Fountain.
@@ -722,8 +753,15 @@ the daemon stopping, crashing, or the machine rebooting:
     are the owner's; an editor sees the list. `capture --text` is the
     view as text.
 
-- **Other hosts** (M4a). Every daemon is a peer; the one the page comes
-  from (the "home daemon") keeps a list of the others and checks on
+- **Your machines through control** (M48, #151). The main way to reach
+  more than one machine: each one runs `illogicald join` once, and control's
+  page (in a browser or the desktop app) lists every machine of your
+  account and your teams in its host menu, reaching each directly when it
+  can and through control's encrypted relay otherwise. No machine is
+  special: none keeps a list of the others. See [control.md](control.md).
+- **Other hosts over the tailnet** (M4a, the older model, still there for
+  the CLI's `--host` and sandboxes). Every daemon is a peer; the one the
+  page comes from (the "home daemon") keeps a list of the others and checks on
   each every minute. The page shows a host switcher (desktop: the bar's
   left end; phone: the sheet), and each host has its own sessions and tabs.
   Switching connects straight to that daemon; nothing is relayed, and the
@@ -768,6 +806,17 @@ the daemon stopping, crashing, or the machine rebooting:
   with, say), never a tagged node, Funnel or the internet. Links expire (a
   week at most), are listed (`illogical shares`) and revocable (`shares
   revoke ID`), which cuts off anyone watching.
+- **A pane for a guest with only OpenSSH** (M65). `illogical share --guest
+  %3` prints an `ssh` command to send someone: the username is a one-time
+  token and the daemon's host key is pinned in the command, so nothing is
+  saved on their side. The daemon's own ssh server (`--guest-ssh`, port
+  7684) listens only while an invite exists, and a session can only watch
+  that pane: no shell, no account, no commands, no forwarding. Read-only
+  unless `--rw`, which types under the one-driver rule with the guest's
+  `--name` on their input. Invites are single use unless `--reusable`,
+  expire (an hour by default; a day at most, two hours with `--rw`), end
+  with the pane, and `illogical guests revoke ID` cuts the guest off at
+  once.
 - **History that outlives a sandbox** (M4c). With `--sync` (closed panes)
   or `--sync-live` (open ones too), a host pushes its panes' log segments
   and indexes to the home daemon with its token, resuming from what is
