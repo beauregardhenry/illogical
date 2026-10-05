@@ -26,6 +26,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::{info, warn};
 
 use crate::server::App;
 
@@ -38,9 +39,9 @@ const TAILSCALE_DOWNLOAD: &str = "https://tailscale.com/download";
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/api/setup", get(status))
-        .route("/api/setup/tailscale", post(tailscale_serve))
+        .route("/api/setup/tailscale", post(|s: AppState| async move { logged("tailscale", tailscale_serve(s).await) }))
         .route("/api/setup/control", post(control_join))
-        .route("/api/setup/claude", post(claude_mcp))
+        .route("/api/setup/claude", post(|s: AppState| async move { logged("claude", claude_mcp(s).await) }))
 }
 
 /// What a button did: done, or why not and what fixes it.
@@ -61,6 +62,18 @@ struct Outcome {
 struct Link {
     label: String,
     url: String,
+}
+
+/// A step's outcome, in the daemon's log too: by the time anyone asks why a
+/// step didn't take, the screen that said so is usually closed.
+fn logged(step: &str, out: Json<Outcome>) -> Json<Outcome> {
+    let o = &out.0;
+    if o.ok {
+        info!(step, "setup step done");
+    } else {
+        warn!(step, error = ?o.error, fix = ?o.fix, link = ?o.link.as_ref().map(|l| &l.url), "setup step failed");
+    }
+    out
 }
 
 impl Outcome {
@@ -341,12 +354,17 @@ async fn control_join(State(app): AppState, body: Option<Json<JoinReq>>) -> Json
             tokio::spawn(async move {
                 // control.json lands where the running daemon looks for it.
                 let r = crate::control::join_finish(p, &dir).await;
+                match &r {
+                    Ok(_) => info!(step = "control", "setup step done"),
+                    Err(e) => warn!(step = "control", error = %e, "setup step failed"),
+                }
                 let mut j = JOIN.lock().unwrap();
                 *j = (None, r.err().map(|e| e.to_string()));
             });
             Json(serde_json::json!({ "pending": pending }))
         }
         Err(e) => {
+            warn!(step = "control", %url, error = %e, "setup step failed");
             JOIN.lock().unwrap().1 = Some(e.to_string());
             Json(serde_json::json!({ "error": e.to_string() }))
         }
@@ -394,6 +412,7 @@ async fn claude_mcp(State(app): AppState) -> Json<Outcome> {
         return Json(Outcome::err("Can't find the illogical CLI next to the daemon."));
     };
     let cli = cli.display().to_string();
+    info!(claude = %c.display(), %cli, "adding illogical to Claude Code");
     match run(&app, &c, &["mcp", "add", "--scope", "user", "illogical", "--", &cli, "mcp"], Duration::from_secs(20))
         .await
     {
