@@ -4,8 +4,20 @@
 //! Control stores rosters and checks them as daemons do (it never keeps
 //! one a daemon would throw away), but it can't make one: every version is
 //! signed by a team owner's device.
+//!
+//! **Who control routes to a daemon.** A daemon says which accounts it
+//! lets in (`POST /api/daemon/access`), but that list is only a filter:
+//! control routes an account to a daemon (the directory, the relay, push
+//! notifications, certificates) only if the account has a say in it: it
+//! owns the daemon, it's in the daemon's team, it's in a team with the
+//! daemon's owner, or it accepted a session the daemon shares with it
+//! (`POST /api/shares/{daemon}`). Anyone else a daemon names waits as an
+//! offer, which the person sees with the owner's name and answers.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     Json,
@@ -75,9 +87,33 @@ fn certs_of(app: &App, account: &str) -> anyhow::Result<(Vec<Cert>, Vec<Revocati
 fn certs_for<'a>(app: &App, accounts: impl Iterator<Item = &'a str>) -> anyhow::Result<AccountCerts> {
     let mut out = HashMap::new();
     for a in accounts {
-        out.insert(a.to_owned(), certs_of(app, a)?);
+        // A deleted account's signing devices, kept to check the history
+        // it signed (#173).
+        let certs = match app.db.retained_certs(a)? {
+            Some(kept) if app.db.account(a)?.is_none() => kept,
+            _ => certs_of(app, a)?,
+        };
+        out.insert(a.to_owned(), certs);
     }
     Ok(out)
+}
+
+/// Members' names as they set them (#208): a roster carries one word per
+/// member (it's signed text), so "Sam Stranger" is "Sam-Stranger" there.
+/// What to show; the roster's word stays what's checked.
+fn names_of<'a>(app: &App, accounts: impl Iterator<Item = &'a str>) -> anyhow::Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    for a in accounts {
+        if let Some(x) = app.db.account(a)?.filter(|x| !x.name.is_empty()) {
+            out.insert(a.to_owned(), x.name);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+pub fn certs_for_test(app: &App, accounts: &[String]) -> AccountCerts {
+    certs_for(app, accounts.iter().map(String::as_str)).unwrap()
 }
 
 fn parse(body: &str) -> anyhow::Result<Roster> {
@@ -131,7 +167,15 @@ pub struct Lookup {
 /// Someone to share with, by their sign-in login or their name (#102):
 /// their account and the root device to pin (compare its fingerprint with
 /// them).
-pub async fn person(State(app): State<Arc<App>>, _s: Session, Query(q): Query<Lookup>) -> R {
+pub async fn person(
+    State(app): State<Arc<App>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    s: Session,
+    Query(q): Query<Lookup>,
+) -> R {
+    app.limits.check_account(crate::limit::PEOPLE, &s.account)?;
+    app.limits.check(crate::limit::PEOPLE, app.limits.client_ip(peer, &headers))?;
     let asked = q.login.split_whitespace().collect::<Vec<_>>().join(" ");
     let a = match app.db.account_by_login(&asked)? {
         Some(a) => Some(a),
@@ -174,6 +218,11 @@ pub async fn create(State(app): State<Arc<App>>, s: Session, Json(b): Json<NewTe
     if r.version != 1 || r.team.len() != 16 || app.db.team(&r.team)?.is_some() {
         return Err(err(StatusCode::BAD_REQUEST, "a new team starts at version 1 with a fresh id"));
     }
+    // Others come in by invite: by asking, or with a link's key.
+    if r.members.len() != 1 {
+        return Err(err(StatusCode::BAD_REQUEST, "a new team has just you in it; invite the others"));
+    }
+    app.limits.check_account(crate::limit::TEAMS, &s.account)?;
     let pin = TeamPin { team: r.team.clone(), founder: s.account.clone(), founder_root: root.clone() };
     if !r.follows(None, &pin, &certs_for(&app, [s.account.as_str()].into_iter())?) {
         return Err(err(StatusCode::FORBIDDEN, "the roster must be signed by one of your devices, with you as owner"));
@@ -199,20 +248,41 @@ pub async fn list(State(app): State<Arc<App>>, s: Session) -> R {
         let mine = role_in(&r, &s.account);
         let requests = if mine == Some(TeamRole::Owner) { app.db.requests(&r.team)? } else { vec![] };
         let certs = certs_for(&app, r.members.iter().map(|m| m.account.as_str()))?;
+        let names = names_of(&app, r.members.iter().map(|m| m.account.as_str()))?;
         out.push(json!({
             "team": t.id, "pin": pin(&t), "locked": t.locked, "roster": r, "role": mine,
-            "requests": requests, "certs": certs,
+            "requests": requests, "certs": certs, "names": names,
         }));
     }
     // Teams I asked to join, and whose yes I'm waiting for (#103).
     let mut asked = Vec::new();
     for team in app.db.asked(&s.account)? {
         let Ok(r) = latest(&app, &team) else { continue };
-        let owners: Vec<&str> =
-            r.members.iter().filter(|m| m.role == TeamRole::Owner).map(|m| m.name.as_str()).collect();
+        let names = names_of(&app, r.members.iter().map(|m| m.account.as_str()))?;
+        let owners: Vec<&str> = r
+            .members
+            .iter()
+            .filter(|m| m.role == TeamRole::Owner)
+            .map(|m| names.get(&m.account).unwrap_or(&m.name).as_str())
+            .collect();
         asked.push(json!({ "team": team, "name": r.name, "owners": owners }));
     }
-    Ok(Json(json!({ "teams": out, "asked": asked })))
+    // Teams that went while I wasn't looking (#206), to show once.
+    let notices: Vec<Value> = app
+        .db
+        .notices(&s.account)?
+        .into_iter()
+        .map(|(id, title, body)| json!({ "id": id, "title": title, "body": body }))
+        .collect();
+    Ok(Json(json!({ "teams": out, "asked": asked, "notices": notices })))
+}
+
+/// `POST /api/me/notices/{id}/seen`: shown; don't show it again.
+pub async fn notice_seen(State(app): State<Arc<App>>, s: Session, Path(id): Path<i64>) -> R {
+    if !app.db.drop_notice(&s.account, id)? {
+        return Err(err(StatusCode::NOT_FOUND, "no such notice"));
+    }
+    Ok(Json(json!({})))
 }
 
 #[derive(Deserialize)]
@@ -235,6 +305,17 @@ pub async fn set_roster(
     let accounts: Vec<&str> = prev.members.iter().chain(&b.roster.members).map(|m| m.account.as_str()).collect();
     if !b.roster.follows(Some(&prev), &pin(&t), &certs_for(&app, accounts.into_iter())?) {
         return Err(err(StatusCode::FORBIDDEN, "a new roster is the next version, signed by an owner's device"));
+    }
+    // Nobody is added who didn't ask: each new member asked to join (and
+    // is added with the first device they asked with), or is redeeming an
+    // invite as themselves (below).
+    let requests = app.db.requests(&team)?;
+    for m in b.roster.members.iter().filter(|m| prev.member(&m.account).is_none()) {
+        let asked = requests.iter().any(|r| r.account == m.account && r.root == m.root);
+        let redeeming = b.roster.redeem.is_some() && m.account == s.account;
+        if !asked && !redeeming {
+            return Err(err(StatusCode::FORBIDDEN, "only people who asked to join (or used an invite) can be added"));
+        }
     }
     // A presigned invite: one control still holds (so it works once, and
     // not after a lock), redeemed by whoever is signed in here.
@@ -320,6 +401,7 @@ pub async fn invite(State(app): State<Arc<App>>, s: Session, Path(team): Path<St
     if role_in(&r, &s.account) != Some(TeamRole::Owner) {
         return Err(err(StatusCode::FORBIDDEN, "owners invite"));
     }
+    app.limits.check_account(crate::limit::TEAM_INVITES, &s.account)?;
     if let Some(inv) = b.presigned {
         let now = illogical_e2e::now_ms();
         // A daemon from before presigned invites refuses the roster one
@@ -363,6 +445,37 @@ pub async fn invite(State(app): State<Arc<App>>, s: Session, Path(team): Path<St
     Ok(Json(
         json!({ "code": code, "link": format!("{}/#invite={team}.{code}", app.cfg.public_url), "expires": expires }),
     ))
+}
+
+/// A team's outstanding presigned invites, for its owners (#134): who
+/// each is for (the role), when it expires and who made it. Used ones are
+/// gone already (the redeem drops them).
+pub async fn list_presigned(State(app): State<Arc<App>>, s: Session, Path(team): Path<String>) -> R {
+    if role_in(&latest(&app, &team)?, &s.account) != Some(TeamRole::Owner) {
+        return Err(err(StatusCode::FORBIDDEN, "owners see invites"));
+    }
+    let mut out = Vec::new();
+    for (key, body, expires, by) in app.db.presigned_of(&team, illogical_e2e::now_ms())? {
+        let inv: Invite = serde_json::from_str(&body)?;
+        let by_name = app.db.account(&by)?.map(|a| a.name).unwrap_or_default();
+        out.push(json!({ "key": key, "role": inv.role, "expires": expires, "by": by, "by_name": by_name }));
+    }
+    Ok(Json(json!({ "invites": out })))
+}
+
+/// Cancel a presigned invite before it's used (#134): control refuses it
+/// at redeem from then on. Daemons never knew of it, so this is only as
+/// good as control is honest, which is fine for a lost link.
+pub async fn cancel_presigned(State(app): State<Arc<App>>, s: Session, Path((team, key)): Path<(String, String)>) -> R {
+    if role_in(&latest(&app, &team)?, &s.account) != Some(TeamRole::Owner) {
+        return Err(err(StatusCode::FORBIDDEN, "owners cancel invites"));
+    }
+    app.db
+        .presigned(&key, illogical_e2e::now_ms())?
+        .filter(|(t, _, _)| *t == team)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "that invite expired, was used, or never was"))?;
+    app.db.drop_presigned(&key)?;
+    Ok(Json(json!({})))
 }
 
 pub async fn show_invite(State(app): State<Arc<App>>, _s: Session, Path((team, code)): Path<(String, String)>) -> R {
@@ -510,6 +623,16 @@ pub async fn daemon_team(State(app): State<Arc<App>>, d: DaemonAuth, Query(q): Q
     app.db.set_daemon_features(&d.cert.device, &q.features)?;
     let Some(team) = app.db.daemon_team(&d.cert.device)? else { return Ok(Json(json!({ "team": null }))) };
     let t = app.db.team(&team)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such team"))?;
+    // A machine downgraded after its team took a presigned invite would
+    // stop at the first version one wrote and keep whoever was in then,
+    // removed or not (#135). It's told why instead, as `daemon_teams`
+    // leaves such a team out.
+    if !takes_presigned(&q.features) && has_presigned(&app, &team)? {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "this machine's illogical is older than its team's invites: update illogical to keep up with the team",
+        ));
+    }
     let rosters: Vec<Roster> =
         app.db.rosters(&team, q.since)?.iter().map(|b| parse(b)).collect::<anyhow::Result<_>>()?;
     // Certificates for everyone in any version it will check, the one it
@@ -521,7 +644,8 @@ pub async fn daemon_team(State(app): State<Arc<App>>, d: DaemonAuth, Query(q): Q
     accounts.sort();
     accounts.dedup();
     let certs = certs_for(&app, accounts.iter().map(String::as_str))?;
-    Ok(Json(json!({ "team": pin(&t), "locked": t.locked, "rosters": rosters, "certs": certs })))
+    let names = names_of(&app, accounts.iter().map(String::as_str))?;
+    Ok(Json(json!({ "team": pin(&t), "locked": t.locked, "rosters": rosters, "certs": certs, "names": names })))
 }
 
 #[derive(Deserialize)]
@@ -560,9 +684,12 @@ pub async fn daemon_teams(State(app): State<Arc<App>>, d: DaemonAuth, Query(q): 
         accounts.sort();
         accounts.dedup();
         let certs = certs_for(&app, accounts.iter().map(String::as_str))?;
+        let names = names_of(&app, accounts.iter().map(String::as_str))?;
         out.insert(
             team.to_owned(),
-            json!({ "team": pin(&t), "name": t.name, "locked": t.locked, "rosters": rosters, "certs": certs }),
+            json!({
+                "team": pin(&t), "name": t.name, "locked": t.locked, "rosters": rosters, "certs": certs, "names": names,
+            }),
         );
     }
     Ok(Json(Value::Object(out)))
@@ -575,15 +702,103 @@ pub struct Peers {
 
 /// Certificates of accounts a daemon was shared with (by its owner,
 /// through their channel): it checks them against the roots it pinned.
-pub async fn daemon_peers(State(app): State<Arc<App>>, _d: DaemonAuth, Query(q): Query<Peers>) -> R {
-    let accounts: Vec<&str> = q.accounts.split(',').filter(|a| !a.is_empty()).take(200).collect();
+/// Only accounts control routes to it (see the top); anyone else it names
+/// becomes an offer they answer, and gets certificates here once they
+/// accept.
+pub async fn daemon_peers(State(app): State<Arc<App>>, d: DaemonAuth, Query(q): Query<Peers>) -> R {
+    let owner = app.db.daemon_account(&d.cert.device)?.unwrap_or_else(|| d.cert.account.clone());
+    let rel = Relations::of(&app, &d.cert.device, &owner)?;
+    let mut accounts: Vec<&str> = q.accounts.split(',').filter(|a| !a.is_empty()).take(200).collect();
+    accounts.sort_unstable();
+    accounts.dedup();
     let mut out = serde_json::Map::new();
+    let mut asking = Vec::new();
     for a in accounts {
+        if !rel.routes(&app, a)? {
+            // Only real accounts that haven't turned it down are asked.
+            if app.db.share_answer(a, &d.cert.device)?.is_none() && app.db.account(a)?.is_some_and(|x| x.root.is_some())
+            {
+                asking.push(a.to_owned());
+            }
+            continue;
+        }
         let name = app.db.account(a)?.map(|x| x.name).unwrap_or_default();
         let (certs, revocations) = certs_of(&app, a)?;
         out.insert(a.to_owned(), json!({ "certs": certs, "revocations": revocations, "name": name }));
     }
+    asking.truncate(50);
+    let new = app.db.offer_shares(&d.cert.device, &asking, illogical_e2e::now_ms())?;
+    // Each new offer shows someone a prompt: a brake on how many.
+    let mut over = false;
+    for a in &new {
+        if over || app.limits.check_daemon(crate::limit::OFFERS, &d.cert.device).is_err() {
+            over = true;
+            asking.retain(|x| x != a);
+        }
+    }
+    if over {
+        app.db.offer_shares(&d.cert.device, &asking, illogical_e2e::now_ms())?;
+    }
     Ok(Json(Value::Object(out)))
+}
+
+/// What control knows of who has a say in a daemon: its owner, its team's
+/// members, and the owner's teammates. Share answers are looked up as
+/// needed.
+pub struct Relations {
+    daemon: String,
+    owner: String,
+    near: HashSet<String>,
+}
+
+impl Relations {
+    pub fn of(app: &App, daemon: &str, owner: &str) -> anyhow::Result<Self> {
+        let mut near = HashSet::from([owner.to_owned()]);
+        if let Some(team) = app.db.daemon_team(daemon)?
+            && let Some(body) = app.db.latest_roster(&team)?
+        {
+            near.extend(parse(&body)?.members.into_iter().map(|m| m.account));
+        }
+        for body in app.db.teams_of(owner)? {
+            near.extend(parse(&body)?.members.into_iter().map(|m| m.account));
+        }
+        Ok(Self { daemon: daemon.to_owned(), owner: owner.to_owned(), near })
+    }
+
+    /// Whether control routes `account` to this daemon (if the daemon lets
+    /// it in): see the top of this file. An account that turned the
+    /// daemon's share down isn't, even a teammate.
+    pub fn routes(&self, app: &App, account: &str) -> anyhow::Result<bool> {
+        if account == self.owner {
+            return Ok(true);
+        }
+        match app.db.share_answer(account, &self.daemon)? {
+            Some(yes) => Ok(yes),
+            None => Ok(self.near.contains(account)),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ShareAnswer {
+    accept: bool,
+}
+
+/// `POST /api/shares/{daemon} {accept}`: someone's answer to a session a
+/// daemon offered to share with them.
+pub async fn answer_share(
+    State(app): State<Arc<App>>,
+    s: Session,
+    Path(daemon): Path<String>,
+    Json(b): Json<ShareAnswer>,
+) -> R {
+    if b.accept && !app.db.offered(&daemon, &s.account)? {
+        return Err(err(StatusCode::NOT_FOUND, "that machine isn't sharing anything with you (any more?)"));
+    }
+    app.db.answer_share(&s.account, &daemon, b.accept, illogical_e2e::now_ms())?;
+    // It fetches their certificates now, and lets them in.
+    app.relay.nudge(&[daemon]);
+    Ok(Json(json!({ "accepted": b.accept })))
 }
 
 #[derive(Deserialize)]
@@ -594,7 +809,8 @@ pub struct Access {
 }
 
 /// Which accounts a daemon lets in, for the directory and the relay. The
-/// daemon decides for itself; this only routes.
+/// daemon decides for itself; control routes only those it would anyway
+/// (see the top): this list narrows that, never widens it.
 pub async fn daemon_access(State(app): State<Arc<App>>, d: DaemonAuth, Json(b): Json<Access>) -> R {
     if b.accounts.len() > 500 {
         return Err(err(StatusCode::BAD_REQUEST, "too many"));
@@ -618,7 +834,7 @@ pub fn may_reach(app: &App, account: &str, id: &str) -> anyhow::Result<bool> {
             return Ok(!t.locked || role == TeamRole::Owner);
         }
     }
-    app.db.daemon_lets_in(id, account)
+    Ok(app.db.daemon_lets_in(id, account)? && Relations::of(app, id, &owner)?.routes(app, account)?)
 }
 
 /// Daemons beyond an account's own that it may reach: its teams' and
@@ -628,7 +844,12 @@ pub fn reachable(app: &App, account: &str) -> anyhow::Result<Vec<String>> {
     for body in app.db.teams_of(account)? {
         ids.extend(app.db.team_daemons(&parse(&body)?.team)?);
     }
-    ids.extend(app.db.shared_daemons(account)?);
+    for id in app.db.shared_daemons(account)? {
+        let Some(owner) = app.db.daemon_account(&id)? else { continue };
+        if Relations::of(app, &id, &owner)?.routes(app, account)? {
+            ids.push(id);
+        }
+    }
     ids.sort();
     ids.dedup();
     Ok(ids)

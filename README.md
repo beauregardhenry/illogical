@@ -20,9 +20,13 @@ tabs and splits you drive with the mouse.
   [ACP](https://agentclientprotocol.com) agent as a UI beside your
   terminals: tool calls with their output, approvals and questions as
   cards big enough for a thumb.
-- **VS Code beside your terminals.** *Open in editor* (or `illogical edit
-  src/main.rs:42`) opens VS Code on the pane's machine, in its directory,
-  as a block: on the phone too, and back with its file after a restart.
+- **VS Code and dev servers beside your terminals** (opt-in). *Open in
+  editor* (or `illogical edit src/main.rs:42`) opens VS Code on the pane's
+  machine, in its directory, as a block, back with its file after a
+  restart; *Open a port…* shows a dev server beside its terminal. Both are
+  off until the daemon gets a listener for them (one flag for this
+  computer's browser; a domain of yours for the phone): see
+  [advanced setup](docs/advanced.md#browser-blocks-on-ports).
 - **What did the agent change?** *Changes* on a pane (or `illogical diff`)
   lists the files changed in its repository, on its machine, with +/−; tap
   a file for its hunks and a line to see the file there, both updating
@@ -51,8 +55,9 @@ Linux (x86_64, arm64) and macOS (Apple silicon and Intel). Share a session with
 someone, or a whole machine with a team, with roles and presence
 ([docs/teams.md](docs/teams.md)). Remote access is over your tailnet, or
 through [illogical control](docs/control.md) for devices without one: end
-to end encrypted, so the service relays for your devices but can't read
-your terminals.
+to end encrypted, so what the service relays it can't read, and it can't
+add a reader to your machines. You do trust it for the web client it
+serves ([what holds](docs/control-e2e.md#what-holds-against-control)).
 
 ## Install
 
@@ -61,14 +66,22 @@ x86_64), from [illogical.widgets.wtf](https://illogical.widgets.wtf) or the
 [latest release](https://github.com/arugula-salad/illogical/releases/latest):
 `illogical-desktop-macos-arm64.zip` (Apple silicon),
 `illogical-desktop-macos-x86_64.zip` (Intel),
-`illogical-desktop-linux-x86_64.AppImage` or `.deb`. The first time it opens it installs `illogicald` and `illogical` in
+`illogical-desktop-linux-x86_64.AppImage` or `.deb` (the Linux app runs on
+Ubuntu 22.04, Debian 12, Fedora 36 or newer: glibc 2.35 and up). The first
+time it opens it installs `illogicald` and `illogical` in
 `~/.local/bin` and starts the daemon as a service, then *Getting started*
 sets up your phone, the cloud and Claude Code, a click each. Once the
-machine is in illogical cloud, the app signs in through your browser
-(approve it as a new device once) and shows every machine in your account
+machine is in illogical cloud, the app signs in through your browser on
+the same computer (approve it as a new device once) and shows every machine in your account
 and your teams. The macOS app
 isn't notarized yet: the first time, open it, then choose *Open Anyway* in
 System Settings › Privacy & Security.
+
+**On Windows** (x86_64), `illogical-desktop-windows-x86_64-setup.exe` is
+a client for illogical cloud: sign in and it shows the machines in your
+account. Panes don't run on Windows itself yet (the Windows track, #224).
+It isn't signed yet: when SmartScreen stops it, choose *More info*, then
+*Run anyway*.
 
 **Servers and machines without a screen:**
 
@@ -96,9 +109,27 @@ On Linux, let it start at boot, before you log in:
 loginctl enable-linger $USER
 ```
 
+**Updating.** When a newer release is out, the top bar says so, with the
+command for how you installed it. Panes keep running while the daemon
+restarts.
+
+- install.sh: run it again.
+- Homebrew: `brew upgrade illogical && illogicald install`.
+- The desktop app: download the new one and open it. When it finds an
+  older daemon running as the service, it puts its own in its place,
+  keeping the daemon's flags and your panes.
+
+The daemon finds out by asking GitHub where its latest release is, at
+most twice a day; nothing else is sent. `illogicald install --
+--no-update-check` turns that off.
+
 ## Quickstart
 
-1. Open <http://127.0.0.1:7681>. Right-click a pane or a tab for
+1. Run `illogical web`: it opens <http://127.0.0.1:7681> in your browser,
+   signed in (programs on this machine show its local token; see
+   [docs/advanced.md](docs/advanced.md)). Over ssh it prints the link
+   and the `ssh -L` that forwards the port to the computer you're at.
+   Right-click a pane or a tab for
    everything. Drag a tab or a pane onto another pane's edge to split it
    there; drag dividers to resize.
 2. **From your phone and other machines**, put it behind Tailscale on this
@@ -143,7 +174,8 @@ loginctl enable-linger $USER
    illogicald join https://control.illogical.widgets.wtf
    ```
 
-   See [docs/control.md](docs/control.md), including running your own.
+   The hosted control is free during the beta, provided as is. See
+   [docs/control.md](docs/control.md), including running your own.
    **With a team:** make one in control (*Teams…*), invite people, and
    pick the team when you approve a machine's join. Roles, personal vs
    team machines and sharing one session: [docs/teams.md](docs/teams.md).
@@ -184,8 +216,8 @@ loginctl enable-linger $USER
        "ask": [
          "mcp__illogical__run", "mcp__illogical__send_input", "mcp__illogical__close",
          "mcp__illogical__open_port", "mcp__illogical__open_app", "mcp__illogical__start_agent",
-         "mcp__illogical__open_conversation", "mcp__illogical__agent_respond", "mcp__illogical__show_changes",
-         "mcp__illogical__show_file", "mcp__illogical__open_workspace", "mcp__illogical__open_pr",
+         "mcp__illogical__open_conversation", "mcp__illogical__prompt_agent", "mcp__illogical__agent_respond",
+         "mcp__illogical__show_changes", "mcp__illogical__show_file", "mcp__illogical__open_workspace", "mcp__illogical__open_pr",
          "mcp__illogical__pr_comment", "mcp__illogical__pr_review", "mcp__illogical__pr_merge",
          "mcp__illogical__open_issue", "mcp__illogical__issue_comment", "mcp__illogical__issue_new",
          "mcp__illogical__open_fountain"
@@ -209,7 +241,11 @@ diff and follow.
    It makes a `fountain` user (its sandboxes under
    `/home/fountain/sandboxes`), the `fountain-runner` systemd unit, and a
    sudoers rule: you may run `/bin/bash` as `fountain`, and
-   `systemctl start|stop|restart|status fountain-runner` as root.
+   `systemctl start|stop|restart|status fountain-runner` as root. The
+   unit keeps its agents off this machine's loopback (where illogicald
+   and your other local services listen), but for DNS;
+   `--allow-loopback` lets them use it (a dev server they start and
+   test, say).
 2. Then, as you: `illogical fountain runner install` (makes the runner's key
    without printing it, and starts the unit); `illogical fountain runner
    status` shows it.
@@ -261,8 +297,7 @@ layout still come back. VM tabs are Linux only.
 - [docs/cli.md](docs/cli.md): the CLI and the HTTP API.
 - [docs/development.md](docs/development.md): building, testing, the code's
   layout, and what building it taught us.
-- [BRIEF.md](BRIEF.md) and [PLAN.md](PLAN.md): why it exists, the
-  decisions and the milestones.
+- [PLAN.md](PLAN.md): the decisions and the milestones.
 
 ## License
 

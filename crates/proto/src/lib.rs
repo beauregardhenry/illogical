@@ -133,8 +133,8 @@ pub enum Attention {
     Idle,
     /// A command is running and producing output.
     Working,
-    /// It asked for you (a notification, a bell, an agent's hook) or an agent
-    /// went quiet mid-command.
+    /// It asked for you (a notification, a bell, an agent's hook, or a
+    /// prompt on an agent's screen).
     NeedsInput,
     /// A long command finished while nobody was looking.
     Done,
@@ -178,8 +178,8 @@ pub struct Reason {
 pub enum ReasonKind {
     /// An agent asks: a question, or a permission to approve.
     Ask,
-    /// It waits on you some other way (a bell, a notification, an agent
-    /// gone quiet).
+    /// It waits on you some other way (a bell, a notification, a prompt on
+    /// an agent's screen).
     Input,
     /// A command that ran a while ended with a non-zero exit.
     Failed,
@@ -434,6 +434,11 @@ pub enum Policy {
     Rerun { confirm: bool },
     /// A fixed command, such as `claude --continue`.
     Hook { command: String },
+    /// The agent conversation that was running in it, by its session id
+    /// (#146): `claude --resume <id>`, `codex resume <id>`. If none was, a
+    /// shell; if its transcript or directory is gone, a shell that says so.
+    /// A pane running Claude Code gets this unless someone picked another.
+    Resume,
 }
 
 /// Control messages from the server.
@@ -832,6 +837,10 @@ pub struct PaneInfo {
     /// and agents.
     #[serde(default, rename = "kind", skip_serializing_if = "Option::is_none")]
     pub work: Option<WorkKind>,
+    /// What a restart resumes (#146): the agent conversation running in
+    /// it, as "Claude Code conversation <title>", when its policy says to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes: Option<String>,
     /// The git repository it works in, if any (M23).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<Project>,

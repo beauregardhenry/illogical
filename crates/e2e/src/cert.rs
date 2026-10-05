@@ -319,6 +319,12 @@ impl Trust {
 }
 
 /// The code a daemon shows when joining, derived from its keys: the device
+/// What a daemon signs with its own key when it asks to join (0.17 and
+/// newer): that whoever asks holds the key, not just its certificate.
+pub fn join_proof_body(cert: &Cert, ms: u64) -> String {
+    format!("illogical join proof v1\n{ms}\n{}", cert.body())
+}
+
 /// approving it recomputes it from the certificate control shows, so
 /// control can't swap in a key of its own. Ten base32 characters, as
 /// `XXXXX-XXXXX`.
@@ -336,6 +342,19 @@ pub fn join_code(cert: &Cert) -> String {
         bits <<= 5;
     }
     s
+}
+
+/// A signed request to control, as the `x-illogical-auth` header's value:
+/// `v2 <device id> <ms> <nonce> <sig>`, signed over the method, the path
+/// and query, the time, a fresh nonce and the body's SHA-256. Daemons sign
+/// every request this way, and so does the CLI (M49).
+pub fn request_auth(keys: &DeviceKeys, method: &str, path_and_query: &str, body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let ms = crate::now_ms();
+    let nonce = hex::encode(crate::random::<16>());
+    let digest = hex::encode(Sha256::digest(body));
+    let msg = format!("illogical daemon auth v2\n{method}\n{path_and_query}\n{ms}\n{nonce}\n{digest}\n");
+    format!("v2 {} {ms} {nonce} {}", keys.id(), hex::encode(keys.signature(msg.as_bytes())))
 }
 
 /// Parse a code as typed: case, spaces and dashes don't matter.

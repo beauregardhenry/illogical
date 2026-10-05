@@ -44,6 +44,9 @@ const WAIT_MAX: Duration = Duration::from_secs(3600);
 const PROGRESS_EVERY: Duration = Duration::from_secs(15);
 /// The last lines a finished command's result carries.
 const TAIL_LINES: usize = 40;
+/// Permission modes that approve everything (Claude Code's, codex-acp's):
+/// start_agent won't start an agent in one (#163).
+const SKIPS_CHECKS: &[&str] = &["bypassPermissions", "full-access"];
 
 fn progress_every() -> Duration {
     // Tests make it short.
@@ -287,6 +290,19 @@ pub struct StartAgentArgs {
     /// Where it works.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Tools whose requests it may make without asking (`Read`, `Edit`,
+    /// `Bash`, ...), as "always" on a card.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// The permission mode its session starts in: `default`, `acceptEdits`,
+    /// `plan`, `auto` (Claude Code's), or the agent's own. Not one that
+    /// skips every check: the user picks that.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    /// For claude: the user's Claude Code settings (allow and deny lists,
+    /// default mode, CLAUDE.md), without their hooks.
+    #[serde(default)]
+    pub user_settings: bool,
     /// Open it beside this pane (an agent block's token: beside itself).
     #[serde(default)]
     pub beside: Option<PaneArg>,
@@ -347,6 +363,23 @@ pub enum Response {
     Answer,
     /// Skip the pending question.
     Skip,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct PromptArgs {
+    /// An agent block, or a terminal running an agent (Claude Code, Codex).
+    pub pane: PaneArg,
+    /// The prompt.
+    pub text: String,
+    /// It's waiting on an approval or a question and this answers it.
+    /// Without it, an agent waiting on someone isn't typed at: its
+    /// question comes back instead.
+    #[serde(default)]
+    pub answering: bool,
+    /// Seconds before answering "still running" (default 100): then wait
+    /// until idle.
+    #[serde(default)]
+    pub timeout: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -724,6 +757,16 @@ fn defs() -> Vec<Def> {
             open_world: true,
         },
         Def {
+            name: "prompt_agent",
+            title: "Prompt an agent and wait",
+            description: "Give an agent (an agent block, or Claude Code or Codex in a terminal) a prompt and wait for its turn in one call: returns when the turn ends (done), when it asks for someone (needs_input, with the question: agent_respond answers it), or stalled with its screen's last lines if it shows no sign of work within a few seconds (no agent there, the prompt not submitted, the agent gone). An agent already waiting on an approval or question isn't typed at; its question comes back (pass answering to type the answer).",
+            schema: schema_for_type::<PromptArgs>,
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+            open_world: false,
+        },
+        Def {
             name: "agent_respond",
             title: "Answer an agent",
             description: "Allow or deny an agent's pending permission request, or answer or skip its pending question (as wait until needs_input showed it).",
@@ -1012,6 +1055,10 @@ impl<'a> Call<'a> {
             },
             "open_conversation" => match parse(args) {
                 Ok(a) => self.open_conversation(a).await,
+                Err(e) => Err(e),
+            },
+            "prompt_agent" => match parse(args) {
+                Ok(a) => self.prompt_agent(a).await,
                 Err(e) => Err(e),
             },
             "agent_respond" => match parse(args) {
@@ -2173,6 +2220,10 @@ impl<'a> Call<'a> {
             None => None,
         };
         may_start(self.on_machine().await?, host.is_some(), a.vm, a.as_fountain.is_some())?;
+        // An agent doesn't hand another one every check switched off.
+        if let Some(m) = a.permission_mode.as_deref().filter(|m| SKIPS_CHECKS.contains(m)) {
+            return Err(format!("permission_mode {m} skips every check: only the user starts an agent like that"));
+        }
         if let Some(name) = a.as_fountain.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             // M44: it runs on this host with the owner's secrets.
             if !matches!(a.agent, AgentKind::Claude) {
@@ -2206,6 +2257,16 @@ impl<'a> Call<'a> {
         }
         if let Some(c) = &a.cwd {
             config["cwd"] = json!(c);
+        }
+        // #163: a lead pre-authorizing what it hands out.
+        if !a.allow.is_empty() {
+            config["allow"] = a.allow.iter().map(|t| json!({ "tool": t })).collect();
+        }
+        if let Some(m) = &a.permission_mode {
+            config["permission_mode"] = json!(m);
+        }
+        if a.user_settings {
+            config["user_settings"] = json!(true);
         }
         let req = OpenRequest {
             kind: BlockType::Agent,
@@ -2272,6 +2333,36 @@ impl<'a> Call<'a> {
             Some(e) => format!("Opened it in %{block}, but: {e}"),
             None => format!("It's in %{block}; send_input to it to go on, then wait and read_output"),
         };
+        done(summary, v)
+    }
+
+    async fn prompt_agent(&self, a: PromptArgs) -> Out {
+        use illogical_proto::api::PromptResult;
+        let pane = a.pane.id()?;
+        self.drivable(pane).await?;
+        let limit = Self::limit(a.timeout);
+        let app = self.app.clone();
+        let by = self.by();
+        let fut = async move { crate::api::prompt(&app, pane, a.text, a.answering, crate::api::STALL, Some(by)).await };
+        let r = self.waiting(&format!("waiting for %{pane}'s turn"), limit, fut).await;
+        let r = match r {
+            Some(r) => r?,
+            None => return self.not_yet(pane, limit, Some("end of its turn")).await,
+        };
+        let summary = match &r {
+            PromptResult::Done => format!("%{pane} finished its turn; read_output or capture_screen for what it said"),
+            PromptResult::NeedsInput { question, .. } => {
+                format!("%{pane} asks: {}; agent_respond answers it", question.as_deref().unwrap_or("for someone"))
+            }
+            PromptResult::Blocked { question, .. } => format!(
+                "%{pane} was already waiting on someone ({}), so nothing was typed; agent_respond answers it, or pass answering",
+                question.as_deref().unwrap_or("a question")
+            ),
+            PromptResult::Stalled { why, .. } => format!("%{pane} stalled: {why}"),
+            PromptResult::StillRunning => format!("%{pane} is still working: wait until idle"),
+        };
+        let mut v = serde_json::to_value(&r).map_err(|e| e.to_string())?;
+        v["pane"] = json!(pane);
         done(summary, v)
     }
 
@@ -2648,7 +2739,7 @@ mod tests {
     #[test]
     fn annotations_are_honest() {
         let all = list(Scope::Full);
-        assert_eq!(all.len(), 31);
+        assert_eq!(all.len(), 32);
         let ro: Vec<&str> = all
             .iter()
             .filter(|t| t.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true))

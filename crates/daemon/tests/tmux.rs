@@ -5,22 +5,17 @@
 //! same success or error, and the same body once ids, checksums and the
 //! known differences are set aside.
 
-mod strays;
-
 use std::{
     collections::{HashMap, VecDeque},
     io::{Read, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{
-        LazyLock,
-        atomic::{AtomicU32, Ordering},
-        mpsc,
-    },
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
+use illogical_testkit::{Daemon, illogicald};
 use regex::Regex;
 
 const COLS: u16 = 120;
@@ -77,49 +72,8 @@ fn detailed() -> String {
 const LIST_WINDOWS: &str =
     "list-windows -F \"#{window_id} #{window_layout} #{window_flags} #{window_visible_layout} #{pane-border-status}\"";
 
-struct Daemon {
-    child: Child,
-    state: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        strays::remove(&self.state);
-    }
-}
-
-impl Daemon {
-    fn start() -> Self {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let state =
-            std::env::temp_dir().join(format!("ilg-tmux-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-        let _ = std::fs::remove_dir_all(&state);
-        let child = Command::new(env!("CARGO_BIN_EXE_illogicald"))
-            .args(["--listen", "127.0.0.1:0", "--shell", "bash --norc --noprofile", "--no-manager-env"])
-            .arg("--state-dir")
-            .arg(&state)
-            .env("PS1", "$ ")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let d = Daemon { child, state };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while UnixStream::connect(d.sock()).is_err() {
-            assert!(Instant::now() < deadline, "daemon did not start");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        d
-    }
-
-    fn sock(&self) -> PathBuf {
-        match std::fs::read_to_string(self.state.join("sock.path")) {
-            Ok(p) => PathBuf::from(p.trim()),
-            Err(_) => self.state.join("sock"),
-        }
-    }
+fn start() -> Daemon {
+    illogicald!("tmux").env("PS1", "$ ").wait_secs(10).start()
 }
 
 /// The CLI, built next to the daemon (cargo builds only this package's
@@ -239,10 +193,15 @@ impl Cc {
         self.stdin.flush().unwrap();
     }
 
+    /// Read lines for `timeout` (no longer, even while lines keep coming:
+    /// callers' deadlines hold under a flood).
     fn pump(&mut self, timeout: Duration) {
         let end = Instant::now() + timeout;
         loop {
             let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
             match self.rx.recv_timeout(left) {
                 Ok(l) => self.on_line(l),
                 Err(mpsc::RecvTimeoutError::Timeout) => return,
@@ -266,9 +225,9 @@ impl Cc {
         }
         let shown = line.replace('\x1b', "\\033").replace('\t', "\\t");
         self.lines.push(shown.clone());
-        // Once, not per line: a flood is tens of thousands of lines.
-        static GUARD: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"^%(begin|end|error) (\d+) (\d+) (\d+)$").unwrap());
+        // Once, not per line: a flood is hundreds of thousands of lines.
+        static GUARD: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new(r"^%(begin|end|error) (\d+) (\d+) (\d+)$").unwrap());
         if let Some(m) = GUARD.captures(&line) {
             let flags: u32 = m[4].parse().unwrap();
             if &m[1] == "begin" {
@@ -292,11 +251,9 @@ impl Cc {
 
     /// Until every command is answered and the line goes quiet.
     fn wait_idle(&mut self) {
-        self.wait_idle_within(Duration::from_secs(15));
-    }
-
-    fn wait_idle_within(&mut self, budget: Duration) {
-        let end = Instant::now() + budget;
+        // A deadline for a failure, not a wait: generous for a loaded
+        // machine.
+        let end = Instant::now() + Duration::from_secs(60);
         while Instant::now() < end {
             let n = self.lines.len();
             self.pump(Duration::from_millis(300));
@@ -676,7 +633,7 @@ fn compare(cmd: &str, ours: &(bool, Vec<String>), theirs: &(bool, Vec<String>)) 
 
 #[test]
 fn iterm2s_conversation_gets_tmuxs_answers() {
-    let daemon = Daemon::start();
+    let daemon = start();
     // The daemon starts with a session; tmux's transcript starts with none.
     {
         let mut c = Cc::start(&daemon, &["-CC"]);
@@ -887,7 +844,7 @@ fn attached(daemon: &Daemon, flags: &[&str]) -> (Cc, u32, u32, u32) {
 
 /// Wait for a pane's shell prompt (`$ `), through the client.
 fn wait_prompt(c: &mut Cc, pane: u32) {
-    let end = Instant::now() + Duration::from_secs(10);
+    let end = Instant::now() + Duration::from_secs(60);
     loop {
         c.send(&[&format!("display -p -t %{pane} '#{{cursor_x}}'")]);
         c.wait_idle();
@@ -911,7 +868,7 @@ fn assert_clean(c: &Cc) {
 /// Ghostty branch send, from their source (S11): the replies they parse.
 #[test]
 fn wezterm_and_ghostty_get_what_they_parse() {
-    let daemon = Daemon::start();
+    let daemon = start();
 
     // ---- WezTerm: no pause mode, strict parsing
     let (mut c, sid, wid, pane) = attached(&daemon, &["-CC"]);
@@ -1068,7 +1025,7 @@ fn formats_match_real_tmux() {
         eprintln!("{} is older than 3.6; skipping", v.trim());
         return;
     }
-    let daemon = Daemon::start();
+    let daemon = start();
     let (mut c, _, _, first) = attached(&daemon, &["-CC"]);
     c.send(&["rename-session s11", &format!("split-window -h -t %{first}")]);
     c.wait_idle();
@@ -1140,7 +1097,7 @@ fn formats_match_real_tmux() {
 /// `continue` carries on from the capture.
 #[test]
 fn falling_behind_pauses_the_pane() {
-    let daemon = Daemon::start();
+    let daemon = start();
     let (mut c, _, _, pane) = attached(&daemon, &["-CC"]);
     c.send(&["refresh-client -fpause-after=1"]);
     c.wait_idle();
@@ -1150,43 +1107,51 @@ fn falling_behind_pauses_the_pane() {
     // Not reading: the front end blocks writing to us.
     let mut c = Cc::start_stalled(&daemon, &["-CC"]);
     c.send(&["refresh-client -fpause-after=1", &format!("refresh-client -C {COLS},{ROWS}")]);
-    paste(&mut c, pane, "yes m5-flood | head -c 40000000; echo flood-done\r");
+    // A flood that lasts until it's stopped: how long a fixed amount takes
+    // depends on the machine's load, and one still running after `continue`
+    // would make the client fall behind (and pause) again.
+    paste(&mut c, pane, "yes m5-flood; echo flood-done\r");
     std::thread::sleep(Duration::from_secs(6));
     c.resume();
-    let end = Instant::now() + Duration::from_secs(60);
+    let end = Instant::now() + Duration::from_secs(120);
     while !c.notes.contains(&format!("%pause %{pane}")) {
         assert!(Instant::now() < end, "no %pause");
         c.pump(Duration::from_millis(200));
     }
-    // Paused: nothing more for it until continue.
-    c.pump(Duration::from_secs(2));
+    // Paused: stop the flood (^C) and wait for the prompt, which the
+    // mirror sees though the client isn't sent it.
+    c.send(&[&format!("send -H -t %{pane} 03")]);
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        c.send(&[&format!("capture-pane -p -t %{pane}")]);
+        c.wait_idle();
+        let (_, body) = c.answer("capture-pane -p -t");
+        if body.iter().rev().find(|l| !l.trim().is_empty()).is_some_and(|l| l.trim() == "$") {
+            break;
+        }
+        assert!(Instant::now() < end, "the flood didn't stop: {:?}", body.last());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Nothing more for it until continue.
     c.notes.clear();
     c.pump(Duration::from_secs(1));
     assert!(!c.notes.iter().any(|n| n.starts_with(&format!("%extended-output %{pane} "))), "output while paused");
     send_all(&mut c, &pane_requests(pane));
-    // The rest of the flood comes through first: on a slow machine (a CI
-    // VM) that takes a while.
-    c.wait_idle_within(Duration::from_secs(60));
+    c.wait_idle();
     assert!(c.notes.contains(&format!("%continue %{pane}")), "{:#?}", c.notes);
     // The capture shows where it got to; the rest follows.
     paste(&mut c, pane, "echo after-$((6*7))\r");
-    let end = Instant::now() + Duration::from_secs(60);
-    let (mut out, mut read) = (String::new(), 0);
+    let end = Instant::now() + Duration::from_secs(30);
     loop {
-        // Only what arrived since the last look; the output so far is large.
-        for n in &c.notes[read..] {
-            if n.contains(&format!(" %{pane} ")) {
-                out.push_str(n);
-            }
-        }
-        read = c.notes.len();
+        let out: String = c.notes.iter().filter(|n| n.contains(&format!(" %{pane} "))).cloned().collect();
         if out.contains("after-42") {
             break;
         }
-        // Keep a tail in case after-42 spans two notes.
-        let cut = (out.len().saturating_sub(64)..=out.len()).find(|&i| out.is_char_boundary(i)).unwrap_or(0);
-        out.drain(..cut);
-        assert!(Instant::now() < end, "no output after continue");
+        assert!(
+            Instant::now() < end,
+            "no output after continue: {:#?}",
+            c.notes.iter().filter(|n| !n.starts_with("%extended-output")).collect::<Vec<_>>()
+        );
         c.pump(Duration::from_millis(200));
     }
     c.close();
@@ -1197,7 +1162,7 @@ fn falling_behind_pauses_the_pane() {
 #[test]
 fn on_a_terminal_nothing_is_echoed() {
     use std::os::fd::{AsRawFd, FromRawFd};
-    let daemon = Daemon::start();
+    let daemon = start();
     let pty = nix::pty::openpty(None, None).unwrap();
     let slave = |_| unsafe { Stdio::from_raw_fd(nix::libc::dup(pty.slave.as_raw_fd())) };
     let mut child = Command::new(cli_bin())
@@ -1245,7 +1210,7 @@ fn on_a_terminal_nothing_is_echoed() {
 /// A block that isn't a terminal is a read-only pane drawn from its text.
 #[test]
 fn a_browser_block_is_a_read_only_pane() {
-    let daemon = Daemon::start();
+    let daemon = start();
     let (mut c, _, wid, pane) = attached(&daemon, &["-CC"]);
     c.notes.clear();
     let body = format!(r#"{{"type":"browser","config":{{"url":"http://127.0.0.1:9/"}},"split":{pane}}}"#);

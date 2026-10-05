@@ -4,7 +4,10 @@
 //! - **The daemon stays a separate service**, so panes outlive the window.
 //!   The app finds the local one (`ILLOGICAL_URL`, else the address in the
 //!   state directory's `listen` file, else `127.0.0.1:7681`) and loads its
-//!   page: the UI and the daemon always match. Loopback auth is unchanged.
+//!   page: the UI and the daemon always match. Loopback callers show the
+//!   daemon's local token (`local-token` in the state directory): the
+//!   window opens the page through its sign-in link, and the app's own
+//!   calls send it as a bearer.
 //! - **It installs the daemon when there is none.** The bundle carries
 //!   `illogicald` and `illogical` (sidecars, built by `sidecars.sh`). With no
 //!   daemon answering, the window opens on a setup page that runs
@@ -12,6 +15,10 @@
 //!   service), else the bundled one, which copies itself to `~/.local/bin`
 //!   and registers the launchd agent or systemd unit. The bundled CLI goes
 //!   to `~/.local/bin` too, unless an `illogical` is already installed.
+//! - **It updates an older daemon** (#176): when the daemon's service runs
+//!   an older version than the one bundled, the setup page runs the
+//!   bundled `illogicald install`, which keeps its flags and its panes
+//!   (`upgrade.rs`).
 //! - **Every key reaches the page** (S25): on macOS the menu is Edit only,
 //!   so Cmd-W, T, N and Q are the client's; on Linux GTK's F10 menu-bar key
 //!   is turned off.
@@ -21,11 +28,31 @@
 //!   goes on the dock badge (macOS) and the tray.
 //! - **Every machine, through illogical cloud** (M48, #159): once this
 //!   machine is joined, the window is control's own client, signed in
-//!   through the person's browser (`cloud.rs`).
+//!   through the person's browser (`cloud.rs`). A join (or a leave) while
+//!   the app is open moves the window there too (#204).
+//! - **Its own profile per older WebKitGTK** (Linux): the .deb and the
+//!   AppImage share one, and a newer WebKitGTK's storage breaks an older
+//!   one (`profile.rs`).
+//! - **Tabs in the titlebar** (M46): the client's bar is the titlebar
+//!   (macOS: under the window buttons; Linux: undecorated, with the
+//!   client's own buttons). On macOS new windows join the first as native
+//!   tabs, which *Move Tab to New Window* takes back out.
+//! - **`illogical://` links** (`links.rs`), **a global hotkey**, off by
+//!   default (`settings.rs`), and **app updates** (`updates.rs`).
 //! - A tray icon with *New window* and *This machine*; one instance (a
 //!   second launch opens a window in the first).
+//! - **Windows has no daemon yet** (M54, #217; the daemon comes in M59):
+//!   the app is control's client only, so a window opens on sign-in or
+//!   control's page, and nothing local is installed, watched or offered.
 
 mod cloud;
+mod links;
+mod profile;
+#[cfg(target_os = "macos")]
+mod service;
+mod settings;
+mod updates;
+mod upgrade;
 
 use std::{
     collections::HashMap,
@@ -41,7 +68,7 @@ use std::{
 use illogical_proto::{Attention, ServerMsg, State};
 use tauri::{
     AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
 };
 
@@ -49,6 +76,9 @@ static WINDOWS: AtomicUsize = AtomicUsize::new(0);
 /// Why the daemon couldn't be reached, for the page that says so.
 static STATUS: Mutex<String> = Mutex::new(String::new());
 static ADDR: OnceLock<String> = OnceLock::new();
+
+/// No local daemon to reach or install: Windows until M59 (#222).
+pub const DAEMONLESS: bool = cfg!(windows);
 
 fn state_dir() -> Option<PathBuf> {
     std::env::var_os("ILLOGICAL_STATE_DIR")
@@ -73,6 +103,41 @@ fn addr() -> &'static str {
 
 fn page() -> String {
     format!("http://{}", addr())
+}
+
+/// The local daemon's token, which loopback callers show.
+fn local_token() -> Option<String> {
+    let file = std::env::var_os("ILLOGICAL_LOCAL_TOKEN_FILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| state_dir().map(|d| d.join("local-token")))?;
+    std::fs::read_to_string(file).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// `Authorization` for the app's own calls to the daemon.
+fn bearer() -> Option<String> {
+    local_token().map(|t| format!("Bearer {t}"))
+}
+
+/// `path` on the daemon's page, through its sign-in link (which sets the
+/// browser's cookie and goes on to `path`).
+fn page_at(path: &str) -> tauri::Url {
+    let url = match local_token() {
+        Some(t) => {
+            let next: String = path
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect();
+            format!("{}/auth?token={t}&next={next}", page())
+        }
+        None => format!("{}{path}", page()),
+    };
+    url.parse().unwrap()
 }
 
 fn reachable() -> bool {
@@ -116,6 +181,14 @@ fn install_cli() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("HOME")?).join(".local/bin");
     std::fs::create_dir_all(&dir).ok()?;
     let dst = dir.join("illogical");
+    // An app in Applications: a link into it, which app updates keep
+    // current. Elsewhere (a disk image, Downloads) the app may move.
+    if cfg!(target_os = "macos") && src.components().any(|c| c.as_os_str() == "Applications") {
+        let _ = std::fs::remove_file(&dst);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&src, &dst).ok()?;
+        return Some(dst);
+    }
     std::fs::copy(&src, &dst).ok()?;
     unquarantine(&dst);
     #[cfg(unix)]
@@ -130,8 +203,22 @@ fn install_cli() -> Option<PathBuf> {
 /// Never starts a second daemon: `illogicald install` (re)starts the one
 /// service.
 fn ensure_daemon() -> Result<(), String> {
+    // One at a time: a second window's setup page waits for the first's.
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     if reachable() {
-        return Ok(());
+        // Answering, but older than ours: replace it.
+        return upgrade::run();
+    }
+    #[cfg(target_os = "macos")]
+    if service::usable() && !service::installed_by_script() && std::env::var_os("ILLOGICAL_NO_LAUNCH_AGENT").is_none() {
+        match start_agent() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("illogical: the app's launch agent: {e}; installing with illogicald install instead");
+                let _ = service::unregister();
+            }
+        }
     }
     let Some(bin) = installed("illogicald").or_else(|| bundled("illogicald")) else {
         return Err(format!(
@@ -167,14 +254,37 @@ fn ensure_daemon() -> Result<(), String> {
     ))
 }
 
+/// macOS: the daemon as the app's launch agent (`service.rs`), registered
+/// the first time, started again if it isn't answering.
+#[cfg(target_os = "macos")]
+fn start_agent() -> Result<(), String> {
+    if service::registered() {
+        service::restart()?;
+    } else {
+        service::register()?;
+        eprintln!("illogical: registered the daemon's launch agent ({})", service::LABEL);
+    }
+    let cli = install_cli();
+    for _ in 0..60 {
+        if reachable() {
+            if let Some(cli) = cli {
+                eprintln!("illogical: installed the CLI at {}", cli.display());
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!("the launch agent is {}, but nothing answers at {}", service::status(), addr()))
+}
+
 /// Where a new window starts:
-/// - no daemon answering: the setup page, which installs or starts it
-///   (`retry`) and then comes back here;
+/// - no daemon answering, or an older one to update: the setup page, which
+///   installs, starts or updates it (`retry`) and then comes back here;
 /// - joined to control and signed in: control's client, every machine;
 /// - joined, not signed in: the app's sign-in page;
 /// - otherwise (or "just this machine"): the daemon's own page.
 fn target(app: &AppHandle) -> WebviewUrl {
-    if !reachable() {
+    if !DAEMONLESS && (!reachable() || upgrade::pending().is_some()) {
         return WebviewUrl::App("index.html".into());
     }
     WebviewUrl::External(home(app))
@@ -190,7 +300,7 @@ fn home(app: &AppHandle) -> tauri::Url {
                 cloud::app_url(cloud::SIGNIN)
             }
         }
-        _ => page().parse().unwrap(),
+        _ => page_at("/"),
     }
 }
 
@@ -204,14 +314,53 @@ fn ours(url: &tauri::Url) -> bool {
             if control.is_some_and(|c| c.origin() == url.origin()) {
                 return true;
             }
-            url.host_str().zip(url.port_or_known_default()).is_some_and(|(h, p)| {
-                let at = format!("{h}:{p}");
-                at == addr() || (h == "tauri.localhost") || (h == "localhost" && addr().ends_with(&format!(":{p}")))
-            })
+            daemons(url) || url.host_str() == Some("tauri.localhost")
         }
         _ => false,
     }
 }
+
+/// The local daemon's own page (or its sign-in link).
+fn daemons(url: &tauri::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().zip(url.port_or_known_default()).is_some_and(|(h, p)| {
+            format!("{h}:{p}") == addr() || (h == "localhost" && addr().ends_with(&format!(":{p}")))
+        })
+}
+
+/// Follows the daemon's join (#204): when it joins control (from the CLI,
+/// or Getting started's button) or leaves, windows showing the old home
+/// move to the new one (`cloud::moves`), as a restart would have.
+fn follow_join(app: AppHandle) {
+    let mut was = cloud::control();
+    loop {
+        std::thread::sleep(JOIN_POLL);
+        if !reachable() {
+            continue;
+        }
+        let now = cloud::local().control;
+        if now == was {
+            continue;
+        }
+        eprintln!("illogical: this machine's control is now {}", now.as_deref().unwrap_or("none"));
+        // A new control: "just this machine" was said of the old one.
+        cloud::set_local_only(false);
+        let home = home(&app);
+        for w in app.webview_windows().into_values() {
+            let Ok(url) = w.url() else { continue };
+            if cloud::moves(was.as_deref(), now.as_deref(), &url, daemons(&url)) {
+                let to = home.clone();
+                let _ = app.run_on_main_thread(move || {
+                    let _ = w.navigate(to);
+                });
+            }
+        }
+        was = now;
+    }
+}
+
+/// How often the app asks the daemon whether it joined or left control.
+const JOIN_POLL: Duration = Duration::from_secs(2);
 
 /// Another site, in the person's own browser: control's approval page,
 /// Tailscale's admin console, docs.
@@ -224,8 +373,15 @@ fn open_outside(url: &tauri::Url) {
         }
         return;
     }
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    if let Err(e) = std::process::Command::new(opener).arg(url.as_str()).spawn() {
+    // Windows: the URL handler directly; `cmd /c start` would split it at `&`.
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    } else {
+        std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
+    };
+    if let Err(e) = cmd.arg(url.as_str()).spawn() {
         eprintln!("illogical: opening {url}: {e}");
     }
 }
@@ -235,7 +391,25 @@ fn open_window(app: &AppHandle, url: WebviewUrl) -> tauri::Result<tauri::Webview
     let label = format!("w{n}");
     let handle = app.clone();
     let nav = (app.clone(), label.clone());
-    let w = WebviewWindowBuilder::new(app, label, url)
+    let mut builder = WebviewWindowBuilder::new(app, label, url);
+    if let Some(dir) = profile::dir() {
+        builder = builder.data_directory(dir);
+    }
+    // The client's bar is the titlebar (M46).
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .tabbing_identifier("illogical")
+            // Shown once it's set to join the others as a tab.
+            .visible(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.decorations(false);
+    }
+    let w = builder
         .title("illogical")
         .inner_size(1280.0, 820.0)
         .initialization_script(cloud::init_script())
@@ -277,11 +451,35 @@ fn open_window(app: &AppHandle, url: WebviewUrl) -> tauri::Result<tauri::Webview
             false
         })
         .build()?;
+    w.on_window_event(|e| {
+        if let tauri::WindowEvent::Focused(f) = e {
+            settings::focus_changed(*f);
+        }
+    });
+    #[cfg(target_os = "macos")]
+    tab_in(&w);
     let _ = w.set_focus();
     Ok(w)
 }
 
+/// macOS: a new window opens as a tab of the window in front, whatever the
+/// system's "Prefer tabs" setting says.
+#[cfg(target_os = "macos")]
+fn tab_in(w: &tauri::WebviewWindow) {
+    let Ok(ptr) = w.ns_window() else { return };
+    let (ptr, w2) = (ptr as usize, w.clone());
+    let _ = w.run_on_main_thread(move || {
+        // SAFETY: the window's NSWindow, on the main thread, while it lives.
+        let ns = unsafe { &*(ptr as *const objc2_app_kit::NSWindow) };
+        ns.setTabbingMode(objc2_app_kit::NSWindowTabbingMode::Preferred);
+        let _ = w2.show();
+        let _ = w2.set_focus();
+    });
+}
+
 fn focus_or_open(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     match app.webview_windows().values().next() {
         Some(w) => {
             let _ = w.unminimize();
@@ -295,12 +493,22 @@ fn focus_or_open(app: &AppHandle) {
 }
 
 /// From a notification: the pane, in a window of ours.
+#[cfg(not(windows))]
 fn open_pane(app: &AppHandle, pane: u32) {
-    let url: tauri::Url = format!("{}/#pane={pane}", page()).parse().unwrap();
+    let url = page_at(&format!("/#pane={pane}"));
+    #[cfg(target_os = "macos")]
+    let _ = app.show();
     match app.webview_windows().values().next() {
         Some(w) => {
-            let _ = w.navigate(url);
+            // Already on the daemon's page: the client opens it (main.tsx),
+            // without a reload.
+            if w.url().is_ok_and(|u| daemons(&u)) {
+                let _ = w.eval(format!("dispatchEvent(new CustomEvent('illogical:open-pane', {{ detail: {pane} }}))"));
+            } else {
+                let _ = w.navigate(url);
+            }
             let _ = w.unminimize();
+            let _ = w.show();
             let _ = w.set_focus();
         }
         None => {
@@ -314,6 +522,9 @@ fn daemon_status() -> String {
     let why = STATUS.lock().unwrap().clone();
     if !why.is_empty() {
         return why;
+    }
+    if let Some(updating) = upgrade::pending() {
+        return updating;
     }
     match installed("illogicald") {
         Some(bin) => format!("Starting {}…", bin.display()),
@@ -334,7 +545,12 @@ async fn retry(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), Strin
 // ---- notifications
 
 fn notify(app: &AppHandle, pane: u32, title: String, body: String) {
+    // Windows: a local daemon's notifications come with it (M59).
+    #[cfg(windows)]
+    let _ = (app, pane, title, body);
+    #[cfg(not(windows))]
     let app = app.clone();
+    #[cfg(not(windows))]
     std::thread::spawn(move || {
         #[cfg(target_os = "linux")]
         {
@@ -399,7 +615,11 @@ fn watch(app: AppHandle) {
 fn watch_once(app: &AppHandle) -> anyhow::Result<()> {
     let sa: SocketAddr = addr().to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("no address"))?;
     let tcp = TcpStream::connect_timeout(&sa, Duration::from_secs(2))?;
-    let (mut ws, _) = tungstenite::client(format!("ws://{}/ws", addr()), tcp).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut req = tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{}/ws", addr()))?;
+    if let Some(b) = bearer() {
+        req.headers_mut().insert("authorization", b.parse()?);
+    }
+    let (mut ws, _) = tungstenite::client(req, tcp).map_err(|e| anyhow::anyhow!("{e}"))?;
     // pane -> needs you; None until the first state, so what already waits
     // at launch shows on the badge without a burst of notifications.
     let mut seen: Option<HashMap<u32, bool>> = None;
@@ -443,10 +663,43 @@ fn watch_once(app: &AppHandle) -> anyhow::Result<()> {
 }
 
 fn main() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = open_window(app, target(app));
+    // `illogical-desktop --agent status|register|unregister|restart`: the
+    // daemon's launch agent, for tests and for fixing a Mac by hand.
+    #[cfg(target_os = "macos")]
+    if std::env::args().nth(1).as_deref() == Some("--agent") {
+        let r = match std::env::args().nth(2).as_deref() {
+            Some("register") => service::register(),
+            Some("unregister") => service::unregister(),
+            Some("restart") => service::restart(),
+            _ => Ok(()),
+        };
+        println!("{}", service::status());
+        if let Err(e) = r {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let context = tauri::generate_context!();
+    let updater = updates::configured(context.config());
+    let mut builder = tauri::Builder::default()
+        // A second launch: its links (Linux runs the app with the link), or
+        // a new window.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let urls = links::in_args(args);
+            if urls.is_empty() {
+                let _ = open_window(app, target(app));
+            }
+            for url in urls {
+                links::handle(app, url);
+            }
         }))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(settings::plugin());
+    if updater {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    builder
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             retry,
@@ -477,7 +730,7 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             Menu::new(app)
         })
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(target_os = "linux")]
             {
                 // GTK opens a menu bar on F10; the page wants the key (S25).
@@ -485,43 +738,123 @@ fn main() {
                 if let Some(s) = gtk::Settings::default() {
                     s.set_property("gtk-menu-bar-accel", "");
                 }
+                // An AppImage has no .desktop file of its own to claim the
+                // scheme; the packages do.
+                if std::env::var_os("APPIMAGE").is_some() {
+                    use tauri_plugin_deep_link::DeepLinkExt;
+                    if let Err(e) = app.deep_link().register_all() {
+                        eprintln!("illogical: registering illogical:// links: {e}");
+                    }
+                }
             }
+            profile::init(app.handle());
+            if !DAEMONLESS {
+                upgrade::check();
+            }
+            let prefs = settings::load(app.handle());
+            let hotkey_ok = match settings::apply(app.handle(), &prefs) {
+                Ok(()) => prefs.hotkey_on,
+                Err(e) => {
+                    eprintln!("illogical: {e}");
+                    false
+                }
+            };
             open_window(app.handle(), target(app.handle()))?;
+            // Linux: a link the app was started with.
+            #[cfg(not(target_os = "macos"))]
+            for url in links::in_args(std::env::args()) {
+                links::handle(app.handle(), url);
+            }
             let open = MenuItem::with_id(app, "open", "Open illogical", true, None::<&str>)?;
             let new = MenuItem::with_id(app, "new", "New window", true, None::<&str>)?;
             let this = MenuItem::with_id(app, "this", "This machine", true, None::<&str>)?;
+            let hotkey = CheckMenuItem::with_id(
+                app,
+                "hotkey",
+                format!("Global hotkey ({})", prefs.keys()),
+                true,
+                hotkey_ok,
+                None::<&str>,
+            )?;
+            let update = MenuItem::with_id(app, "update", "Restart to update", false, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            // Windows has no daemon here yet (M54): no "this machine" item.
+            let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&open, &new];
+            if !DAEMONLESS {
+                items.push(&this);
+            }
+            items.push(&hotkey);
+            if updater && updates::can_update() {
+                items.push(&update);
+            }
+            items.push(&quit);
+            let hotkey_item = hotkey.clone();
             TrayIconBuilder::with_id("illogical")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("illogical")
-                .menu(&Menu::with_items(app, &[&open, &new, &this, &quit])?)
-                .on_menu_event(|app, e| match e.id().as_ref() {
+                .menu(&Menu::with_items(app, &items)?)
+                .on_menu_event(move |app, e| match e.id().as_ref() {
                     "open" => focus_or_open(app),
                     "new" => {
                         let _ = open_window(app, target(app));
                     }
                     // The daemon's own page, whatever the window shows.
                     "this" => {
-                        let _ = open_window(app, WebviewUrl::External(page().parse().unwrap()));
+                        let _ = open_window(app, WebviewUrl::External(page_at("/")));
                     }
+                    "hotkey" => {
+                        let mut prefs = settings::load(app);
+                        prefs.hotkey_on = !prefs.hotkey_on;
+                        let on = match settings::apply(app, &prefs) {
+                            Ok(()) => prefs.hotkey_on,
+                            Err(e) => {
+                                eprintln!("illogical: {e}");
+                                prefs.hotkey_on = false;
+                                false
+                            }
+                        };
+                        settings::save(app, &prefs);
+                        let _ = hotkey_item.set_checked(on);
+                    }
+                    "update" => app.restart(),
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
-            let handle = app.handle().clone();
-            std::thread::Builder::new().name("watch".into()).spawn(move || watch(handle))?;
+            app.manage(updates::Item(update));
+            if updater {
+                updates::start(app.handle().clone());
+            } else {
+                eprintln!("illogical: this build has no updater key; it doesn't check for updates");
+            }
+            if !DAEMONLESS {
+                let handle = app.handle().clone();
+                std::thread::Builder::new().name("watch".into()).spawn(move || watch(handle))?;
+                let handle = app.handle().clone();
+                std::thread::Builder::new().name("join".into()).spawn(move || follow_join(handle))?;
+            }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("illogical desktop")
         .run(|app, event| match event {
             // macOS: stay in the Dock with no windows, as Mac apps do.
-            #[cfg(target_os = "macos")]
-            tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            // Linux: stay in the tray while the global hotkey is on.
+            tauri::RunEvent::ExitRequested { code: None, api, .. }
+                if cfg!(target_os = "macos") || settings::load(app).hotkey_on =>
+            {
+                api.prevent_exit()
+            }
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { has_visible_windows: false, .. } => focus_or_open(app),
-            _ => {
-                let _ = app;
+            // macOS: an illogical:// link (the app started for it, or was
+            // running).
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Opened { urls } => {
+                for url in urls {
+                    links::handle(app, url.to_string());
+                }
             }
+            _ => {}
         });
 }

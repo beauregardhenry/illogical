@@ -10,9 +10,10 @@ import { directory } from "../hosts";
 import { CopyButton, CopyText, download } from "./copy";
 import { ROLE_HELP, roleAs, roleLabel } from "./roles";
 import type { MenuItem } from "./menu";
-import type { Team } from "../control";
+import type { PresignedInvite, ShareOffer, Team } from "../control";
 import type { TeamRole } from "../e2e/team.ts";
 import { qr, qrPath } from "./qr";
+import { AccountPanel } from "./account";
 
 export function useControl(s: ControlSession) {
   useSubscribe((fn) => s.subscribe(fn));
@@ -20,6 +21,21 @@ export function useControl(s: ControlSession) {
 
 function Center({ children }: { children: preact.ComponentChildren }) {
   return <div class="control-center">{children}</div>;
+}
+
+/** The hosted control's terms (#172); a control you run yourself has its
+ * own, or none. */
+const HOSTED = "control.illogical.widgets.wtf";
+const SITE = "https://illogical.widgets.wtf";
+
+function HostedTerms() {
+  if (location.hostname !== HOSTED) return null;
+  return (
+    <p class="control-legal dim" data-legal>
+      Free during the beta, provided as is. By signing in you agree to the <a href={`${SITE}/terms`}>terms</a>; the{" "}
+      <a href={`${SITE}/privacy`}>privacy notice</a> says what this service keeps.
+    </p>
+  );
 }
 
 /** Everything before the app: sign in, approval, no machines yet. */
@@ -52,6 +68,7 @@ export function ControlGate({ s }: { s: ControlSession }) {
           {s.info.passkeys ? <PasskeyButtons /> : null}
         </div>
         {!s.info.github && !s.info.passkeys ? <p class="control-error">No sign-in is configured on this control.</p> : null}
+        <HostedTerms />
       </Center>
     );
   }
@@ -120,6 +137,7 @@ function WhyHere() {
   useEffect(() => {
     const on = () => setHash(location.hash);
     addEventListener("hashchange", on);
+    on();
     return () => removeEventListener("hashchange", on);
   }, []);
   useEffect(() => {
@@ -400,7 +418,7 @@ function JoinCodeForm({ s }: { s: ControlSession }) {
   );
 }
 
-type Panel = "devices" | "add" | "add-device" | "teams" | "plan";
+type Panel = "devices" | "add" | "add-device" | "teams" | "plan" | "account";
 
 const openPanel = (p: Panel) => () => dispatchEvent(new CustomEvent("illogical:control-panel", { detail: p }));
 
@@ -414,9 +432,17 @@ export function ControlOverlay({ s }: { s: ControlSession }) {
     const open = (e: Event) => setPanel((e as CustomEvent<Panel>).detail);
     addEventListener("hashchange", on);
     addEventListener("illogical:control-panel", open);
+    // Says the panel event has a listener, so a test can wait for it
+    // rather than send one into nothing.
+    document.documentElement.dataset.controlPanels = "";
+    // Mounted afresh (the page switches machine when one is approved, and
+    // that happens before the prompt clears the hash): catch up with a
+    // hashchange that fired before this listener was there.
+    on();
     return () => {
       removeEventListener("hashchange", on);
       removeEventListener("illogical:control-panel", open);
+      delete document.documentElement.dataset.controlPanels;
     };
   }, []);
   if (s.phase !== "ready") return null;
@@ -427,7 +453,8 @@ export function ControlOverlay({ s }: { s: ControlSession }) {
   // after allowing its sign-in.
   const appLogin = /^#app=([0-9a-f]{16,128})$/.exec(hash)?.[1];
   if (appLogin && !s.pending[0]) return <AppLoginPrompt s={s} id={appLogin} />;
-  const invite = inviteInHash(hash);
+  if (hash === "#app-done" && !s.pending[0]) return <AppLoginDone />;
+  const invite = inviteInHash(hash) ?? inviteInHash(usedLink);
   if (invite)
     return invite.presigned ? (
       <PresignedPrompt s={s} team={invite.team} seed={invite.code} />
@@ -439,10 +466,20 @@ export function ControlOverlay({ s }: { s: ControlSession }) {
   if (req) return <AdmitPrompt s={s} team={req.t} req={req.r} />;
   const asking = s.pending[0];
   if (asking) return <DevicePrompt s={s} c={asking} />;
+  const offer = s.offers[0];
+  if (offer) return <ShareOfferPrompt s={s} o={offer} />;
   if (s.joined) return <Joined s={s} />;
+  const notice = s.notices[0];
+  if (notice) return <Notice s={s} n={notice} />;
   if (panel === "devices") return <Devices s={s} close={() => setPanel(null)} />;
   if (panel === "teams") return <Teams s={s} close={() => setPanel(null)} />;
   if (panel === "plan") return <Plan s={s} close={() => setPanel(null)} />;
+  if (panel === "account")
+    return (
+      <Modal close={() => setPanel(null)}>
+        <AccountPanel s={s} close={() => setPanel(null)} />
+      </Modal>
+    );
   if (panel === "add-device") return <AddDevice s={s} close={() => setPanel(null)} />;
   if (panel === "add")
     return (
@@ -463,8 +500,19 @@ function Modal({ children, close }: { children: preact.ComponentChildren; close?
 }
 
 function clearHash() {
+  usedLink = "";
   history.replaceState(null, "", location.pathname + location.search);
   dispatchEvent(new HashChangeEvent("hashchange"));
+}
+
+/** An invite link that was used: out of the address bar, so a reload
+ * doesn't offer it again (#208), but its prompt stays up until closed,
+ * through the overlay mounting afresh. */
+let usedLink = "";
+
+function dropHash() {
+  if (location.hash) usedLink = location.hash;
+  history.replaceState(null, "", location.pathname + location.search);
 }
 
 function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
@@ -491,6 +539,8 @@ function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
     if (j) void s.rejectJoin(j.code).catch(() => {});
     clearHash();
   };
+  // M49: the illogical CLI on a machine, asking to be one of your devices.
+  if (j?.cert.kind === "cli") return <CliJoin s={s} j={j} cancel={cancel} />;
   return (
     <Modal close={clearHash}>
       <h2>Add a machine?</h2>
@@ -499,9 +549,18 @@ function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
         <>
           <p>
             <b>{j.cert.name}</b> asks to join {j.team ? <>the team <b data-join-team={j.team.team}>{j.team.name}</b></> : "your account"} with code{" "}
-            <b data-join-code={j.code}>{j.code}</b>. Check that's the code it printed.
+            <b data-join-code={j.code}>{j.code}</b>. Check it's the code the machine shows (in Getting started, or where you ran <code>illogicald join</code>).
           </p>
           <p class="dim">Its key: {fingerprint(j.cert.device)}</p>
+          {s.enrollment ? (
+            <p>
+              Your account:{" "}
+              <b class="fingerprint" data-join-account={s.enrollment.root}>
+                {fingerprint(s.enrollment.root)}
+              </b>
+              . Once you approve, the machine shows its account's fingerprint: check it's this one there.
+            </p>
+          ) : null}
           {owned.length || asked ? (
             <p>
               <label>
@@ -561,13 +620,64 @@ function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
   );
 }
 
+/** M49: the illogical CLI on some machine asks to be one of this account's
+ * devices (`illogical login`). Approved, it reaches the account's machines
+ * and can approve devices and machines, as this browser can. */
+function CliJoin({ s, j, cancel }: { s: ControlSession; j: JoinRequest; cancel: () => void }) {
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <Modal close={clearHash}>
+      <h2>Add a terminal?</h2>
+      {err ? <p class="control-error">{err}</p> : null}
+      <p data-join-cli={j.cert.name}>
+        The illogical command line on <b>{j.cert.name}</b> asks to be one of your devices, with code <b data-join-code={j.code}>{j.code}</b>. Check it's the code
+        it shows where you ran <code>illogical login</code>.
+      </p>
+      <p class="dim">Its key: {fingerprint(j.cert.device)}</p>
+      {s.enrollment ? (
+        <p>
+          Your account:{" "}
+          <b class="fingerprint" data-join-account={s.enrollment.root}>
+            {fingerprint(s.enrollment.root)}
+          </b>
+          . Once you approve, it shows its account's fingerprint: check it's this one there.
+        </p>
+      ) : null}
+      <p class="dim">It reaches your machines (directly or through control's relay, end to end encrypted) and can approve devices, as this one can.</p>
+      <div class="prompt-buttons">
+        <button data-cancel-join onClick={cancel}>
+          Cancel
+        </button>
+        <button
+          class="primary"
+          data-approve-join
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await s.approveJoin(j.code, j.cert);
+              clearHash();
+            } catch (e) {
+              setErr((e as Error).message);
+              setBusy(false);
+            }
+          }}
+        >
+          Approve
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 /** M48: the desktop app asks to sign in as this account. Its device key
  * is approved separately afterwards (the "New device?" prompt), so this
- * only lets it ask. */
+ * only lets it ask. Allowing hands a grant to the app on this computer
+ * (its loopback port): an app elsewhere that sent this link gets nothing. */
 function AppLoginPrompt({ s, id }: { s: ControlSession; id: string }) {
-  const [a, setA] = useState<{ name: string; code: string; allowed: boolean } | null>(null);
+  const [a, setA] = useState<{ name: string; code: string; allowed: boolean; from: string; same_network: boolean } | null>(null);
   const [err, setErr] = useState("");
-  const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     s.showAppLogin(id).then(setA, (e: Error) => setErr(e.message));
@@ -576,23 +686,22 @@ function AppLoginPrompt({ s, id }: { s: ControlSession; id: string }) {
     <Modal close={clearHash}>
       <h2>Sign in the app?</h2>
       {err ? <p class="control-error" data-app-login-error>{err}</p> : null}
-      {done || a?.allowed ? (
-        <>
-          <p data-app-login-done>
-            Signed in. Next the app asks to be approved as a new device: the prompt shows here in a moment. Then it reaches your machines.
-          </p>
-          <div class="prompt-buttons">
-            <button class="primary" onClick={clearHash}>
-              Done
-            </button>
-          </div>
-        </>
+      {a?.allowed ? (
+        <p data-app-login-error>This sign-in was already allowed. Start it again in the app if it didn't finish.</p>
       ) : a ? (
         <>
           <p>
             <b data-app-login-name>{a.name}</b> asks to sign in as you. Check the app shows <b data-app-login-code={a.code}>{a.code}</b>.
           </p>
-          <p class="dim">If you didn't just press Sign in in the illogical app, cancel: someone may have sent you this link.</p>
+          {a.same_network ? null : (
+            <p class="control-error" data-app-login-elsewhere>
+              It asked from another network ({a.from}) than this browser's. If the app isn't on this computer, cancel.
+            </p>
+          )}
+          <p class="dim">
+            Only the app on this computer can finish it. If you didn't just press Sign in in the illogical app, cancel: someone may have sent you
+            this link.
+          </p>
           <div class="prompt-buttons">
             <button onClick={clearHash}>Cancel</button>
             <button
@@ -602,14 +711,12 @@ function AppLoginPrompt({ s, id }: { s: ControlSession; id: string }) {
               onClick={async () => {
                 setBusy(true);
                 try {
-                  await s.allowAppLogin(id);
-                  setDone(true);
-                  // Out of the way of the device prompt that follows.
-                  setTimeout(clearHash, 4000);
+                  // To the app's loopback port; it sends this page back.
+                  location.href = await s.allowAppLogin(id);
                 } catch (e) {
                   setErr((e as Error).message);
+                  setBusy(false);
                 }
-                setBusy(false);
               }}
             >
               Allow
@@ -619,6 +726,63 @@ function AppLoginPrompt({ s, id }: { s: ControlSession; id: string }) {
       ) : err ? null : (
         <p class="dim">Looking it up…</p>
       )}
+    </Modal>
+  );
+}
+
+/** Back from handing the app its grant. */
+function AppLoginDone() {
+  useEffect(() => {
+    // Out of the way of the device prompt that follows.
+    const t = setTimeout(clearHash, 6000);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <Modal close={clearHash}>
+      <h2>Sign in the app?</h2>
+      <p data-app-login-done>Signed in. Next the app asks to be approved as a new device: the prompt shows here in a moment. Then it reaches your machines.</p>
+      <div class="prompt-buttons">
+        <button class="primary" onClick={clearHash}>
+          Done
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+/** Someone shares a session on their machine with this account: it's
+ * listed (and its notifications reach here) only once accepted. */
+function ShareOfferPrompt({ s, o }: { s: ControlSession; o: ShareOffer }) {
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const who = o.owner_name || o.owner_login || "Someone";
+  const answer = (accept: boolean) => async () => {
+    setBusy(true);
+    try {
+      await s.answerShare(o.daemon, accept);
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+    setBusy(false);
+  };
+  return (
+    <Modal>
+      <h2>A shared session</h2>
+      <p data-share-offer={o.daemon}>
+        <b data-share-offer-owner>{who}</b>
+        {o.owner_login && o.owner_login !== who ? ` (${o.owner_login})` : ""} wants to share a session on their machine{" "}
+        <b data-share-offer-machine>{o.name}</b> with you.
+      </p>
+      <p class="dim">Accept only if you know them. Accepting lists the machine here and lets its notifications reach you.</p>
+      {err ? <p class="control-error">{err}</p> : null}
+      <div class="prompt-buttons">
+        <button data-share-decline disabled={busy} onClick={answer(false)}>
+          Decline
+        </button>
+        <button class="primary" data-share-accept disabled={busy} onClick={answer(true)}>
+          Accept
+        </button>
+      </div>
     </Modal>
   );
 }
@@ -788,6 +952,15 @@ function Devices({ s, close }: { s: ControlSession; close: () => void }) {
       <p class="dim">
         Signed in as <b data-account={s.account}>{s.login}</b>.
       </p>
+      {s.enrollment ? (
+        <p class="dim">
+          Your account's fingerprint:{" "}
+          <span class="fingerprint-inline" data-account-fingerprint={s.enrollment.root}>
+            {fingerprint(s.enrollment.root)}
+          </span>
+          . A machine shows it when it joins; check they match.
+        </p>
+      ) : null}
       {s.rootMismatch ? (
         <p class="control-error">Control reports a different first device for this account than this browser pinned. New devices and machines won't be trusted here.</p>
       ) : null}
@@ -909,6 +1082,7 @@ function accountItems(s: ControlSession): MenuItem[] {
   return [
     { label: "Teams…", run: panel("teams") },
     { label: "Devices and machines…", run: panel("devices") },
+    { label: "Sign-in and account…", run: panel("account") },
     ...(s.billing?.billing ? [{ label: s.billing.relay.warning ? "Plan and usage… (over the free relay)" : "Plan and usage…", run: panel("plan") }] : []),
     { label: "Sign out", run: () => void s.signOut(false) },
   ];
@@ -974,6 +1148,22 @@ function Joined({ s }: { s: ControlSession }) {
   );
 }
 
+/** Something control kept to tell this account (#206: a team it was in
+ * was deleted while this page wasn't open, or was). */
+function Notice({ s, n }: { s: ControlSession; n: ControlSession["notices"][number] }) {
+  return (
+    <Modal close={() => void s.sawNotice(n.id)}>
+      <h2 data-notice={n.id}>{n.title}</h2>
+      <p>{n.body}</p>
+      <div class="prompt-buttons">
+        <button class="primary" onClick={() => void s.sawNotice(n.id)}>
+          OK
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 function InvitePrompt({ s, team, code }: { s: ControlSession; team: string; code: string }) {
   const [info, setInfo] = useState<{ name: string; role: TeamRole } | null>(null);
   const [err, setErr] = useState("");
@@ -998,7 +1188,15 @@ function InvitePrompt({ s, team, code }: { s: ControlSession; team: string; code
             class="primary"
             data-accept-invite
             disabled={!info}
-            onClick={() => s.acceptInvite(team, code).then(() => setDone(true), (e: Error) => setErr(e.message))}
+            onClick={() =>
+              s.acceptInvite(team, code).then(
+                () => {
+                  dropHash();
+                  setDone(true);
+                },
+                (e: Error) => setErr(e.message),
+              )
+            }
           >
             Join
           </button>
@@ -1017,7 +1215,7 @@ function PresignedPrompt({ s, team, seed }: { s: ControlSession; team: string; s
   // prompt as the team's machines arrive).
   const member = s.teams.find((t) => t.team === team && t.role);
   useEffect(() => {
-    if (member) return;
+    if (member) return dropHash();
     s.showPresigned(team, seed).then(
       (p) => setInfo({ name: p.name, role: p.invite.role }),
       (e: Error) => setErr(e.message),
@@ -1026,6 +1224,7 @@ function PresignedPrompt({ s, team, seed }: { s: ControlSession; team: string; s
   const join = () => {
     setBusy(true);
     s.redeem(team, seed)
+      .then(dropHash)
       .catch((e: Error) => setErr(e.message))
       .finally(() => setBusy(false));
   };
@@ -1093,8 +1292,8 @@ function Teams({ s, close }: { s: ControlSession; close: () => void }) {
         ))}
       </ul>
       <p class="dim">
-        Owners approve everyone who uses an invite. Machines join a team when an owner approves them for it.{" "}
-        <a href="https://git.inevitable.fyi/jhgaylor/illogical/src/branch/main/docs/teams.md" target="_blank" rel="noreferrer">
+        An invite link lets one person in right away (with Ask me first, an owner says yes to each). Machines join a team when an owner approves them for it.{" "}
+        <a href="https://github.com/arugula-salad/illogical/blob/main/docs/teams.md" target="_blank" rel="noreferrer">
           More about teams
         </a>
       </p>
@@ -1131,6 +1330,20 @@ function TeamSection({ s, t, act }: { s: ControlSession; t: Team; act: (f: () =>
   // Which button waits for a second click: "lock", or a member to remove.
   const [confirming, setConfirming] = useState<string | null>(null);
   const owner = t.role === "owner";
+  // One-click links not used yet (#134), each with Cancel.
+  const [unused, setUnused] = useState<PresignedInvite[]>([]);
+  const [reload, setReload] = useState(0);
+  useEffect(() => {
+    if (!owner) return setUnused([]);
+    let live = true;
+    s.presignedInvites(t.team).then(
+      (l) => live && setUnused(l),
+      () => live && setUnused([]),
+    );
+    return () => {
+      live = false;
+    };
+  }, [s, t.team, owner, t.locked, t.roster.version, link, reload]);
   return (
     <section class="team" data-team={t.team}>
       <h3>
@@ -1151,14 +1364,14 @@ function TeamSection({ s, t, act }: { s: ControlSession; t: Team; act: (f: () =>
       <ul class="control-devices">
         {t.roster.members.map((m) => (
           <li key={m.account} data-member={m.account}>
-            <span>
-              {m.name}
+            <span data-member-name>
+              {t.names?.[m.account] ?? m.name}
               {m.account === s.account ? " (you)" : ""}
             </span>
             {owner && m.account !== s.account ? (
               <select
                 value={m.role}
-                aria-label={`${m.name}'s role`}
+                aria-label={`${t.names?.[m.account] ?? m.name}'s role`}
                 onChange={(e) => {
                   const r = (e.target as HTMLSelectElement).value as TeamRole;
                   act(() => s.changeTeam(t.team, (ms) => ms.map((x) => (x.account === m.account ? { ...x, role: r } : x))));
@@ -1233,6 +1446,35 @@ function TeamSection({ s, t, act }: { s: ControlSession; t: Team; act: (f: () =>
               <CopyText text={link} share data-invite-link />
             </p>
           ) : null}
+          {unused.length ? (
+            <>
+              <p class="dim">One-click links nobody has used yet:</p>
+              <ul class="control-devices" data-presigned-list>
+                {unused.map((i) => (
+                  <li key={i.key} data-presigned={i.key}>
+                    <span>
+                      {roleAs(i.role).replace(/^as /, "for ")}
+                      {i.by === s.account ? "" : `, from ${i.by_name}`}
+                    </span>
+                    <span class="dim">{expiresIn(i.expires)}</span>
+                    <button
+                      class="control-revoke"
+                      data-cancel-presigned={i.key}
+                      title="Nobody can join with this link any more"
+                      onClick={() =>
+                        act(async () => {
+                          await s.cancelPresigned(t.team, i.key);
+                          setReload((n) => n + 1);
+                        })
+                      }
+                    >
+                      Cancel
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : null}
           {confirming === "lock" ? (
             <p class="control-error" data-lock-warning>
               Lock: only owners reach the team's machines; open invites and requests are dropped.
@@ -1257,6 +1499,12 @@ function TeamSection({ s, t, act }: { s: ControlSession; t: Team; act: (f: () =>
       ) : null}
     </section>
   );
+}
+
+/** How long a link has left, roughly. */
+function expiresIn(at: number): string {
+  const min = Math.max(1, Math.round((at - Date.now()) / 60_000));
+  return min < 90 ? `expires in ${min} min` : `expires in ${Math.round(min / 60)} h`;
 }
 
 function RoleOptions() {

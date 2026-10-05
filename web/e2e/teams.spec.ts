@@ -13,7 +13,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { ready, run, text } from "./helpers";
+import { controlPanel, ready, run, text } from "./helpers";
 import { ANY, controlPort, listen } from "./ports";
 
 let base = "";
@@ -142,6 +142,8 @@ test("two people at different companies join a team by invite", async ({ browser
   await expect(bob.locator(".control-prompt")).toContainText("as someone who drives");
   await bob.locator("[data-accept-invite]").click();
   await expect(bob.locator("[data-invite-pending]")).toBeVisible();
+  // The used link leaves the address bar, so a reload doesn't offer it again (#208).
+  expect(new URL(bob.url()).hash).toBe("");
   await bob.getByRole("button", { name: "Done" }).click();
   await expect(bob.locator(`[data-asked="${team}"]`)).toHaveText("Waiting for alice to add you to Acme. Their machines appear here when they do.");
   await expect(bob.getByRole("heading", { name: "Add your own machine" })).toBeVisible();
@@ -169,7 +171,7 @@ test("two people at different companies join a team by invite", async ({ browser
  * and how it ended. */
 async function startJoin(name: string, state: string, extra: string[] = [], env: NodeJS.ProcessEnv = {}) {
   const joining = spawn("../target/debug/illogicald", ["join", base, "--name", name, "--state-dir", state, ...extra], {
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, ...env },
   });
   procs.push(joining);
@@ -184,20 +186,30 @@ async function startJoin(name: string, state: string, extra: string[] = [], env:
       if (m) res(m[1]);
     });
   });
-  return { link, exited, out: () => out, err: () => err };
+  // Answer the machine's question: the account's fingerprint, as `page`
+  // shows it while approving.
+  const confirm = async (page: Page) => {
+    const account = await page.locator("[data-join-account]").getAttribute("data-join-account");
+    return () => joining.stdin!.end(`${account}\n`);
+  };
+  return { link, exited, confirm, out: () => out, err: () => err };
 }
 
-function runDaemon(name: string, state: string) {
-  procs.push(
-    spawn(
-      "../target/debug/illogicald",
-      [
-        ...["--listen", ANY, "--name", name, "--state-dir", state],
-        ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/sock"],
-      ],
-      { stdio: "ignore" },
-    ),
+/** The daemon, and what it has logged when `log` is set. */
+function runDaemon(name: string, state: string, opts: { env?: NodeJS.ProcessEnv; log?: boolean } = {}) {
+  const d = spawn(
+    "../target/debug/illogicald",
+    [
+      ...["--listen", ANY, "--name", name, "--state-dir", state],
+      ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/sock"],
+    ],
+    { stdio: opts.log ? ["ignore", "pipe", "pipe"] : "ignore", env: { ...process.env, ...opts.env } },
   );
+  procs.push(d);
+  let log = "";
+  d.stdout?.on("data", (b) => (log += b));
+  d.stderr?.on("data", (b) => (log += b));
+  return { proc: d, log: () => log };
 }
 
 test("a team-owned box joins; both use it through the relay and pass control", async () => {
@@ -215,7 +227,9 @@ test("a team-owned box joins; both use it through the relay and pass control", a
   await expect(alice.locator("[data-join-team]")).toHaveText("Acme");
   await expect(alice.locator("[data-join-to]")).toHaveValue(team);
   await expect(alice.locator("[data-join-grants]")).toContainText("The members of Acme reach it by their role");
+  const answer = await j.confirm(alice);
   await alice.locator("[data-approve-join]").click();
+  answer();
   expect(await j.exited).toBe(0);
   expect(j.out()).toContain("This machine is in the team Acme");
   expect(j.out()).toContain("illogicald isn't running here");
@@ -257,16 +271,15 @@ test("a presigned invite: someone already in a team joins another in one click",
   const old = temp("oldbox");
   const j = await startJoin("oldbox", old, ["--team", team], { ILLOGICAL_FEATURES: "" });
   await alice.goto(j.link);
+  const answer = await j.confirm(alice);
   await alice.locator("[data-approve-join]").click();
+  answer();
   expect(await j.exited).toBe(0);
   await alice.goto("/");
   await alice.waitForFunction(() => window.__illogical?.control?.phase === "ready");
   const section = alice.locator(`[data-team="${team}"]`);
-  // The panel opens once the page's control overlay is listening.
-  await expect(async () => {
-    await alice.evaluate(() => window.dispatchEvent(new CustomEvent("illogical:control-panel", { detail: "teams" })));
-    await expect(section).toBeVisible({ timeout: 500 });
-  }).toPass({ timeout: 15_000 });
+  await controlPanel(alice, "teams");
+  await expect(section).toBeVisible();
   await section.locator(`[data-invite-role="${team}"]`).selectOption("viewer");
   await expect(section.locator("[data-invite-ask-first]")).not.toBeChecked();
   await alice.locator(`[data-invite="${team}"]`).click();
@@ -279,6 +292,19 @@ test("a presigned invite: someone already in a team joins another in one click",
   await alice.locator(`[data-invite="${team}"]`).click();
   await expect(section.locator("[data-invite-why]")).toHaveCount(0);
   await expect(section).toContainText("One person can join with this link, within a day");
+  // It's listed until someone uses it, and she can cancel it (#134): this
+  // one she sent to the wrong person.
+  const lost = (await section.locator("[data-invite-link]").textContent())!;
+  const unused = section.locator("[data-presigned]");
+  await expect(unused).toHaveCount(1);
+  await expect(unused).toContainText("for someone who watches");
+  await expect(unused).toContainText(/expires in 2\d h/);
+  await unused.locator("[data-cancel-presigned]").click();
+  await expect(unused).toHaveCount(0);
+  // The one she means to send.
+  await alice.locator(`[data-invite="${team}"]`).click();
+  await expect(section.locator("[data-invite-link]")).not.toHaveText(lost);
+  await expect(unused).toHaveCount(1);
   const link = (await section.locator("[data-invite-link]").textContent())!;
   expect(link).toMatch(/#pinvite=[0-9a-f]{16}\.[0-9a-f]{64}$/);
   await alice.getByRole("button", { name: "Done" }).click();
@@ -286,14 +312,24 @@ test("a presigned invite: someone already in a team joins another in one click",
   const stranger = await (await browser.newContext()).newPage();
   await stranger.goto(link);
   await expect(stranger.locator("[data-why=invite]")).toContainText("alice invited you to Acme.");
+  // The cancelled link does nothing.
+  const tab = await carol.context().newPage();
+  await tab.goto(lost);
+  await expect(tab.locator(".control-prompt .control-error")).toContainText("expired, was used, or never was");
+  await tab.close();
   // Carol opens it: one button, and she's in, with no visit from Alice.
   await carol.goto(link);
   await expect(carol.locator("[data-invite-team]")).toHaveText("Acme");
   await expect(carol.locator(".control-prompt")).toContainText("Joining adds you right away");
   await carol.locator("[data-accept-invite]").click();
   await expect(carol.locator("[data-invite-joined]")).toBeVisible({ timeout: 15_000 });
+  // The link is gone from the address bar: a reload shows neither "You're
+  // in" nor "that invite expired" (#208).
+  expect(new URL(carol.url()).hash).toBe("");
   const mine = await carol.evaluate(() => window.__illogical.control!.teams.map((t) => `${t.roster.name}:${t.role}`).sort());
   expect(mine).toEqual(["Acme:viewer", "Carols:owner"]);
+  // Used, so no longer listed.
+  expect(await alice.evaluate((t) => window.__illogical.control!.presignedInvites(t), team)).toEqual([]);
   await carol.getByRole("button", { name: "Done" }).click();
   // Alice's browser checks the version Carol wrote, as daemons do.
   await alice.evaluate(() => window.__illogical.control!.refresh());
@@ -327,6 +363,15 @@ test("a presigned invite: someone already in a team joins another in one click",
   await expect(dave.locator(".control-prompt .control-error")).toContainText("expired, was used, or never was");
   expect(sent.some((r) => r.includes("/auth/github"))).toBe(true);
   expect(sent.filter((r) => r.includes(seed))).toEqual([]);
+  // A name with a space: the signed roster keeps one word, the team list
+  // shows the name as she set it (#208).
+  await carol.evaluate(() => window.__illogical.control!.setName("Carol  Day"));
+  const carolId = await carol.evaluate(() => window.__illogical.control!.account);
+  await alice.evaluate(() => window.__illogical.control!.refresh());
+  await controlPanel(alice, "teams");
+  await expect(alice.locator(`[data-member="${carolId}"] [data-member-name]`).first()).toHaveText("Carol Day");
+  expect(await alice.evaluate(() => window.__illogical.control!.teams.flatMap((t) => t.roster.members.map((m) => m.name)))).toContain("carol");
+  await alice.getByRole("button", { name: "Done" }).click();
 });
 
 test("a read-only link works logged out, and dies at expiry", async ({ browser }) => {
@@ -362,7 +407,7 @@ test("removing a member cuts them off within a second", async () => {
   await expect.poll(() => bob.evaluate(() => window.__illogical.client.connected)).toBe(true);
   // Remove asks first (#101).
   const bobId = await bob.evaluate(() => window.__illogical.control!.account);
-  await alice.evaluate(() => dispatchEvent(new CustomEvent("illogical:control-panel", { detail: "teams" })));
+  await controlPanel(alice, "teams");
   const remove = alice.locator(`[data-remove-member="${bobId}"]`);
   await remove.click();
   await expect(remove).toHaveText("Really remove?");
@@ -370,6 +415,27 @@ test("removing a member cuts them off within a second", async () => {
   await remove.click();
   await expect.poll(() => bob.evaluate(() => window.__illogical.client.connected), { timeout: 3000, intervals: [50] }).toBe(false);
   expect(Date.now() - t).toBeLessThan(1500);
+});
+
+test("a machine downgraded after a one-click join is told to update", async () => {
+  // #135: a team box joins now that the team's history has a presigned
+  // version, then runs an illogical from before them (played by one that
+  // says it understands nothing). Control won't hand it rosters it would
+  // stop at, and it says why.
+  const state = temp("downbox");
+  const j = await startJoin("downbox", state, ["--team", team]);
+  await alice.goto(j.link);
+  await expect(alice.locator("[data-join-to]")).toHaveValue(team);
+  const answer = await j.confirm(alice);
+  await alice.locator("[data-approve-join]").click();
+  answer();
+  expect(await j.exited).toBe(0);
+  const d = runDaemon("downbox", state, { env: { ILLOGICAL_FEATURES: "" }, log: true });
+  await expect.poll(d.log, { timeout: 30_000 }).toContain("update illogical to keep up with the team");
+  d.proc.kill("SIGKILL");
+  // Out of the team again, so the tests after see only their machines.
+  const left = spawn("../target/debug/illogicald", ["leave", "--state-dir", state], { stdio: "ignore" });
+  expect(await new Promise((r) => left.on("exit", r))).toBe(0);
 });
 
 const mineState = temp("mine");
@@ -397,7 +463,9 @@ test("Cancel turns a join down; Just me keeps a machine apart from the team's", 
   await expect(alice.locator("[data-join-to]")).toHaveValue(team);
   await alice.locator("[data-join-to]").selectOption("");
   await expect(alice.locator("[data-join-grants]")).toContainText("Only your devices reach it");
+  const answer = await j.confirm(alice);
   await alice.locator("[data-approve-join]").click();
+  answer();
   expect(await j.exited).toBe(0);
   expect(j.out()).toContain("This machine is in your account");
   expect(j.out()).toContain("Not the team Acme");
@@ -419,7 +487,7 @@ test("Move to… puts a machine in a team and back, signed by the device", async
   await expect
     .poll(() => alice.evaluate((id) => window.__illogical.control!.daemons.find((d) => d.id === id)?.online, minebox), { timeout: 30_000 })
     .toBe(true);
-  await alice.evaluate(() => dispatchEvent(new CustomEvent("illogical:control-panel", { detail: "devices" })));
+  await controlPanel(alice, "devices");
   const row = alice.locator(`[data-move="${minebox}"]`);
   await row.locator("[data-move-to]").selectOption(team);
   await expect(row.locator("[data-move-explain]")).toContainText("Acme's members reach minebox by their role");
@@ -449,4 +517,31 @@ test("Move to… puts a machine in a team and back, signed by the device", async
   await expect.poll(() => pinned(mineState), { timeout: 15_000 }).toBeNull();
   await expect.poll(() => alice.evaluate((id) => window.__illogical.control!.daemons.find((d) => d.id === id)?.team ?? null, minebox)).toBeNull();
   await alice.getByRole("button", { name: "Done" }).click();
+});
+
+test("a session shared with someone outside your teams waits for their yes", async ({ browser }) => {
+  test.setTimeout(120_000);
+  const erin = await person(browser, "erin");
+  const who = await alice.evaluate(() => window.__illogical.control!.person("erin"));
+  // minebox is Alice's own again (the test before): she shares a session.
+  await alice.evaluate(() => window.__illogical.hosts.select("minebox"));
+  await expect
+    .poll(() => alice.evaluate(() => window.__illogical.client.connected && !!window.__illogical.client.state?.sessions.length), { timeout: 20_000 })
+    .toBe(true);
+  const shared = await alice.evaluate(async (c) => {
+    const cl = window.__illogical.client;
+    const session = cl.state!.sessions[0].id;
+    return (await cl.request("POST", "/api/acl", { session, principal: `account:${c.account}`, role: "viewer", root: c.root, name: "erin" })).ok;
+  }, who);
+  expect(shared).toBe(true);
+  // Erin is asked first, by Alice's name; the machine isn't hers to see yet.
+  const offers = () => erin.evaluate(async () => (await window.__illogical.control!.refresh(), window.__illogical.control!.offers.length));
+  await expect.poll(offers, { timeout: 30_000 }).toBe(1);
+  await expect(erin.locator("[data-share-offer-owner]")).toHaveText("alice");
+  await expect(erin.locator("[data-share-offer-machine]")).toHaveText("minebox");
+  expect(await hostNames(erin)).not.toContain("minebox");
+  await erin.locator("[data-share-accept]").click();
+  await expect
+    .poll(async () => (await erin.evaluate(() => window.__illogical.control!.refresh()), hostNames(erin)), { timeout: 30_000 })
+    .toContain("minebox");
 });

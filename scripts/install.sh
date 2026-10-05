@@ -8,10 +8,11 @@
 #
 # ILLOGICAL_VERSION=vX.Y.Z  a release tag (default: the latest)
 # ILLOGICAL_NO_START=1      install the service without starting it
+# ILLOGICAL_DOWNLOAD_URL=…  where the release's files are, instead of GitHub
+#                           (a mirror, or a local build: file:///path/to/dist)
 set -eu
 
 repo=https://github.com/arugula-salad/illogical
-api=https://api.github.com/repos/arugula-salad/illogical
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'illogical: %s\n' "$*" >&2; exit 1; }
@@ -34,12 +35,18 @@ esac
 
 version=${ILLOGICAL_VERSION:-}
 if [ -z "$version" ]; then
-  version=$(curl -fsSL "$api/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
-  [ -n "$version" ] || die "couldn't find the latest release at $repo/releases"
+  # releases/latest redirects to releases/tag/<tag>. Not GitHub's API: its
+  # unauthenticated limit (60 an hour) is shared by everyone behind an IP.
+  latest=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$repo/releases/latest") || latest=""
+  version=${latest##*/releases/tag/}
+  case "$version" in
+    v[0-9]*) ;;
+    *) die "couldn't find the latest release at $repo/releases" ;;
+  esac
 fi
 
 name="illogical-${version#v}-$target"
-base="$repo/releases/download/$version"
+base=${ILLOGICAL_DOWNLOAD_URL:-$repo/releases/download/$version}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -79,7 +86,10 @@ fi
 # or the default.
 listen=127.0.0.1:7681
 if [ "$os" = Darwin ]; then
-  args=$(sed -n 's:.*<string>\(.*\)</string>.*:\1:p' "$HOME/Library/LaunchAgents/illogicald.plist" 2>/dev/null || true)
+  plist="$HOME/Library/LaunchAgents/illogicald.plist"
+  # Or the LaunchDaemon `illogicald install --system` wrote.
+  [ -f "$plist" ] || plist="/Library/LaunchDaemons/illogicald.$(id -un).plist"
+  args=$(sed -n 's:.*<string>\(.*\)</string>.*:\1:p' "$plist" 2>/dev/null || true)
 else
   args=$(sed -n 's/^ExecStart=[^ ]*//p' "$HOME/.config/systemd/user/illogicald.service" 2>/dev/null || true)
 fi
@@ -119,7 +129,14 @@ if [ -n "$started" ]; then
     fi
   fi
 elif [ -n "${nosystemd:-}" ]; then
-  say "illogical $version is installed. No systemd here, so no service: start the daemon with"
+  if curl -s -o /dev/null -m 1 "$url/"; then
+    # An upgrade: the old daemon is still the one running.
+    say "illogical $version is installed. A daemon is already running here (the old one): restart it"
+    say "to run this version. Panes started with --keep-panes keep running:"
+    say "  kill \$(pgrep -f '^$HOME/.local/bin/illogicald --keep-panes')"
+  else
+    say "illogical $version is installed. No systemd here, so no service: start the daemon with"
+  fi
   say "  nohup $HOME/.local/bin/illogicald --keep-panes >>~/illogicald.log 2>&1 &"
   say "(--keep-panes: panes outlive its restarts)"
 else
@@ -156,9 +173,9 @@ fi
 
 say ""
 if [ -n "$started" ]; then
-  say "  Open      $url"
+  say "  Open      illogical web   ($url, with your browser signed in)"
 else
-  say "  Open      $url  (once it's running)"
+  say "  Open      illogical web   ($url signed in, once it's running)"
 fi
 serve="tailscale serve --bg --https=443 $url"
 if [ -n "$dns" ]; then

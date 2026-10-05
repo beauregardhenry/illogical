@@ -16,12 +16,16 @@
     "active": true,
     "targets": [
       "deb",
+      "rpm",
       "appimage",
       "app",
       "dmg"
     ],
     "category": "DeveloperTool",
     "shortDescription": "Terminals that outlive their windows",
+    "longDescription": "illogical keeps your terminals running in a daemon on this machine, so they\noutlive their windows. Watch and take them over from this app, a browser or\nyour phone, and reach your other machines through illogical control.\nThe app carries illogicald and installs it as a user service on first start.",
+    "publisher": "Jake Gaylor <hello@illogical.widgets.wtf>",
+    "homepage": "https://illogical.widgets.wtf",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -32,11 +36,14 @@
     ],
     "macOS": {
       "signingIdentity": "-",
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "13.0",
+      "files": {
+        "Library/LaunchAgents/wtf.widgets.illogical.daemon.plist": "macos/wtf.widgets.illogical.daemon.plist"
+      }
     },
     "linux": {
       "deb": {
-        "depends": []
+        "depends": ["libc6 (>= 2.35)"]
       }
     },
     "externalBin": [
@@ -50,5 +57,16 @@
       "../../LICENSE-APACHE": "LICENSE-APACHE"
     },
     "copyright": "MIT OR Apache-2.0"
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["illogical"]
+      }
+    },
+    "updater": {
+      "pubkey": "",
+      "endpoints": ["https://github.com/arugula-salad/illogical/releases/latest/download/latest.json"]
+    }
   }
 }

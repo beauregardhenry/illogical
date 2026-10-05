@@ -83,7 +83,7 @@ const keyForm = (page: Page) =>
 
 /** `illogicald join`, approved from `page` (a fresh page load each time). */
 async function approveJoin(page: Page, name: string) {
-  const joining = spawn("../target/debug/illogicald", ["join", base, "--name", name, "--state-dir", temp(name)], { stdio: ["ignore", "pipe", "ignore"] });
+  const joining = spawn("../target/debug/illogicald", ["join", base, "--name", name, "--state-dir", temp(name)], { stdio: ["pipe", "pipe", "ignore"] });
   procs.push(joining);
   const link = await new Promise<string>((res) => {
     let out = "";
@@ -96,7 +96,10 @@ async function approveJoin(page: Page, name: string) {
   const exited = new Promise<number | null>((r) => joining.on("exit", r));
   await page.goto(link);
   await expect(page.locator("[data-join-code]")).toHaveText(link.split("#join=")[1]);
+  // The machine asks whether the account is the one this browser shows.
+  const account = await page.locator("[data-join-account]").getAttribute("data-join-account");
   await page.locator("[data-approve-join]").click();
+  joining.stdin!.end(`${account}\n`);
   expect(await exited).toBe(0);
 }
 
@@ -107,6 +110,9 @@ test("the key probe: keys survive a reload here, or the fallback does", async ({
   const rows = await page.locator("#rows tr").allTextContents();
   test.info().annotations.push({ type: "probe", description: [await verdict.textContent(), ...rows].join("\n") });
   await expect(verdict).not.toContainText("doesn't work either");
+  // And for a test driving real Safari (web/safari): the same, as data.
+  await expect(verdict).toHaveAttribute("data-verdict", /^(keys|wrapped)$/);
+  expect(JSON.parse((await page.locator("#result").textContent())!).verdict).toBe(await verdict.getAttribute("data-verdict"));
   // The fallback, after the reload.
   await expect(page.locator("#rows tr").last().locator("td").last()).toHaveText("works");
   await expect(page.locator("#browser")).toContainText("Safari");

@@ -24,6 +24,8 @@
 //! **Permissions.** "Always allow" is a rule in the block's config, answered
 //! by the block itself: it never picks the agent's `allow_always`, which
 //! `claude-agent-acp` writes into your repo's `.claude/settings.local.json`.
+//! A standing rule (#166, [`crate::rules`]) is "always" kept by the daemon
+//! for a directory or every block; blocks check those after their own.
 //! Cancelling a turn answers open requests `cancelled`; a card goes when its
 //! tool call ends (Fountain refuses an unanswered request after 5 minutes
 //! without telling the client).
@@ -235,6 +237,7 @@ enum Purpose {
     /// `session/fork` (M33): reopen the new session when it answers.
     Fork,
     SetModel,
+    SetMode(String),
     Prompt,
     Other,
 }
@@ -316,6 +319,8 @@ struct Inner {
     worn: Option<Arc<crate::fountain::wear::Worn>>,
     /// Putting it on now.
     wearing: bool,
+    /// #161: waiting for this host's shell environment before spawning.
+    awaiting_shell: bool,
     /// #128: illogical's own MCP token, when it goes by reference (a local
     /// Claude Code), to keep out of logs too.
     token: Option<String>,
@@ -383,6 +388,7 @@ impl Inner {
             adapter: None,
             worn: None,
             wearing: false,
+            awaiting_shell: false,
             token: None,
         }
     }
@@ -561,7 +567,11 @@ impl Inner {
                 let how = e["how"].as_str().unwrap_or("once");
                 let text = match how {
                     "rule" => format!("Allowed {title} (always allowed)"),
+                    "standing" => format!("Allowed {title} (standing rule: {})", e["rule"].as_str().unwrap_or("?")),
                     "always" => format!("Allowed {title}, and always from now on"),
+                    "standing-new" => {
+                        format!("Allowed {title}, and from now on: {}", e["rule"].as_str().unwrap_or("?"))
+                    }
                     _ => format!("Allowed {title}"),
                 };
                 self.t.note(format!("{text}{}", by_of(e)), at);
@@ -634,6 +644,7 @@ impl Inner {
                     "session/resume" => Purpose::Resume,
                     "session/fork" => Purpose::Fork,
                     "session/set_config_option" => Purpose::SetModel,
+                    "session/set_mode" => Purpose::SetMode(m["params"]["modeId"].as_str().unwrap_or("").to_owned()),
                     "session/prompt" => {
                         let text: String = m["params"]["prompt"]
                             .as_array()
@@ -772,6 +783,10 @@ impl Inner {
                         self.pending.clear();
                         self.asks.clear();
                         fx.push(Effect::TurnEnded);
+                    }
+                    (Purpose::SetMode(mode), Some(e)) => {
+                        self.t.note(format!("Couldn't switch to permission mode {mode}: {e}"), at);
+                        self.error = Some(format!("permission mode {mode}: {e}"));
                     }
                     (Purpose::Init | Purpose::New, Some(e)) => {
                         self.t.note(format!("The agent couldn't start a session: {e}"), at);
@@ -1018,6 +1033,8 @@ impl Inner {
             "turns": self.turns.len(),
             "recent_turns": self.turns.iter().rev().take(20).collect::<Vec<_>>(),
             "allow": self.cfg.allow,
+            "permission_mode": self.cfg.def.permission_mode,
+            "user_settings": self.cfg.def.user_settings,
             // M44: what it wears (nothing secret), or that it's putting it on.
             "as_fountain": self.cfg.def.as_fountain,
             "worn": self.worn.as_ref().map(|w| &w.info),
@@ -1267,6 +1284,12 @@ impl Agent {
             self.wear(inner, false);
             return;
         }
+        // #161: a local agent runs with the user's shell environment, which
+        // is still being resolved just after the daemon starts.
+        if self.ctx.sprite.is_none() && self.ctx.shell_env.local_now().is_none() {
+            self.await_shell_env(inner);
+            return;
+        }
         let vm = self.ctx.sprite.is_some();
         let launch = match inner.cfg.def.launch(&self.ctx.home, vm) {
             Ok(l) => l,
@@ -1279,7 +1302,11 @@ impl Agent {
         match &self.ctx.sprite {
             None => {
                 let cwd = inner.cfg.cwd.clone().map(PathBuf::from).unwrap_or_else(|| self.ctx.home.clone());
-                let mut env = self.ctx.env.clone();
+                // #161: the user's shell environment over the daemon's, as a
+                // pane gets it, so the adapter finds the user's node (nvm,
+                // Homebrew), not only what a launchd or systemd PATH has.
+                let shell = self.ctx.shell_env.local_now().unwrap_or_default();
+                let mut env = crate::shellenv::merge(&self.ctx.env, &shell, self.ctx.launch.exe.parent());
                 env.extend(launch.env.iter().cloned());
                 // M44 and #128: what the session's `${…}`s stand for, in the
                 // adapter's environment (its own and its children's: never
@@ -1374,6 +1401,28 @@ impl Agent {
                 "clientInfo": { "name": "illogical", "version": env!("CARGO_PKG_VERSION") },
             }),
         );
+    }
+
+    /// #161: spawn once this host's shell environment is resolved.
+    fn await_shell_env(&self, inner: &mut Inner) {
+        if inner.awaiting_shell {
+            return;
+        }
+        inner.awaiting_shell = true;
+        inner.status = Status::Starting;
+        inner.error = None;
+        let agent = Agent { ctx: self.ctx.clone(), inner: self.inner.clone(), tx: self.tx.clone() };
+        self.ctx.rt.spawn(async move {
+            agent.ctx.shell_env.local().await;
+            let mut g = agent.inner.lock().unwrap();
+            g.awaiting_shell = false;
+            if g.closing {
+                return;
+            }
+            agent.spawn(&mut g);
+            drop(g);
+            agent.changed();
+        });
     }
 
     /// Put on the Fountain agent it wears (M44), then start it; or say why
@@ -1746,6 +1795,12 @@ fn act(ctx: &BlockCtx, g: &mut Inner, f: Effect) {
                     json!({ "sessionId": session, "configId": "model", "value": model }),
                 );
             }
+            // #163: after the model, which decides whether `auto` is there.
+            // Again on each reopen: a resumed session starts in its default.
+            if let Some(mode) = g.cfg.def.permission_mode.clone() {
+                let session = g.session();
+                g.request("session/set_mode", json!({ "sessionId": session, "modeId": mode }));
+            }
             if g.status == Status::Starting {
                 g.status = Status::Ready;
             }
@@ -1770,8 +1825,22 @@ fn act(ctx: &BlockCtx, g: &mut Inner, f: Effect) {
             let Some(p) = g.pending.iter().find(|p| p.id == key).cloned() else { return };
             let allowed =
                 g.cfg.allow.iter().any(|r| r.tool == p.tool && r.title.as_ref().is_none_or(|t| *t == p.title));
-            if allowed && let Some(opt) = p.options.iter().find(|o| o.kind == "allow_once") {
-                g.note(json!({ "e": "approve", "title": p.title, "how": "rule" }));
+            // #166: then the daemon's standing rules, as they are now.
+            let standing = (!allowed)
+                .then(|| {
+                    let what = p.command.as_deref().unwrap_or(&p.title);
+                    ctx.rules.allowing(&p.tool, what, g.cfg.cwd.as_deref(), ctx.sprite.as_deref())
+                })
+                .flatten();
+            if (allowed || standing.is_some())
+                && let Some(opt) = p.options.iter().find(|o| o.kind == "allow_once")
+            {
+                match standing {
+                    Some(r) => {
+                        g.note(json!({ "e": "approve", "title": p.title, "how": "standing", "rule": r.describe() }))
+                    }
+                    None => g.note(json!({ "e": "approve", "title": p.title, "how": "rule" })),
+                }
                 let opt = opt.id.clone();
                 g.out(json!({ "jsonrpc": "2.0", "id": p.rpc, "result": { "outcome": { "outcome": "selected", "optionId": opt } } }));
             }
@@ -1832,15 +1901,9 @@ fn worn_meta(ctx: &BlockCtx, g: &Inner) -> Option<Value> {
 }
 
 /// An imported conversation's `_meta` (M33): your settings, skills and
-/// `CLAUDE.md`, as it had where it started, with every hook off (S20 Q3:
-/// `project` is what loads `CLAUDE.md`, and it brings the project's hooks).
+/// `CLAUDE.md`, as it had where it started, with every hook off.
 fn imported_meta(g: &Inner) -> Option<Value> {
-    (g.cfg.import.is_some() && g.cfg.def.agent == Kind::Claude).then(|| {
-        json!({ "claudeCode": { "options": {
-            "settingSources": ["user", "project", "local"],
-            "settings": { "disableAllHooks": true },
-        } } })
-    })
+    (g.cfg.import.is_some() && g.cfg.def.agent == Kind::Claude).then(defs::user_settings_meta)
 }
 
 /// A followed conversation that can't be loaded: the agent stops, saying
@@ -1942,14 +2005,53 @@ impl Agent {
             // the block instead.
             return Err("use option \"always\": the block remembers it, not the agent".into());
         }
-        if option.starts_with("always") {
+        // #166: "always" for this block (its config), or a standing rule
+        // the daemon keeps for this directory or every block. Those are the
+        // owner's to make, and they allow the whole tool unless given a
+        // prefix.
+        let scope = args["scope"].as_str().unwrap_or("block");
+        let standing = match scope {
+            "block" => None,
+            "cwd" | "everywhere" if !option.starts_with("always") => {
+                return Err(format!("scope {scope} goes with option \"always\""));
+            }
+            "cwd" | "everywhere" if by.is_some() => {
+                return Err("only the owner makes standing rules".into());
+            }
+            "cwd" | "everywhere" => {
+                let cwd = match scope {
+                    "cwd" => Some(g.cfg.cwd.clone().ok_or("this block has no directory: use scope everywhere")?),
+                    _ => None,
+                };
+                let prefix = args["prefix"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+                Some(crate::rules::Standing {
+                    tool: p.tool.clone(),
+                    prefix,
+                    sprite: cwd.as_ref().and(self.ctx.sprite.clone()),
+                    cwd,
+                    at_ms: 0,
+                    from: Some(p.title.clone()),
+                })
+            }
+            s => return Err(format!("scope {s}: block, cwd or everywhere")),
+        };
+        if let Some(r) = &standing {
+            self.ctx.rules.add(r.clone()).map_err(|e| format!("couldn't keep the rule: {e}"))?;
+        } else if option.starts_with("always") {
             let rule = Rule { tool: p.tool.clone(), title: (option == "always").then(|| p.title.clone()) };
             if !g.cfg.allow.contains(&rule) {
                 g.cfg.allow.push(rule);
             }
         }
-        let how = if option.starts_with("always") { "always" } else { "once" };
-        g.note(json!({ "e": "approve", "title": p.title, "how": how, "by": by }));
+        match &standing {
+            Some(r) => g.note(
+                json!({ "e": "approve", "title": p.title, "how": "standing-new", "rule": r.describe(), "by": by }),
+            ),
+            None => {
+                let how = if option.starts_with("always") { "always" } else { "once" };
+                g.note(json!({ "e": "approve", "title": p.title, "how": how, "by": by }));
+            }
+        }
         g.out(json!({ "jsonrpc": "2.0", "id": p.rpc, "result": { "outcome": { "outcome": "selected", "optionId": chosen.id } } }));
         drop(g);
         self.changed();

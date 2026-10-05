@@ -3,6 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "@playwright/test";
+// Loopback callers show the daemon's local token: every daemon of the run
+// shares one, which browsers carry as a cookie.
+import { tokenCookies } from "./e2e/local-token.ts";
 
 // Directories for the run, made once (workers load this config too, and
 // inherit them) and removed when the runner exits, after the daemon (#62).
@@ -112,7 +115,9 @@ runDir("FAKE_ACP_DIR", "illogical-e2e-fake-acp-");
 }
 
 // By default runs against a throwaway debug daemon on 7683 (which serves
-// web/dist from disk), driving the system Chrome; `*.webkit.spec.ts` drive
+// web/dist from disk), driving the system Chrome (E2E_CHROMIUM=1: Playwright's
+// own Chromium, for machines without Chrome, like CI's; the full build, as the
+// headless shell denies notifications whatever's granted); `*.webkit.spec.ts` drive
 // Playwright's WebKit (#94: Safari's engine, where device keys behave
 // differently), which needs `pnpm exec playwright install webkit`. Set E2E_BASE_URL to test a
 // daemon that is already running, e.g. through `tailscale serve`.
@@ -132,9 +137,10 @@ export default defineConfig({
   use: {
     baseURL: external ?? `http://127.0.0.1:${port}`,
     viewport: { width: 1000, height: 640 },
+    storageState: { cookies: tokenCookies, origins: [] },
   },
   projects: [
-    { name: "chrome", use: { channel: "chrome" }, testIgnore: /\.webkit\.spec\.ts$/ },
+    { name: "chrome", use: { channel: process.env.E2E_CHROMIUM ? "chromium" : "chrome" }, testIgnore: /\.webkit\.spec\.ts$/ },
     { name: "webkit", use: { browserName: "webkit" }, testMatch: /\.webkit\.spec\.ts$/ },
   ],
   webServer: external
