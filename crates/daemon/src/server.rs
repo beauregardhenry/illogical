@@ -145,6 +145,7 @@ pub fn router(app: Arc<App>) -> Router {
         .fallback(asset)
         .layer(middleware::from_fn_with_state(app.clone(), cors))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
+        .layer(middleware::from_fn(whole_body))
         .with_state(app)
 }
 
@@ -156,6 +157,7 @@ pub fn local_router(app: Arc<App>) -> Router {
         // Editors on this machine join the swarm here (M28).
         .route("/api/editors/connect", get(crate::editor::link::connect))
         .merge(api_routes(&app))
+        .layer(middleware::from_fn(whole_body))
         .with_state(app)
 }
 
@@ -182,6 +184,29 @@ pub fn channel_router(app: Arc<App>) -> Router {
 /// An embedded web client file.
 pub fn asset_file(path: &str) -> Option<Vec<u8>> {
     Assets::get(path).map(|f| f.data.into_owned())
+}
+
+/// A request body this small is read before anything answers.
+const SMALL_BODY: usize = 64 * 1024;
+
+/// Read a small request body in full before anything answers. A refusal
+/// (a check's 403, a 404) is answered without reading the body, and a
+/// connection closed with data still unread is reset, not closed: the
+/// reset can reach the client before it has read the answer, which it then
+/// never sees. Bodies of no stated length or larger (uploads) stream to
+/// their handlers as before.
+async fn whole_body(req: Request, next: Next) -> Response {
+    let len =
+        req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<usize>().ok());
+    let Some(len @ 1..=SMALL_BODY) = len else { return next.run(req).await };
+    let (parts, body) = req.into_parts();
+    // A client that never sends what it said it would: as a handler
+    // reading the body would have, give up rather than wait for ever.
+    match tokio::time::timeout(std::time::Duration::from_secs(30), axum::body::to_bytes(body, len)).await {
+        Ok(Ok(bytes)) => next.run(Request::from_parts(parts, Body::from(bytes))).await,
+        Ok(Err(_)) => StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }
 
 /// Cross-site requests can't read our answers, but a POST still lands: so a

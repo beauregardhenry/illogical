@@ -338,6 +338,37 @@ fn the_api_over_tcp_refuses_other_sites() {
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
 }
 
+/// A refusal waits for the request's body. Answered first, the daemon would
+/// close with the body unread, which resets the connection: a client could
+/// lose the answer to the reset (as `Connection: close` clients, the CLI
+/// among them, did on slow machines).
+#[test]
+fn a_refusal_reads_the_body_first() {
+    let d = start();
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", d.port)).unwrap();
+    let body = r#"{"command":"true"}"#;
+    write!(
+        s,
+        "POST /api/run HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        d.port,
+        body.len()
+    )
+    .unwrap();
+    // No answer while the body is still to come.
+    s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let mut early = [0u8; 1];
+    let waited = s.read(&mut early).map_err(|e| e.kind());
+    assert!(
+        matches!(waited, Err(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "answered before the body came: {waited:?}"
+    );
+    s.write_all(body.as_bytes()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+}
+
 /// Web Push end to end: a stand-in push service receives what the daemon
 /// sends, and we decrypt it as the browser would.
 #[test]
