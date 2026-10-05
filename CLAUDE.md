@@ -14,6 +14,7 @@
   PR and to the user, and leave it open.
 
 CI is `.github/workflows/check.yml` on GitHub's hosted runners: `linux`
-(`just check` and the rest), and `macos` on Apple silicon and Intel
-(`macos-15-intel`). Run what you can of it locally before pushing:
+(`just check` and the rest), and `macos`, which passes only when the build
+and tests pass on both Apple silicon and Intel (`macos-15-intel`). main's
+ruleset requires `linux` and `macos` by those names: keep them. Run what you can of it locally before pushing:
 `just check`, `just test-scripts`.

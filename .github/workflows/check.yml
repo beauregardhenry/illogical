@@ -7,6 +7,11 @@ on:
     branches: ["**"]
   workflow_dispatch:
 
+# A newer push to the same branch replaces the run in progress.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -45,7 +50,8 @@ jobs:
           docker run --rm -v "$PWD:/repo" -w /repo --entrypoint sh ghcr.io/gitleaks/gitleaks:latest \
             -c 'git config --global --add safe.directory /repo && gitleaks git --no-banner --redact .'
 
-  macos:
+  macos-build:
+    name: macos (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -57,3 +63,12 @@ jobs:
       - uses: ./.github/actions/tools
       - run: just bootstrap
       - run: just test
+
+  # The check main's ruleset requires: one `macos` for both runners above.
+  macos:
+    needs: macos-build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both macOS jobs passed
+        run: test "${{ needs.macos-build.result }}" = success
