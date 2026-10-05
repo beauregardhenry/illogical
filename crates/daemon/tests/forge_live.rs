@@ -418,7 +418,12 @@ fn a_box_with_no_gh_login_reads_through_the_app_and_writes_nothing() {
     enroll(&d, &origin);
     let b = open(&d, json!({ "pr": format!("https://github.com/cli/cli/pull/{N}") }));
     wait_until("joined", 20, || !f.seen.lock().unwrap().texts.is_empty());
-    wait_until("a read", 20, || d.state(b)["pr"].is_object());
+    // The read and who you are come separately (the App's read, control's
+    // say-so): either can land first.
+    wait_until("a read, and who you are", 20, || {
+        let st = d.state(b);
+        st["pr"].is_object() && !st["me"].is_null()
+    });
     let st = d.state(b);
     assert!(st["error"].is_null(), "{st}");
     assert_eq!(st["me"], "jhgaylor", "control said who you are: {st}");
