@@ -19,7 +19,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # gitleaks reads the whole history
       - name: Room for the build
@@ -59,7 +59,7 @@ jobs:
         os: [macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: bash 4.4+ (macOS ships 3.2; the shell integration tests need PS0)
         run: |
           brew install bash

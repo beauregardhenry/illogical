@@ -14,7 +14,7 @@ jobs:
   linux:
     runs-on: [self-hosted, linux-x86_64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: echo "CARGO_TARGET_DIR=$HOME/.cache/illogical-ci/release" >> "$GITHUB_ENV"
       - run: scripts/ci-cap-target 30
       - run: just bootstrap
@@ -30,7 +30,7 @@ jobs:
   macos:
     runs-on: [self-hosted, macos-arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: echo "CARGO_TARGET_DIR=$HOME/.cache/illogical-ci/release" >> "$GITHUB_ENV"
       - run: scripts/ci-cap-target 30
       - run: just bootstrap
@@ -47,7 +47,7 @@ jobs:
     needs: [linux, macos]
     runs-on: [self-hosted, linux-x86_64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/release sums "$GITHUB_REF_NAME"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
