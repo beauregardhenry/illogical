@@ -122,8 +122,13 @@ impl Claude {
         std::fs::write(
             &script,
             r#"import json, os, sys, time
+parent = os.getpid()
 if os.fork():
     sys.exit(0)
+# Out of the pane's tree before saying so: until the parent has exited
+# (slow on a busy machine), this is still its child, under the shell.
+while os.getppid() == parent:
+    time.sleep(0.01)
 os.setsid()
 me = os.getpid()
 start = open(f"/proc/{me}/stat").read().rsplit(")", 1)[1].split()[19]
