@@ -538,6 +538,18 @@ fn normalize(line: &str) -> String {
 /// A captured line without escapes or trailing blanks (tmux writes only
 /// SGR changes, we write whole SGRs; trailing spaces depend on how a
 /// program cleared the line).
+/// Whether `vi -u NONE -N` here draws its ruler, as the fixture's vim
+/// (Debian's) does. `cq` quits with an error only when 'ruler' is on.
+fn vi_draws_ruler() -> bool {
+    Command::new("vi")
+        .args(["-u", "NONE", "-N", "-es", "-c", "if &ruler | cq | endif", "-c", "q!"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| !s.success())
+}
+
 fn plain(line: &str) -> String {
     let s = Regex::new(r"\\033\[[0-9;:?]*[A-Za-z]").unwrap().replace_all(line, "");
     s.trim_end().to_owned()
@@ -817,11 +829,12 @@ fn iterm2s_conversation_gets_tmuxs_answers() {
 
     // ---- every reply, against tmux's
     let mut tmux = tmux_replies();
+    let ruler = vi_draws_ruler();
     let mut failures = vec![];
     let mut compared = 0;
     for (cmd, ok, body) in first.into_iter().chain(second) {
         let key = normalize(&cmd);
-        let Some(theirs) = tmux.get_mut(&key).and_then(|q| q.pop_front()) else {
+        let Some(mut theirs) = tmux.get_mut(&key).and_then(|q| q.pop_front()) else {
             failures.push(format!("tmux never answered {key}"));
             continue;
         };
@@ -830,6 +843,16 @@ fn iterm2s_conversation_gets_tmuxs_answers() {
         // other systems' vim draws it differently.
         if !cfg!(target_os = "linux") && key.starts_with("capture-pane") {
             continue;
+        }
+        // A Linux vim with the ruler off (Ubuntu's) draws the same screen
+        // without it: that line is blank here, the rest still compared.
+        if !ruler && key.starts_with("capture-pane") {
+            let re = Regex::new(r"^ +[0-9]+,[0-9]+ +All$").unwrap();
+            for l in &mut theirs.1 {
+                if re.is_match(&plain(l)) {
+                    l.clear();
+                }
+            }
         }
         if let Err(e) = compare(&cmd, &(ok, body), &theirs) {
             failures.push(e);
