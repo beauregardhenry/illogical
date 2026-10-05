@@ -5,7 +5,9 @@
 You need [rustup](https://rustup.rs) (the toolchain is pinned in
 `rust-toolchain.toml`), [mise](https://mise.jdx.dev) (it installs the exact
 Zig that libghostty needs, from `.mise.toml`), [just](https://just.systems),
-Node and [pnpm](https://pnpm.io). On macOS, the Xcode command line tools too.
+Node and [pnpm](https://pnpm.io). On macOS, the Xcode command line tools too,
+and for the tests a bash newer than the system's 3.2 (`brew install bash`):
+the shell integration needs bash 4.4.
 
 ```
 just bootstrap      # Zig via mise, web dependencies
@@ -49,7 +51,13 @@ tests use a stand-in chant). `just screenshots` regenerates the images in
 3. `install.sh` picks up the latest release by itself. If the page
    changed, `just site-deploy` publishes it (wrangler's login on geek).
 
-CI runs on two self-hosted GitHub Actions runners in the arugula-salad
+In this repo (beauregardhenry/illogical), `check.yml` runs on GitHub's
+hosted runners instead: Ubuntu, and macOS on both Apple silicon and Intel
+(`macos-15-intel`, Sequoia). `.github/actions/tools` installs what the
+self-hosted machines already had. `release.yml` still names the
+self-hosted runners below, so a tag doesn't release from here.
+
+Upstream, CI runs on two self-hosted GitHub Actions runners in the arugula-salad
 org's `illogical` runner group, which only this repo may use: geek
 (`linux-x86_64`, a systemd user service,
 `~/.config/systemd/user/actions-runner-illogical.service`, runner in

@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
+        LazyLock,
         atomic::{AtomicU32, Ordering},
         mpsc,
     },
@@ -265,8 +266,10 @@ impl Cc {
         }
         let shown = line.replace('\x1b', "\\033").replace('\t', "\\t");
         self.lines.push(shown.clone());
-        let re = Regex::new(r"^%(begin|end|error) (\d+) (\d+) (\d+)$").unwrap();
-        if let Some(m) = re.captures(&line) {
+        // Once, not per line: a flood is tens of thousands of lines.
+        static GUARD: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^%(begin|end|error) (\d+) (\d+) (\d+)$").unwrap());
+        if let Some(m) = GUARD.captures(&line) {
             let flags: u32 = m[4].parse().unwrap();
             if &m[1] == "begin" {
                 let cmd = if flags & 1 == 1 { self.queue.pop_front().unwrap_or_default() } else { "(server)".into() };
@@ -289,7 +292,11 @@ impl Cc {
 
     /// Until every command is answered and the line goes quiet.
     fn wait_idle(&mut self) {
-        let end = Instant::now() + Duration::from_secs(15);
+        self.wait_idle_within(Duration::from_secs(15));
+    }
+
+    fn wait_idle_within(&mut self, budget: Duration) {
+        let end = Instant::now() + budget;
         while Instant::now() < end {
             let n = self.lines.len();
             self.pump(Duration::from_millis(300));
@@ -538,6 +545,18 @@ fn normalize(line: &str) -> String {
 /// A captured line without escapes or trailing blanks (tmux writes only
 /// SGR changes, we write whole SGRs; trailing spaces depend on how a
 /// program cleared the line).
+/// Whether `vi -u NONE -N` here draws its ruler, as the fixture's vim
+/// (Debian's) does. `cq` quits with an error only when 'ruler' is on.
+fn vi_draws_ruler() -> bool {
+    Command::new("vi")
+        .args(["-u", "NONE", "-N", "-es", "-c", "if &ruler | cq | endif", "-c", "q!"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| !s.success())
+}
+
 fn plain(line: &str) -> String {
     let s = Regex::new(r"\\033\[[0-9;:?]*[A-Za-z]").unwrap().replace_all(line, "");
     s.trim_end().to_owned()
@@ -817,11 +836,13 @@ fn iterm2s_conversation_gets_tmuxs_answers() {
 
     // ---- every reply, against tmux's
     let mut tmux = tmux_replies();
+    let ruler = vi_draws_ruler();
+    let ruler_line = Regex::new(r"^ +[0-9]+,[0-9]+ +All$").unwrap();
     let mut failures = vec![];
     let mut compared = 0;
     for (cmd, ok, body) in first.into_iter().chain(second) {
         let key = normalize(&cmd);
-        let Some(theirs) = tmux.get_mut(&key).and_then(|q| q.pop_front()) else {
+        let Some(mut theirs) = tmux.get_mut(&key).and_then(|q| q.pop_front()) else {
             failures.push(format!("tmux never answered {key}"));
             continue;
         };
@@ -830,6 +851,15 @@ fn iterm2s_conversation_gets_tmuxs_answers() {
         // other systems' vim draws it differently.
         if !cfg!(target_os = "linux") && key.starts_with("capture-pane") {
             continue;
+        }
+        // A Linux vim with the ruler off (Ubuntu's) draws the same screen
+        // without it: that line is blank here, the rest still compared.
+        if !ruler && key.starts_with("capture-pane") {
+            for l in &mut theirs.1 {
+                if ruler_line.is_match(&plain(l)) {
+                    l.clear();
+                }
+            }
         }
         if let Err(e) = compare(&cmd, &(ok, body), &theirs) {
             failures.push(e);
@@ -1134,16 +1164,28 @@ fn falling_behind_pauses_the_pane() {
     c.pump(Duration::from_secs(1));
     assert!(!c.notes.iter().any(|n| n.starts_with(&format!("%extended-output %{pane} "))), "output while paused");
     send_all(&mut c, &pane_requests(pane));
-    c.wait_idle();
+    // The rest of the flood comes through first: on a slow machine (a CI
+    // VM) that takes a while.
+    c.wait_idle_within(Duration::from_secs(60));
     assert!(c.notes.contains(&format!("%continue %{pane}")), "{:#?}", c.notes);
     // The capture shows where it got to; the rest follows.
     paste(&mut c, pane, "echo after-$((6*7))\r");
-    let end = Instant::now() + Duration::from_secs(30);
+    let end = Instant::now() + Duration::from_secs(60);
+    let (mut out, mut read) = (String::new(), 0);
     loop {
-        let out: String = c.notes.iter().filter(|n| n.contains(&format!(" %{pane} "))).cloned().collect();
+        // Only what arrived since the last look; the output so far is large.
+        for n in &c.notes[read..] {
+            if n.contains(&format!(" %{pane} ")) {
+                out.push_str(n);
+            }
+        }
+        read = c.notes.len();
         if out.contains("after-42") {
             break;
         }
+        // Keep a tail in case after-42 spans two notes.
+        let cut = (out.len().saturating_sub(64)..=out.len()).find(|&i| out.is_char_boundary(i)).unwrap_or(0);
+        out.drain(..cut);
         assert!(Instant::now() < end, "no output after continue");
         c.pump(Duration::from_millis(200));
     }
