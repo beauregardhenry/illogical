@@ -349,8 +349,9 @@ fn a_refusal_reads_the_body_first() {
     let body = r#"{"command":"true"}"#;
     write!(
         s,
-        "POST /api/run HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /api/run HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nOrigin: https://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         d.port,
+        d.token(),
         body.len()
     )
     .unwrap();
