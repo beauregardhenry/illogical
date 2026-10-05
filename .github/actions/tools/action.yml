@@ -20,10 +20,12 @@ runs:
     - uses: taiki-e/install-action@v2
       with:
         tool: just
-    - uses: actions/setup-node@v4
+    - uses: actions/setup-node@v7
       with:
         node-version: 24
-    - uses: pnpm/action-setup@v4
+        # pnpm comes next and the lockfile is in web/: nothing to cache here.
+        package-manager-cache: false
+    - uses: pnpm/action-setup@v6
       with:
         version: 10
     - uses: Swatinem/rust-cache@v2
