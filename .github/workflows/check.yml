@@ -1,6 +1,8 @@
-# Every push, on GitHub's hosted runners: the testnet's claims, `just check`
-# and the Playwright specs (Chromium and WebKit) on Linux; build, test and
-# the WebKit specs on macOS (Apple silicon and Intel). The testnet
+# Every push, on GitHub's hosted runners: the testnet's claims and `just
+# check` on Linux; build, test and the WebKit specs on macOS (Apple silicon
+# and Intel). Not upstream's full Playwright run (`just e2e`): on these
+# runners some of it can't pass (no nvim, frame-rate and timing budgets set
+# for upstream's machines, tc netem), and upstream runs it on its own. The testnet
 # (testnet/README.md) and the ssh tests in `just test` need Docker, which
 # only the Linux runner has: the macOS jobs skip them, loudly
 # (ILLOGICAL_SKIP_DOCKER), and Linux runs them. Each run starts clean but
@@ -69,13 +71,6 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo --entrypoint sh ghcr.io/gitleaks/gitleaks:latest \
             -c 'git config --global --add safe.directory /repo && gitleaks git --no-banner --redact .'
-      # team-swarm-phones' variant across networks runs a box in a container
-      # behind tc netem, with just static's illogicald (built above).
-      - name: The Playwright specs, in Chromium and WebKit
-        run: just e2e
-        env:
-          E2E_CHROMIUM: "1"
-          E2E_PORT: "7769"
       - name: Take the test stack down
         if: always()
         run: just testnet down

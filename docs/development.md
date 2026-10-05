@@ -64,7 +64,10 @@ hosted runners instead: Ubuntu, and macOS on both Apple silicon and Intel
 (`macos-15-intel`, Sequoia). `.github/actions/tools` installs what the
 self-hosted machines already had. Only the Ubuntu runner has Docker, so it
 runs the testnet and the ssh tests; the macOS jobs skip those, saying so
-(`ILLOGICAL_SKIP_DOCKER=1`). `macos-intel.yml` and `forges-nightly.yml`
+(`ILLOGICAL_SKIP_DOCKER=1`). Upstream's full Playwright run (`just e2e`)
+isn't part of it: on these runners some specs can't pass (no nvim, frame
+and timing budgets set for upstream's machines, `tc netem`); the macOS
+jobs run the WebKit specs. `macos-intel.yml` and `forges-nightly.yml`
 run only upstream (check.yml covers Intel here, and the forges need
 upstream's runners and secrets), and `release.yml` still names the
 self-hosted runners below, so a tag doesn't release from here.
