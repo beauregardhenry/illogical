@@ -365,7 +365,13 @@ impl Guests {
         if self.any() {
             return;
         }
-        if let Some(l) = self.listening.lock().await.take() {
+        let mut listening = self.listening.lock().await;
+        // Again, holding the listener: an invite minted while we waited
+        // for it needs it.
+        if self.any() {
+            return;
+        }
+        if let Some(l) = listening.take() {
             let _ = l.stop.send(());
             info!("guest ssh stopped listening: no invites left");
         }
@@ -810,16 +816,25 @@ async fn mint(State(app): AppState, Json(req): Json<GuestInviteRequest>) -> Resp
     if !plain_host(&host) {
         return error(StatusCode::BAD_REQUEST, format!("{host:?} isn't a host name or address"));
     }
+    // The invite first, then the listener: the other way round, the
+    // once-a-second prune could find no invite in between and stop the
+    // listener this invite's command names.
+    let (mut invite, token) = guests.mint(&req);
     let addr = match guests.ensure_listening(&app).await {
         Ok(a) => a,
-        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        Err(e) => {
+            guests.revoke(invite.id);
+            return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string());
+        }
     };
     let key = match guests.host_key() {
         Ok(k) => k,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("no host key: {e}")),
+        Err(e) => {
+            guests.revoke(invite.id);
+            return error(StatusCode::INTERNAL_SERVER_ERROR, format!("no host key: {e}"));
+        }
     };
     let public = key.public_key().to_openssh().unwrap_or_default();
-    let (mut invite, token) = guests.mint(&req);
     let known = format!("{} {public}", known_name(&host, addr.port()));
     invite.command = Some(command(&token, &host, addr.port(), &known));
     invite.known_hosts = Some(known);
