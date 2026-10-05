@@ -9,7 +9,7 @@ mod strays;
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     os::unix::net::UnixStream,
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -359,7 +359,8 @@ pub fn alive(pid: u64) -> bool {
 /// A phone subscribed to push notifications: a push service of our own,
 /// whose messages it decrypts as a browser would (RFC 8291).
 pub struct Phone {
-    service: TcpListener,
+    /// Each push's body, as the service thread got it.
+    pushes: std::sync::mpsc::Receiver<Vec<u8>>,
     ua: p256::SecretKey,
     ua_public: Vec<u8>,
     auth: [u8; 16],
@@ -377,7 +378,45 @@ impl Phone {
             "/api/push/subscribe",
             json!({"endpoint": endpoint, "keys": {"p256dh": B64.encode(&ua_public), "auth": B64.encode(auth)}}),
         );
-        Self { service, ua, ua_public, auth }
+        // The push service answers at once, as a real one does: the daemon
+        // gives up on a push after 15 s, which a test busy elsewhere (on a
+        // slow machine) could otherwise outlast, leaving it to read a
+        // connection the daemon had already closed.
+        let (tx, pushes) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for conn in service.incoming() {
+                let Ok(conn) = conn else { continue };
+                if let Some(body) = Self::receive(conn)
+                    && tx.send(body).is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Self { pushes, ua, ua_public, auth }
+    }
+
+    /// One push request: its body, answered 201.
+    fn receive(mut conn: TcpStream) -> Option<Vec<u8>> {
+        conn.set_read_timeout(Some(Duration::from_secs(20))).ok()?;
+        let mut r = BufReader::new(conn.try_clone().ok()?);
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).ok()?;
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':')
+                && k.eq_ignore_ascii_case("content-length")
+            {
+                len = v.trim().parse().ok()?;
+            }
+        }
+        let mut body = vec![0; len];
+        r.read_exact(&mut body).ok()?;
+        let _ = write!(conn, "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        Some(body)
     }
 
     /// The next push.
@@ -387,37 +426,7 @@ impl Phone {
         use p256::PublicKey;
         use sha2::Sha256;
 
-        self.service.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut conn = loop {
-            match self.service.accept() {
-                Ok((c, _)) => break c,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "no push came");
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => panic!("push service: {e}"),
-            }
-        };
-        conn.set_nonblocking(false).unwrap();
-        conn.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-        let mut r = BufReader::new(conn.try_clone().unwrap());
-        let mut len = 0;
-        loop {
-            let mut line = String::new();
-            r.read_line(&mut line).unwrap();
-            if line.trim().is_empty() {
-                break;
-            }
-            if let Some((k, v)) = line.split_once(':')
-                && k.eq_ignore_ascii_case("content-length")
-            {
-                len = v.trim().parse().unwrap();
-            }
-        }
-        let mut body = vec![0; len];
-        r.read_exact(&mut body).unwrap();
-        write!(conn, "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        let body = self.pushes.recv_timeout(Duration::from_secs(30)).expect("no push came");
         let (salt, rest) = body.split_at(16);
         let idlen = rest[4] as usize;
         let (as_public, sealed) = rest[5..].split_at(idlen);

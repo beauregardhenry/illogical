@@ -34,7 +34,7 @@ mod agentd;
 
 use std::{
     collections::HashMap,
-    io::{Read as _, Write as _},
+    io::{BufRead as _, BufReader, Read as _, Write as _},
     net::TcpStream,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -512,17 +512,38 @@ fn agents_through_mcp() {
 fn as_friend(d: &Daemon, method: &str, path: &str, body: Value) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", d.port)).unwrap();
     let body = body.to_string();
+    // Not `Connection: close`: a refusal (403 before the body is read) would
+    // close with the body unread, which resets the connection, and the
+    // reset can beat the answer here. Kept alive, the daemon reads past the
+    // body; the answer's Content-Length says where it ends.
     write!(
         s,
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nTailscale-User-Login: {FRIEND}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nTailscale-User-Login: {FRIEND}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         d.port,
         body.len()
     )
     .unwrap();
-    let mut out = String::new();
-    s.read_to_string(&mut out).unwrap();
-    let status = out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    (status, out.split_once("\r\n\r\n").map(|(_, b)| b.to_owned()).unwrap_or_default())
+    s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    let mut r = BufReader::new(s);
+    let mut head = String::new();
+    let mut len = 0;
+    loop {
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':')
+            && k.eq_ignore_ascii_case("content-length")
+        {
+            len = v.trim().parse().unwrap();
+        }
+        head.push_str(&line);
+    }
+    let mut out = vec![0; len];
+    r.read_exact(&mut out).unwrap();
+    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (status, String::from_utf8_lossy(&out).into_owned())
 }
 
 #[test]
