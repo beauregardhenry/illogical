@@ -5,7 +5,9 @@
 You need [rustup](https://rustup.rs) (the toolchain is pinned in
 `rust-toolchain.toml`), [mise](https://mise.jdx.dev) (it installs the exact
 Zig that libghostty needs, from `.mise.toml`), [just](https://just.systems),
-Node and [pnpm](https://pnpm.io). On macOS, the Xcode command line tools too.
+Node and [pnpm](https://pnpm.io). On macOS, the Xcode command line tools too,
+and for the tests a bash newer than the system's 3.2 (`brew install bash`):
+the shell integration needs bash 4.4.
 
 ```
 just bootstrap      # Zig via mise, web dependencies
