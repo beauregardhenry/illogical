@@ -226,6 +226,8 @@ impl Plain {
     fn start(&mut self) {
         // Not the last one's port.
         let _ = std::fs::remove_file(self.state.join("listen"));
+        // Every start's log, one after another, for when a check fails.
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(self.log()).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_illogicald"))
             .args(["--listen", listen::ANY, "--shell", "bash --norc --noprofile"])
             .args(["--no-manager-env", "--keep-panes", "--state-dir"])
@@ -234,10 +236,24 @@ impl Plain {
             .env("ILLOGICAL_KEEP_GRACE_MS", GRACE_MS.to_string())
             .env_remove("NOTIFY_SOCKET")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(log)
             .spawn()
             .unwrap();
         self.child = Some(child);
+    }
+
+    /// The daemons' log (theirs and their panes' shims'), beside the state.
+    fn log(&self) -> PathBuf {
+        self.state.with_extension("log")
+    }
+
+    /// What the daemons logged, for a failure message.
+    fn logs(&self) -> String {
+        format!(
+            "\n--- daemon log ({}) ---\n{}",
+            self.log().display(),
+            std::fs::read_to_string(self.log()).unwrap_or_default()
+        )
     }
 
     fn signal(&mut self, sig: nix::sys::signal::Signal) {
@@ -264,6 +280,7 @@ impl Drop for Plain {
             let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(*pid), nix::sys::signal::Signal::SIGKILL);
         }
         strays::remove(&self.state);
+        let _ = std::fs::remove_file(self.log());
     }
 }
 
@@ -291,7 +308,7 @@ async fn shims_keep_panes_without_systemd() {
     assert!(alive(pid), "the shell outlived the daemon");
     d.start();
     let (mut ws, state) = d.connect().await;
-    assert!(state.panes[0].running, "adopted, still running");
+    assert!(state.panes[0].running, "adopted, still running{}", d.logs());
     let seen = watch(&mut ws, |s| ticks(s).last().is_some_and(|n| *n >= 60)).await;
     let t = ticks(&seen);
     let expected: Vec<u32> = (t[0]..=*t.last().unwrap()).collect();
@@ -309,7 +326,7 @@ async fn shims_keep_panes_without_systemd() {
     type_in(&mut ws, "echo pid=$((0+$$))x\r").await;
     let again = watch(&mut ws, |s| s.rsplit("tick-").next().is_some_and(|tail| shell_pid(tail).is_some())).await;
     let again = shell_pid(again.rsplit("tick-").next().unwrap()).unwrap();
-    assert_eq!(again, pid, "the same shell, through a restart and a crash");
+    assert_eq!(again, pid, "the same shell, through a restart and a crash{}", d.logs());
     let _ = std::fs::remove_file(&stop);
     drop(ws);
 
