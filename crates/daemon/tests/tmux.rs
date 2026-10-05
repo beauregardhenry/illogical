@@ -830,6 +830,7 @@ fn iterm2s_conversation_gets_tmuxs_answers() {
     // ---- every reply, against tmux's
     let mut tmux = tmux_replies();
     let ruler = vi_draws_ruler();
+    let ruler_line = Regex::new(r"^ +[0-9]+,[0-9]+ +All$").unwrap();
     let mut failures = vec![];
     let mut compared = 0;
     for (cmd, ok, body) in first.into_iter().chain(second) {
@@ -847,9 +848,8 @@ fn iterm2s_conversation_gets_tmuxs_answers() {
         // A Linux vim with the ruler off (Ubuntu's) draws the same screen
         // without it: that line is blank here, the rest still compared.
         if !ruler && key.starts_with("capture-pane") {
-            let re = Regex::new(r"^ +[0-9]+,[0-9]+ +All$").unwrap();
             for l in &mut theirs.1 {
-                if re.is_match(&plain(l)) {
+                if ruler_line.is_match(&plain(l)) {
                     l.clear();
                 }
             }
