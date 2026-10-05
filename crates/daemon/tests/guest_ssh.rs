@@ -359,7 +359,11 @@ fn revoke_expiry_and_closing_the_pane_end_sessions() {
     assert!(g.text().contains("the invite expired"), "{:?}", g.text());
     let mut late = Guest::run(&cmd);
     assert_ne!(late.exited(Duration::from_secs(10)), 0);
-    assert!(late.text().contains("Permission denied"), "{:?}", late.text());
+    // Refused by the expired token, or, once the daemon's next prune has
+    // dropped the last invite, by nothing listening at all (as with no
+    // invite left below): either way nobody gets in.
+    let refused = late.text();
+    assert!(refused.contains("Permission denied") || refused.contains("Connection refused"), "{refused:?}");
 
     // Closing the pane ends the session and the invite.
     let other = d.new_pane();
