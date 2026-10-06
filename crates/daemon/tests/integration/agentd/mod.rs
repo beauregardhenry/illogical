@@ -248,6 +248,9 @@ pub struct Phone {
     port: u16,
     /// Each push's body, as the service thread got it.
     pushes: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>,
+    /// Set on drop: the service thread stops listening.
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    service: Option<std::thread::JoinHandle<()>>,
     ua: p256::SecretKey,
     ua_public: Vec<u8>,
     auth: [u8; 16],
@@ -285,8 +288,13 @@ impl Phone {
         // slow machine) could otherwise outlast, leaving it to read a
         // connection the daemon had already closed.
         let (tx, pushes) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = closed.clone();
+        let service = std::thread::spawn(move || {
             for conn in service.incoming() {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
                 let Ok(conn) = conn else { continue };
                 if let Some(body) = Self::receive(conn)
                     && tx.send(body).is_err()
@@ -295,7 +303,15 @@ impl Phone {
                 }
             }
         });
-        Self { port, pushes: std::sync::Mutex::new(pushes), ua, ua_public, auth: [9u8; 16] }
+        Self {
+            port,
+            pushes: std::sync::Mutex::new(pushes),
+            closed,
+            service: Some(service),
+            ua,
+            ua_public,
+            auth: [9u8; 16],
+        }
     }
 
     /// One push request: its body, answered 201.
@@ -406,6 +422,19 @@ impl Drop for Mcp {
     fn drop(&mut self) {
         if let Some(s) = self.session.take() {
             let _ = self.rt.block_on(s.cancel());
+        }
+    }
+}
+
+/// A dropped phone's push service is gone: its port refuses, as a phone
+/// that unsubscribed or went away does to the daemon.
+impl Drop for Phone {
+    fn drop(&mut self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wakes the service thread's accept, which then drops the listener.
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(t) = self.service.take() {
+            let _ = t.join();
         }
     }
 }
