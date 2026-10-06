@@ -1,9 +1,21 @@
 [package]
 name = "illogical-desktop"
-version = "0.18.0"
+version = "0.25.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "illogical's desktop app: the web client in a native window, with native notifications"
+
+[features]
+native-calls = [
+  "dep:webrtc",
+  "dep:rtc",
+  "dep:cpal",
+  "dep:opus",
+  "dep:webrtc-audio-processing",
+  "dep:webrtc-audio-processing-config",
+  "dep:async-trait",
+  "dep:tokio",
+]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -22,6 +34,8 @@ tauri-plugin-deep-link = "2"
 tauri-plugin-global-shortcut = "2"
 # App updates (M46): a signed manifest on the release page.
 tauri-plugin-updater = "2"
+# Check for Updates… says what it found (#419).
+tauri-plugin-dialog = "2"
 tungstenite = "0.30"
 # Control's ticket for signing in (M48), and the local daemon's /api/host.
 ureq = { version = "3", features = ["json"] }
@@ -35,13 +49,32 @@ notify-rust = "4"
 gtk = "0.18"
 # The running WebKitGTK's version, for the window's profile (profile.rs).
 webkit2gtk-sys = "2"
+# Huddles (M63, `native-calls`): WebKitGTK has no WebRTC, so the call runs
+# here (S30's native peer). Off by default: they need ALSA, Opus, meson,
+# ninja and libclang to build, which the release container has
+# (packaging/desktop/Containerfile).
+webrtc = { version = "0.21", optional = true }
+rtc = { version = "0.21", default-features = false, optional = true }
+cpal = { version = "0.18", optional = true }
+opus = { version = "0.3", optional = true }
+webrtc-audio-processing = { version = "2.1", features = ["bundled"], optional = true }
+webrtc-audio-processing-config = { version = "2.1", optional = true }
+async-trait = { version = "0.1", optional = true }
+tokio = { version = "1", features = ["sync", "time"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Toasts whose click opens the pane (M59).
+windows = { version = "0.61", features = ["Data_Xml_Dom", "UI_Notifications"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6"
-# SMAppService for the daemon's launch agent, and NSWindow tabs (M46).
+# SMAppService for the daemon's launch agent, and NSWindow tabs (M46) and
+# their tab bar (#323).
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
-objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSResponder"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray", "NSURL"] }
+# Finder's service (M47): the provider and its pasteboard. The Dock's menu
+# and Stop's question (#322).
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSWindowTabGroup", "NSResponder", "NSApplication", "NSPasteboard", "NSPasteboardItem", "NSMenu", "NSMenuItem", "NSAlert", "NSButton", "NSControl", "NSView"] }
 objc2-service-management = { version = "0.3", features = ["SMAppService"] }
 
 # Its own workspace, out of the main build: Tauri needs WebKitGTK headers

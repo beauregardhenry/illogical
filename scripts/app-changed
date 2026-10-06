@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Does this push change what the desktop app is built from? check.yml asks
+# before `just desktop-check`, so a daemon- or web-only push compiles no
+# app. The paths are windows-desktop.yml's; keep the two in step.
+#
+#   scripts/app-changed [BEFORE]
+#
+# See scripts/changed for BEFORE and the exit status.
+exec "$(dirname "$0")/changed" "the app" "${1:-}" \
+  crates/desktop crates/proto crates/core Cargo.toml THIRD_PARTY.md LICENSE-MIT LICENSE-APACHE \
+  .github/workflows/windows-desktop.yml .github/workflows/check.yml scripts/app-changed scripts/changed

@@ -7,14 +7,14 @@
 // Code, Cursor or nvim follows its cursor (`follow.tsx`); its debugger
 // stopping, errors after a save, a merge conflict and Claude Code's diffs
 // are cards. The look and the motion are the prototype's
-// (spikes/s16-swarm/canvas.html). On a phone the rail is a strip of cards
+// (archive/spikes:spikes/s16-swarm/canvas.html). On a phone the rail is a strip of cards
 // along the bottom, and the field pinches and pans.
 
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { Fleet, FleetPane } from "../fleet";
-import { gateKey, type Action, type Reason } from "../proto";
+import { gateKey, type Action, type ActRequest, type ActResponse, type OpenRequest, type OpenResponse, type Reason } from "../proto";
 import { AskCard, type Answered } from "../blocks/ask";
-import { answeredLine, FollowUpBox, PermissionBody, PermissionButtons, VIEWER_NOTE, type Requester } from "../ui/answer-card";
+import { ANSWERED_MS, answeredLine, FollowUpBox, PermissionBody, PermissionButtons, VIEWER_NOTE, type Requester } from "../ui/answer-card";
 import { Avatar } from "../ui/people";
 import { MenuLayer, openMenu } from "../ui/menu";
 import { usePhone, useSubscribe } from "../ui/hooks";
@@ -26,14 +26,22 @@ import { activityOf, bundleOf, cardTitle, followable, GROUPINGS, groupOf, isPres
 
 const BY_KEY = "illogical.swarm.by";
 const THEME_KEY = "illogical.swarm.theme";
-/** M41: how the swarm is drawn. Blocks is the field; the city is 3D; M42's
- * hive is a cell per pane and the timeline a lane per pane over time. */
+/** How the swarm is drawn. Blocks is the field; the city is 3D; the hive is a
+ * cell per pane and the timeline a lane per pane over time. */
 export type Theme = "blocks" | "city" | "hive" | "timeline";
-export const THEMES: Theme[] = ["blocks", "city", "hive", "timeline"];
+/** The themes on offer without labs. The others are built but only a machine
+ * with labs offers them. With one, there's no picker. */
+export const THEMES: Theme[] = ["blocks"];
+const ALL_THEMES: Theme[] = ["blocks", "city", "hive", "timeline"];
+
+/** The themes to offer: `THEMES`, or all of them where the home machine has
+ * labs. */
+export function offeredThemes(labs: boolean): Theme[] {
+  return labs ? ALL_THEMES : THEMES;
+}
+
 /** A done card leaves the rail by itself after this long. */
 export const DONE_MS = 15_000;
-/** An answered card (with its follow-up box) stays this long. */
-const ANSWERED_MS = 60_000;
 
 function savedBy(): GroupBy {
   try {
@@ -44,10 +52,13 @@ function savedBy(): GroupBy {
   }
 }
 
+/** The theme this browser picked last. Whether it's on offer waits for the
+ * machine's features, which arrive after the first draw: it's kept until
+ * then, not thrown away. */
 function savedTheme(): Theme {
   try {
     const v = localStorage.getItem(THEME_KEY) as Theme | null;
-    return v && THEMES.includes(v) ? v : "blocks";
+    return v && ALL_THEMES.includes(v) ? v : "blocks";
   } catch {
     return "blocks";
   }
@@ -89,9 +100,13 @@ export function SwarmView({
   fleet,
   back,
   focus,
+  home,
 }: {
   fleet: Fleet;
   back: () => void;
+  /** The machine this page is of: its labs say whether the extra themes
+   * are offered. */
+  home: string | null;
   /** Opened from a notification: the pane to show, and its card. */
   focus?: { host: string; pane: number } | null;
 }) {
@@ -100,7 +115,10 @@ export function SwarmView({
   useEffect(() => watchRunners(fleet), [fleet]);
   const phone = usePhone();
   const [by, setBy] = useState<GroupBy>(savedBy);
-  const [theme, setTheme] = useState<Theme>(savedTheme);
+  const [chosen, setChosen] = useState<Theme>(savedTheme);
+  // Read on each render: the features arrive after the first one.
+  const themes = offeredThemes(!!home && !!fleet.clientOf(home)?.hasLabs());
+  const theme = themes.includes(chosen) ? chosen : "blocks";
   const [peek, setPeek] = useState<{ key: string; x: number; y: number; text: string } | null>(null);
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const [answered, setAnswered] = useState<Done[]>([]);
@@ -177,7 +195,7 @@ export function SwarmView({
       })
       .catch((e) => {
         console.error(`the ${theme} theme didn't load`, e);
-        if (!gone) setTheme("blocks");
+        if (!gone) setChosen("blocks");
       });
     addEventListener("resize", resize);
     return () => {
@@ -220,6 +238,8 @@ export function SwarmView({
           lastExit: p.info.last?.exit ?? null,
           lastEnded: p.info.last?.ended_ms ?? null,
           people,
+          unread: p.unread,
+          mention: p.mention,
         };
       });
     field.current?.set(fed.current);
@@ -229,7 +249,7 @@ export function SwarmView({
     field.current?.regroup();
   }, [by]);
   const pickTheme = (t: Theme) => {
-    setTheme(t);
+    setChosen(t);
     setPeek(null);
     try {
       localStorage.setItem(THEME_KEY, t);
@@ -258,8 +278,9 @@ export function SwarmView({
       if (!p || !r || r.kind !== "ask" || reasonOf(p)) continue;
       const a = p.info.answered;
       // Worth keeping a card for: someone else answered, or the agent can
-      // take a follow-up.
-      const worth = a && (a.who !== fleet.meOn(p.host) || p.info.inbox || p.info.type === "agent");
+      // take a follow-up. An agent in a terminal waits on its inbox only
+      // once it stops, maybe after this update: its box shows then.
+      const worth = a && (a.who !== fleet.meOn(p.host) || p.info.inbox || p.info.type === "agent" || p.info.kind === "agent");
       if (a && worth && (!r.ask || a.id === r.ask.id) && !answered.some((d) => d.key === key && d.answered.at_ms === a.at_ms)) {
         next.push({ key, pane: p, answered: a, until: now + ANSWERED_MS });
       }
@@ -395,16 +416,18 @@ export function SwarmView({
             ))}
           </div>
         </div>
-        <div>
-          <div class="swarm-seg-l">Theme</div>
-          <div class="swarm-seg" role="group" aria-label="Theme">
-            {THEMES.map((t) => (
-              <button key={t} data-theme-pick={t} aria-pressed={t === theme} onClick={() => pickTheme(t)}>
-                {t}
-              </button>
-            ))}
+        {themes.length > 1 && (
+          <div>
+            <div class="swarm-seg-l">Theme</div>
+            <div class="swarm-seg" role="group" aria-label="Theme">
+              {themes.map((t) => (
+                <button key={t} data-theme-pick={t} aria-pressed={t === theme} onClick={() => pickTheme(t)}>
+                  {t}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
         <div class="swarm-tools">
           <button data-fit onClick={() => field.current?.fitAll()}>
             Fit
@@ -592,8 +615,8 @@ function canEdit(fleet: Fleet, p: FleetPane) {
 /** Open VS Code in a pane's directory, on its machine, and show it. */
 async function editIn(fleet: Fleet, p: FleetPane, back: () => void): Promise<string | null> {
   try {
-    const res = await fleet.request(p.host, "POST", "/api/blocks", { type: "editor", config: {}, from_pane: p.id });
-    const v = await res.json<{ block?: number; error?: string }>().catch(() => null);
+    const res = await fleet.request(p.host, "POST", "/api/blocks", { type: "editor", config: {}, from_pane: p.id } satisfies OpenRequest);
+    const v = await res.json<Partial<OpenResponse> & { error?: string }>().catch(() => null);
     if (!res.ok || v?.block === undefined) return v?.error ?? `couldn't (${res.status})`;
     back();
     fleet.open(p.host, v.block);
@@ -606,8 +629,8 @@ async function editIn(fleet: Fleet, p: FleetPane, back: () => void): Promise<str
 /** What changed in a pane's project (M11): a diff block beside it, shown. */
 async function changesOf(fleet: Fleet, p: FleetPane, back: () => void): Promise<string | null> {
   try {
-    const res = await fleet.request(p.host, "POST", "/api/blocks", { type: "diff", config: {}, from_pane: p.id, split: p.id });
-    const v = await res.json<{ block?: number; error?: string }>().catch(() => null);
+    const res = await fleet.request(p.host, "POST", "/api/blocks", { type: "diff", config: {}, from_pane: p.id, split: p.id } satisfies OpenRequest);
+    const v = await res.json<Partial<OpenResponse> & { error?: string }>().catch(() => null);
     if (!res.ok || v?.block === undefined) return v?.error ?? `couldn't (${res.status})`;
     back();
     fleet.open(p.host, v.block);
@@ -618,7 +641,7 @@ async function changesOf(fleet: Fleet, p: FleetPane, back: () => void): Promise<
 }
 
 /** Act on a bundle: one request per host, naming its panes. */
-async function act(fleet: Fleet, panes: FleetPane[], action: Action, extra: Record<string, unknown> = {}): Promise<string | null> {
+async function act(fleet: Fleet, panes: FleetPane[], action: Action, extra: Partial<ActRequest> = {}): Promise<string | null> {
   const hosts = new Map<string, FleetPane[]>();
   for (const p of panes) hosts.set(p.host, [...(hosts.get(p.host) ?? []), p]);
   let err: string | null = null;
@@ -627,10 +650,10 @@ async function act(fleet: Fleet, panes: FleetPane[], action: Action, extra: Reco
       const r = ps[0].info.reason;
       // What it answers: a question or approval's id, or a gate's key (M34).
       const id = r?.ask?.id ?? (r?.gate ? gateKey(r.gate) : undefined);
-      const body = ps.length === 1 ? { action, pane: ps[0].id, id, ...extra } : { action, panes: ps.map((p) => p.id), ...extra };
+      const body: ActRequest = ps.length === 1 ? { action, pane: ps[0].id, id, ...extra } : { action, panes: ps.map((p) => p.id), ...extra };
       try {
         const res = await fleet.request(host, "POST", "/api/attention/act", body);
-        if (!res.ok) err = (await res.json<{ error?: string; results?: { error?: string }[] }>().catch(() => null))?.error ?? `couldn't (${res.status})`;
+        if (!res.ok) err = (await res.json<Partial<ActResponse> & { error?: string }>().catch(() => null))?.error ?? `couldn't (${res.status})`;
       } catch (e) {
         err = String(e);
       }

@@ -4,11 +4,13 @@
 //! - Text frames carry JSON control messages ([`ClientMsg`], [`ServerMsg`]).
 //! - Binary frames carry terminal bytes with a fixed header ([`Frame`]).
 //!
-//! The web client mirrors these types by hand in `web/src/proto.ts`; keep
-//! them in step.
+//! The web client's copy of these types is generated from them
+//! (`web/src/proto.gen.ts`, `just proto-ts`); CI fails when it's stale.
 
 use serde::{Deserialize, Serialize};
 
+/// Old and new names across the rename to Arugula (#504).
+pub use illogical_core::rename;
 pub use illogical_core::{
     ClientId, Dir, Edge, Intent, Layout, Node, NodeId, OptionMap, OptionScope, Options, PaneId, Rect, Session,
     SessionId, SplitRect, TabId,
@@ -16,13 +18,34 @@ pub use illogical_core::{
 
 pub mod api;
 pub mod ask;
+pub mod follow;
 pub mod fs;
 pub mod hosts;
 pub mod keys;
+pub mod service;
+#[cfg(all(test, feature = "ts"))]
+mod ts;
+
+/// The app↔daemon protocol (#390). The desktop app relies on a few things
+/// from the daemon, listed in `crates/desktop/src/main.rs`'s docs; the
+/// daemon reports this number beside its version (`GET /api/host`), and
+/// the app checks it against the range it supports at launch.
+///
+/// Bump it only when something on that list changes so that an app built
+/// before the change breaks against this daemon: a type the app reads
+/// changes shape, an endpoint it calls goes or answers differently, the
+/// daemon's page needs an app command older apps don't have. Additions
+/// an older app ignores (a new field, a new endpoint) don't bump it.
+pub const PROTOCOL: u32 = 1;
+
+/// What a daemon that reports no protocol number speaks: every daemon from
+/// before the number (0.23 and earlier).
+pub const PROTOCOL_BASELINE: u32 = 1;
 
 /// Control messages from a client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ClientMsg {
     /// Start (or resume) receiving panes. The server replays from each
     /// pane's offset when it still has the bytes, otherwise it sends a
@@ -47,10 +70,22 @@ pub enum ClientMsg {
     /// Stop receiving panes.
     Detach { panes: Vec<PaneId> },
     /// The client is showing `tab` in a `cols`x`rows` cell area, optionally
-    /// with one pane zoomed to fill it. With `claim` (the client was opened,
-    /// focused or typed in), that becomes the tab's size; otherwise it only
-    /// does if the client already owns the tab's size or nobody does.
-    View { tab: TabId, cols: u16, rows: u16, zoom: Option<PaneId>, claim: bool },
+    /// with one pane zoomed to fill it. With `claim` (the client opened or
+    /// switched to the tab, or typed in it), that becomes the tab's size;
+    /// otherwise it only does if the client already owns the tab's size or
+    /// nobody does. A claim with `typed` (made because the client typed)
+    /// waits until the owner has been idle a few seconds, so two editors
+    /// typing in turn don't resize the pane at every turn (#333). An older
+    /// daemon ignores `typed` and takes any claim at once.
+    View {
+        tab: TabId,
+        cols: u16,
+        rows: u16,
+        zoom: Option<PaneId>,
+        claim: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        typed: bool,
+    },
     /// Change sessions, tabs or splits. Errors come back as
     /// [`ServerMsg::Error`] with the same id.
     Intent { id: Option<u64>, intent: Intent },
@@ -72,10 +107,78 @@ pub enum ClientMsg {
     /// Follow an editor (M28): its cursor, selection and the file it shows
     /// come as [`ServerMsg::Follow`] while `on`. Viewer access is enough.
     Follow { pane: PaneId, on: bool },
+    /// Join the huddle on `session` (M63), starting one if there's none.
+    /// Anyone with a role in the session may, up to [`CALL_MAX`] people.
+    CallJoin { session: SessionId },
+    /// Leave it. The huddle ends when its last member leaves.
+    CallLeave { session: SessionId },
+    /// Show everyone in the huddle that this client is (un)muted.
+    CallMute { session: SessionId, muted: bool },
+    /// A WebRTC description for another member of the huddle, passed on
+    /// untouched as [`ServerMsg::CallSignal`]. `signal` is
+    /// `{type: "offer"|"answer", sdp, sig?}`: `sig` signs the SDP's
+    /// fingerprints with the device key ([`call_fingerprint_body`]).
+    CallSignal {
+        session: SessionId,
+        to: ClientId,
+        #[cfg_attr(feature = "ts", ts(as = "CallSignal"))]
+        signal: serde_json::Value,
+    },
+    /// This client is a hand (S33): device tools agents may call through
+    /// the daemon's MCP server. `tools` empty: it stops being one. A hand
+    /// that isn't connected is woken by a push to its device.
+    Hand {
+        tools: Vec<HandTool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        name: Option<String>,
+    },
+    /// The answer to a [`ServerMsg::HandCall`]: a result or why not.
+    HandReply {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "unknown"))]
+        result: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        error: Option<String>,
+    },
+}
+
+/// A tool a hand offers (S33).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct HandTool {
+    pub name: String,
+    pub description: String,
+    /// Its arguments, as a JSON Schema object.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(type = "unknown"))]
+    pub schema: serde_json::Value,
+}
+
+/// #379: the header `illogical mcp` sends with the `CLAUDE_CONFIG_DIR` of
+/// the client that started it (on the local socket only), so an agent it
+/// starts uses that client's Claude Code login.
+pub const CLAUDE_CONFIG_DIR_HEADER: &str = "Illogical-Claude-Config-Dir";
+
+/// The most people in one huddle: every member sends to every other
+/// (S30: CPU and how it sounds are the limit, not bandwidth).
+pub const CALL_MAX: usize = 5;
+
+/// What a huddle member signs with its device key when it sends a
+/// description: the call, who it's for, and the SDP's `a=fingerprint:`
+/// lines in order. Naming the call and the recipient keeps a daemon from
+/// replaying it into another call or to another member.
+pub fn call_fingerprint_body(call: &str, from: ClientId, to: ClientId, sdp: &str) -> String {
+    let fps: Vec<&str> = sdp.lines().map(str::trim).filter(|l| l.starts_with("a=fingerprint:")).collect();
+    // Frozen (#504): signed, and checked by other versions.
+    format!("illogical call v1\ncall {call}\nfrom {from}\nto {to}\n{}\n", fps.join("\n"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum PaneOp {
     /// What happens to the pane when the daemon starts again (after a
     /// reboot).
@@ -127,6 +230,7 @@ pub enum PaneOp {
 /// Whether a pane wants you: the cheap version of an "agent block".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Attention {
     /// At a prompt, or nothing to report.
     #[default]
@@ -144,6 +248,7 @@ pub enum Attention {
 /// client can explain it, bundle it with others and act on it. Every
 /// `needs_input` and `done` pane has one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Reason {
     pub kind: ReasonKind,
     /// When it started wanting you.
@@ -151,23 +256,29 @@ pub struct Reason {
     /// One line: the question, the command that failed, what finished.
     pub headline: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub exit: Option<i32>,
     /// `done` and `failed`: how long the command ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub duration_ms: Option<u64>,
     /// Reasons with the same key are one card on a "needs you" rail ("11
     /// failed on build-03"): `failed:<machine>`, `exited:<machine>`,
     /// `ask:<project>:<agent>`. `None` never bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub bundle: Option<String>,
     /// `ask`: what is asked, and how to answer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub ask: Option<AskRef>,
     /// `gate`: the gate that waits (the first, if several do), which
     /// `allow` approves (M34).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub gate: Option<Box<Gate>>,
     /// What [`api::ActRequest`] can do about it here.
     pub actions: Vec<Action>,
@@ -175,6 +286,7 @@ pub struct Reason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ReasonKind {
     /// An agent asks: a question, or a permission to approve.
     Ask,
@@ -206,23 +318,28 @@ pub enum ReasonKind {
 /// the card and the phone's sheet are all made from this, whichever reader
 /// found it (`source`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Gate {
     /// The member (of a workspace) whose op waits.
     pub member: String,
     pub op: String,
     pub gate: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub env: Option<String>,
     /// When it started waiting, and when it stops (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub since: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub expires: Option<String>,
     /// Approvals so far, of how many it needs.
     pub approvals: u64,
     pub needed: u64,
     /// The source's own command for approving it, to show.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub command: Option<String>,
     pub source: GateSource,
 }
@@ -230,6 +347,7 @@ pub struct Gate {
 /// Where a gate was read, which is how it's approved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum GateSource {
     /// chant on the block's host: approved by `chant approve <op> <gate>`
     /// in the member's directory, `--approver` the person who approves.
@@ -239,6 +357,7 @@ pub enum GateSource {
         dir: String,
         /// The machine (sprite) it's on; none for this host.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         machine: Option<String>,
     },
     /// hud in a studio box (M35), from its work board: approved through
@@ -298,6 +417,7 @@ pub fn host_of(url: &str) -> &str {
 
 /// The open question or approval behind an `ask` reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AskRef {
     /// What `allow`, `deny` and `answer` name (a permission request's id, or
     /// a question's).
@@ -310,6 +430,7 @@ pub struct AskRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum AskWhat {
     Approve,
     Question,
@@ -318,6 +439,7 @@ pub enum AskWhat {
 /// Something done about a reason (`POST /api/attention/act`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Action {
     /// Approve a permission request.
     Allow,
@@ -341,6 +463,7 @@ pub enum Action {
 
 /// A command the shell integration reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct CommandInfo {
     pub text: Option<String>,
     pub cwd: Option<String>,
@@ -352,6 +475,7 @@ pub struct CommandInfo {
     pub end: Option<u64>,
     /// Who started it (M13), when someone other than the owner might have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub by: Option<String>,
 }
 
@@ -423,6 +547,7 @@ pub enum EventKind {
 /// back; this decides what runs in it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Policy {
     /// Nothing; press Enter for a shell.
     None,
@@ -444,6 +569,7 @@ pub enum Policy {
 /// Control messages from the server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ServerMsg {
     /// First message on every connection.
     Hello { version: String, client: ClientId, state: State },
@@ -459,7 +585,11 @@ pub enum ServerMsg {
     Error { id: Option<u64>, message: String },
     /// A non-terminal block's state, whole: on connecting, and whenever it
     /// changes. Its type's renderer draws it.
-    Block { block: PaneId, state: serde_json::Value },
+    Block {
+        block: PaneId,
+        #[cfg_attr(feature = "ts", ts(type = "unknown"))]
+        state: serde_json::Value,
+    },
     /// The answer to [`ClientMsg::Ping`].
     Pong { id: u64 },
     /// Something to show briefly that isn't an error (M13: someone took
@@ -478,17 +608,50 @@ pub enum ServerMsg {
     /// line, col, sel, view, mode}`, `{open: {file, version, text}}`,
     /// `{edit: {file, version, changes}}`, `{diagnostics: {file, items}}`,
     /// or `{gone: true}` when it left.
-    Follow { pane: PaneId, msg: serde_json::Value },
+    Follow {
+        pane: PaneId,
+        #[cfg_attr(feature = "ts", ts(as = "follow::FollowMsg"))]
+        msg: serde_json::Value,
+    },
+    /// A new message in a pane's or session's thread (M61), sent to every
+    /// client whose person may read it.
+    Thread { target: ThreadTarget, msg: ThreadMsg },
+    /// A huddle member's description for this client (M63). `cert` is the
+    /// sender's device certificate as the daemon verified it, when it
+    /// connected with one: the receiver checks `signal.sig` against it and
+    /// checks the certificate itself, so the daemon can't swap the
+    /// fingerprints. No `cert`: the sender has no device key (tailnet or
+    /// local), and the client says the peer isn't verified.
+    CallSignal {
+        session: SessionId,
+        from: ClientId,
+        #[cfg_attr(feature = "ts", ts(as = "CallSignal"))]
+        signal: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "unknown"))]
+        cert: Option<serde_json::Value>,
+    },
+    /// An agent calls one of this hand's tools (S33). `from` says who, for
+    /// the person to decide. Answer with [`ClientMsg::HandReply`].
+    HandCall {
+        id: u64,
+        tool: String,
+        #[cfg_attr(feature = "ts", ts(type = "Record<string, unknown>"))]
+        args: serde_json::Value,
+        from: String,
+    },
 }
 
 /// Changes to the last [`State`]: each pane in `panes` is `{id, ...}` with
 /// only the fields that changed (a field set to `null` went back to its
 /// default, absent); `gone` panes left this client's view. `machines` and
-/// `presence` are whole when present. Anything else (sessions, tabs,
+/// `presence` (and `threads`) are whole when present. Anything else (sessions, tabs,
 /// options, roles) changes with a new `State`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Delta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(type = "Array<{ id: PaneId } & Partial<PaneInfo>>"))]
     pub panes: Vec<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gone: Vec<PaneId>,
@@ -496,11 +659,20 @@ pub struct Delta {
     pub machines: Option<Vec<Machine>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence: Option<Vec<Presence>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<Vec<ThreadSummary>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<Vec<Call>>,
 }
 
 impl Delta {
     pub fn is_empty(&self) -> bool {
-        self.panes.is_empty() && self.gone.is_empty() && self.machines.is_none() && self.presence.is_none()
+        self.panes.is_empty()
+            && self.gone.is_empty()
+            && self.machines.is_none()
+            && self.presence.is_none()
+            && self.threads.is_none()
+            && self.calls.is_none()
     }
 }
 
@@ -537,6 +709,12 @@ impl State {
         if let Some(p) = &delta.presence {
             self.presence = p.clone();
         }
+        if let Some(t) = &delta.threads {
+            self.threads = t.clone();
+        }
+        if let Some(c) = &delta.calls {
+            self.calls = c.clone();
+        }
     }
 }
 
@@ -545,6 +723,7 @@ impl State {
 /// command the shell integration reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum WorkKind {
     Shell,
     Build,
@@ -565,6 +744,7 @@ pub enum WorkKind {
 
 /// The git repository a pane's working directory is in (M23).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Project {
     /// The repository's top directory.
     pub root: String,
@@ -574,6 +754,7 @@ pub struct Project {
 
 /// How much a pane prints (M23).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Activity {
     /// Bytes of output a second, over the last second or so.
     pub bps: u32,
@@ -585,6 +766,7 @@ pub struct Activity {
 /// Everything a client needs to draw: sessions in order, each tab's tree
 /// and the cell rectangles the server computed for it, and pane details.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct State {
     pub rev: u64,
     pub sessions: Vec<Session>,
@@ -606,6 +788,74 @@ pub struct State {
     /// client sees.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub presence: Vec<Presence>,
+    /// The threads (M61) this person may read that have messages, with how
+    /// many they haven't read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<ThreadSummary>,
+    /// Huddles (M63) on the sessions this person has a role in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<Call>,
+}
+
+/// A huddle: a voice call on a session (M63), peer to peer between its
+/// members, signaled through this daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Call {
+    pub session: SessionId,
+    /// New each time a huddle starts on the session, so what's signed for
+    /// one can't be used in the next.
+    pub id: String,
+    /// When it started (ms since the epoch).
+    pub started: u64,
+    /// In the order they joined.
+    pub members: Vec<CallMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CallMember {
+    pub client: ClientId,
+    /// Their principal id.
+    pub who: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub pic: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
+    /// When they joined (ms since the epoch).
+    pub joined: u64,
+    /// Their device's id, when they connected with a device key (through
+    /// control): their fingerprints are signed. Absent for a tailnet or
+    /// local connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub device: Option<String>,
+}
+
+/// What one huddle member sends another through the daemon (M63), which
+/// passes it on untouched: [`ClientMsg::CallSignal`]'s and
+/// [`ServerMsg::CallSignal`]'s `signal`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CallSignal {
+    #[serde(rename = "type")]
+    pub kind: SdpKind,
+    pub sdp: String,
+    /// Hex Ed25519 signature of [`call_fingerprint_body`] by the sender's
+    /// device key, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub sig: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SdpKind {
+    Offer,
+    Answer,
 }
 
 pub type MachineId = u32;
@@ -614,6 +864,7 @@ pub type MachineId = u32;
 /// throwaway wisp sprite (a Firecracker microVM) owned by one pane, and
 /// deleted when that pane closes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Machine {
     pub id: MachineId,
     /// Who runs it: `wisp`.
@@ -644,6 +895,7 @@ pub struct Machine {
 /// a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", from = "OwnerRepr")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum Owner {
     Pane(PaneId),
     Tab(TabId),
@@ -674,6 +926,7 @@ impl From<OwnerRepr> for Owner {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum MachineState {
     /// Created or being reached; the first program boots it.
     #[default]
@@ -687,6 +940,7 @@ pub enum MachineState {
 /// share one id space (`%N`) and one place in the layout tree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum BlockType {
     #[default]
     Terminal,
@@ -720,17 +974,28 @@ pub enum BlockType {
     /// with their own `fountain` login. Config `{profile?, view: catalog,
     /// filter?, specs?}`.
     Fountain,
+    /// An agent's invites into the session (#234), waiting for the owner:
+    /// a card each, beside the agent. Config `{drafter, drafts}`.
+    Invite,
+    /// A type a newer daemon has and this build doesn't know: its state
+    /// still parses. Nothing opens one, and the web client's types leave
+    /// it out.
+    #[serde(other)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
 
 /// Where a remote block's pane lives (#17): a host in the home daemon's
 /// list, and the pane's id there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RemoteRef {
     pub host: String,
     pub pane: PaneId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TabView {
     pub id: TabId,
     pub name: Option<String>,
@@ -743,6 +1008,7 @@ pub struct TabView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AttachPane {
     pub pane: PaneId,
     /// Offset just past the last byte the client has, or `None` for a fresh
@@ -752,6 +1018,7 @@ pub struct AttachPane {
     /// keeps (`None`: all of it). After a [`ServerMsg::Resync`], `0`: the
     /// client keeps what it has and needs only the screen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub history: Option<u32>,
 }
 
@@ -763,6 +1030,9 @@ impl AttachPane {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Its optional fields are `T | null` in TypeScript: a delta clears one
+// with `null`.
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PaneInfo {
     pub id: PaneId,
     /// Identifies this pane's output stream. Offsets are only meaningful
@@ -799,10 +1069,13 @@ pub struct PaneInfo {
     /// A question open in a terminal (Claude Code's AskUserQuestion, through
     /// its hook), drawn as a card beside it (M6c).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    // The web client's card types live with the card (web/src/blocks/ask.tsx).
+    #[cfg_attr(feature = "ts", ts(type = "import(\"./blocks/ask\").Ask | null"))]
     pub ask: Option<ask::Ask>,
     /// Who answered its last question or approval, and how (M29), until
     /// it asks again. For agent blocks too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(type = "import(\"./blocks/ask\").Answered | null"))]
     pub answered: Option<ask::Answered>,
     /// An edit Claude Code in this terminal proposes, waiting as a diff
     /// (M28: illogicald as its IDE).
@@ -866,6 +1139,7 @@ pub struct PaneInfo {
 /// what changes about once in ten seconds. The cursor and the file's text
 /// are content and go only to followers ([`ServerMsg::Follow`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EditorInfo {
     /// `vscode`, `cursor`, `code-server`, `nvim`, ...
     pub app: String,
@@ -897,6 +1171,7 @@ pub struct EditorInfo {
 
 /// Diagnostic counts: errors, warnings, information.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Diag {
     #[serde(default)]
     pub e: u32,
@@ -908,8 +1183,10 @@ pub struct Diag {
 
 /// An editor's debug session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DebugState {
     /// `running` or `paused`.
+    #[cfg_attr(feature = "ts", ts(type = "\"running\" | \"paused\""))]
     pub state: String,
     /// Why it stopped: `breakpoint`, `exception`, `step`, ...
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -922,6 +1199,7 @@ pub struct DebugState {
 
 /// An edit an agent proposes, waiting as a diff (M28).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DiffInfo {
     /// What `accept` and `reject` name.
     pub id: String,
@@ -943,17 +1221,20 @@ pub struct DiffInfo {
 
 /// Who started a pane or block through MCP (M16).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct StartedBy {
     /// `mcp:<client>`, as the pane and history show it.
     pub by: String,
     /// The agent block whose token it came with, if any: that block may
     /// drive and close it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub block: Option<PaneId>,
 }
 
 /// A pane's driver (M13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Driver {
     /// Principal id (`owner`, `tailnet:<login>`, `account:<id>`).
     pub who: String,
@@ -962,18 +1243,114 @@ pub struct Driver {
 
 /// Someone looking at the daemon (M13): one per connected client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Presence {
     pub client: ClientId,
     /// Principal id: one person's clients share it.
     pub who: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub pic: Option<String>,
     /// The tab it shows, and the pane it's focused on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub tab: Option<TabId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub pane: Option<PaneId>,
+}
+
+/// What a thread (M61) is about: a pane, or a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum ThreadTarget {
+    Pane(PaneId),
+    Session(SessionId),
+}
+
+impl ThreadTarget {
+    /// `pane-7` or `session-2`: its name in paths and file names.
+    pub fn key(&self) -> String {
+        match self {
+            ThreadTarget::Pane(p) => format!("pane-{p}"),
+            ThreadTarget::Session(s) => format!("session-{s}"),
+        }
+    }
+
+    pub fn parse(key: &str) -> Option<Self> {
+        if let Some(p) = key.strip_prefix("pane-") {
+            return p.parse().ok().map(ThreadTarget::Pane);
+        }
+        key.strip_prefix("session-")?.parse().ok().map(ThreadTarget::Session)
+    }
+}
+
+/// One message in a thread (M61).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ThreadMsg {
+    /// 1, 2, 3, ... within its thread.
+    pub id: u64,
+    /// When it was posted (ms since the epoch).
+    pub at: u64,
+    /// Who posted it: a principal id (`owner`, `tailnet:…`, `account:…`),
+    /// or `mcp:…` for an agent.
+    pub who: String,
+    pub name: String,
+    /// M74: the poster's picture when they posted, if they have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub pic: Option<String>,
+    pub text: String,
+    /// Terminal output it quotes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub quote: Option<Quote>,
+    /// Principal ids it @mentions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
+    /// The `@` tokens (lowercase) that reached someone: each one naming a
+    /// person in `mentions`, and the agent's when `to_agent`. The page
+    /// marks only these; an `@word` that reached no one stays plain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landed: Vec<String>,
+    /// It @mentioned the pane's agent, and went to it as a follow-up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub to_agent: bool,
+    /// An agent posted it (through MCP).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent: bool,
+}
+
+/// Output quoted in a thread message: kept as text, so it stays readable
+/// after the pane scrolls or closes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Quote {
+    pub pane: PaneId,
+    pub text: String,
+}
+
+/// A thread as one person has it (M61).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ThreadSummary {
+    pub target: ThreadTarget,
+    /// The newest message's id and time.
+    pub last: u64,
+    pub at: u64,
+    /// Messages from others they haven't read.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread: u32,
+    /// One of those mentions them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mention: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn yes() -> bool {
@@ -1136,6 +1513,8 @@ mod tests {
             options: Box::new(options),
             roles: Some(vec![(1, illogical_core::Role::Viewer), (4, illogical_core::Role::Editor)]),
             presence: vec![],
+            threads: vec![],
+            calls: vec![],
         };
         let msg = ServerMsg::State { state };
         let back: ServerMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();

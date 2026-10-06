@@ -15,7 +15,7 @@
 
 import { Client, paneIds } from "../client";
 import { directory } from "../hosts";
-import type { PaneId, RemoteRef, TabId } from "../proto";
+import type { OpenRequest, PaneId, RemoteRef, RunRequest, RunResponse, TabId } from "../proto";
 import { registerBlock, type BlockView } from "./view";
 import type { TerminalView } from "../terminal-view";
 
@@ -25,8 +25,9 @@ const GONE_GRACE_MS = 5000;
 /** A host that dropped off the network closes nothing: its connection
  * just goes quiet. Ask a quiet host to answer this often... */
 const HEARTBEAT_MS = 3000;
-/** ...and give up on a link that said nothing for this long, or that
- * hasn't connected in this long, and connect again as after any drop. */
+/** ...and give up on a link that said nothing for this long (counted from
+ * the ask, see `Client.keepAlive`), or that hasn't connected in this long,
+ * and connect again as after any drop. */
 const SILENT_MS = 6000;
 
 interface HostLink {
@@ -49,13 +50,12 @@ class RemoteHosts {
       const c = l.client;
       if (c.connected) {
         l.trying = null;
-        if (now - c.lastHeard > SILENT_MS) c.drop();
-        else if (now - c.lastHeard > HEARTBEAT_MS) c.heartbeat();
+        c.keepAlive(now, HEARTBEAT_MS, SILENT_MS - HEARTBEAT_MS);
       } else if (c.linked) {
         l.trying ??= now;
         if (now - l.trying > SILENT_MS) {
           l.trying = null;
-          c.drop();
+          c.drop("didn't connect in time");
         }
       } else {
         l.trying = null;
@@ -77,7 +77,8 @@ class RemoteHosts {
       client.only = new Set();
       const l: HostLink = { client, views: new Map(), trying: null };
       // Typing in a pane there makes this window the one whose size counts,
-      // here and there.
+      // here and there (once whoever has it stops typing, #333). Nothing
+      // else on this connection claims.
       client.claim = (tab: TabId) => {
         const t = client.tabView(tab);
         for (const [p, vs] of l.views) if (t && paneIds(t).includes(p)) vs.forEach((v) => v.claimed());
@@ -122,12 +123,12 @@ export async function newRemote(home: Client, host: string, where: { split?: Pan
   const there = new Client(directory.base(host));
   let pane: PaneId;
   try {
-    const res = await there.request("POST", "/api/run", { session: directory.home });
+    const res = await there.request("POST", "/api/run", { session: directory.home } satisfies RunRequest);
     if (!res.ok) {
       home.toast((await res.json<{ error?: string }>().catch(() => null))?.error ?? `${host} said no (${res.status})`);
       return;
     }
-    pane = (await res.json<{ pane: PaneId }>()).pane;
+    pane = (await res.json<RunResponse>()).pane;
   } catch {
     home.toast(`can't reach ${host}`);
     return;
@@ -137,7 +138,7 @@ export async function newRemote(home: Client, host: string, where: { split?: Pan
     config: { host, pane },
     split: where.split ?? null,
     session: where.split === undefined && where.session !== undefined ? String(where.session) : null,
-  });
+  } satisfies OpenRequest);
   if (failed) {
     home.toast(failed);
     // Nothing here shows it: don't leave it running there.
@@ -166,8 +167,8 @@ class RemoteView implements BlockView {
   private missingSince = 0;
   private gone = false;
   private goneTimer: number | undefined;
-  /** Its place here, and whether this window sizes it. */
-  private size: { cols: number; rows: number; owned: boolean } | null = null;
+  /** Its place here. */
+  private size: { cols: number; rows: number } | null = null;
   /** What its host was last told, and on which connection. */
   private pushed = "";
 
@@ -268,7 +269,11 @@ class RemoteView implements BlockView {
     this.home.intent({ op: "close_pane", pane: this.id });
   }
 
-  /** Tell its host the size of its place here. */
+  /** Tell its host the size of its place here. That's the tab's size
+   * there only if nobody else's is, or if `claim` (it was typed into
+   * here): owning the home tab here isn't a claim on the host's, or two
+   * windows showing the same remote pane take its size from each other
+   * at every layout (#333). */
   private push(claim = false) {
     const c = this.client;
     const at = this.at;
@@ -276,22 +281,21 @@ class RemoteView implements BlockView {
     const t = c.tabOfPane(at.pane);
     if (!t) return;
     const zoom = paneIds(t).length > 1 ? at.pane : null;
-    const owned = claim || this.size.owned;
-    const key = `${c.clientId}:${t.id}:${this.size.cols}x${this.size.rows}:${zoom}:${owned}`;
+    const key = `${c.clientId}:${t.id}:${this.size.cols}x${this.size.rows}:${zoom}`;
     if (key === this.pushed && !claim) return;
     this.pushed = key;
-    c.view(t.id, this.size.cols, this.size.rows, zoom, owned);
+    c.view(t.id, this.size.cols, this.size.rows, zoom, claim, claim);
   }
 
-  layout(cols: number, rows: number, owned: boolean) {
-    this.size = { cols, rows, owned };
+  layout(cols: number, rows: number) {
+    this.size = { cols, rows };
     this.push();
   }
 
   /** Typed into on its host's connection: this window sizes it now. */
   claimed() {
     const tab = this.home.tabOfPane(this.id);
-    if (tab && tab.owner !== this.home.clientId) this.home.claim(tab.id);
+    if (tab && tab.owner !== this.home.clientId) this.home.claim(tab.id, true);
     this.push(true);
   }
 

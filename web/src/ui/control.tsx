@@ -3,8 +3,8 @@
 // list, and how to add a machine.
 
 import { useEffect, useState } from "preact/hooks";
-import { inviteInHash, passkeyRegister, passkeySignIn, previewInvite, signInNext, type ControlSession, type JoinRequest } from "../control";
-import { fingerprint, type Cert } from "../e2e/cert.ts";
+import { AlongsideError, cameToRecover, deviceName, inApp, inviteInHash, joinInHash, passkeyRegister, passkeySignIn, previewInvite, RefusedError, signInNext, type ControlSession, type JoinRequest } from "../control";
+import { fingerprint, normalizeCode, type Cert } from "../e2e/cert.ts";
 import { useSubscribe } from "./hooks";
 import { directory } from "../hosts";
 import { CopyButton, CopyText, download } from "./copy";
@@ -14,6 +14,7 @@ import type { PresignedInvite, ShareOffer, Team } from "../control";
 import type { TeamRole } from "../e2e/team.ts";
 import { qr, qrPath } from "./qr";
 import { AccountPanel } from "./account";
+import { ConfirmRemove } from "./confirm";
 
 export function useControl(s: ControlSession) {
   useSubscribe((fn) => s.subscribe(fn));
@@ -72,25 +73,7 @@ export function ControlGate({ s }: { s: ControlSession }) {
       </Center>
     );
   }
-  if (s.phase === "waiting")
-    return (
-      <Center>
-        <h1>Approve this browser</h1>
-        <p>
-          You're signed in as <b>{s.login}</b>. Before this browser can reach your machines, a device you already use approves it. Open{" "}
-          <CopyText inline text={s.info.url} data-control-url /> on that device; it asks there.
-        </p>
-        <p>It shows this fingerprint; check it matches:</p>
-        <p class="fingerprint" data-fingerprint={s.keys.id}>
-          {fingerprint(s.keys.id)}
-        </p>
-        <p class="dim">Waiting…</p>
-        <RecoveryForm s={s} />
-        <button class="control-linkish" data-sign-out onClick={() => void s.signOut(false)}>
-          Sign out
-        </button>
-      </Center>
-    );
+  if (s.phase === "waiting") return <Waiting s={s} />;
   if (s.phase === "lost-key")
     return (
       <Center>
@@ -104,9 +87,27 @@ export function ControlGate({ s }: { s: ControlSession }) {
         <button class="primary" data-enroll-again onClick={() => void s.enrollAgain()}>
           Forget this browser and enroll again
         </button>
-        <button class="control-linkish" data-sign-out onClick={() => void s.signOut(false)}>
-          Sign out
+        <SignOuts s={s} />
+      </Center>
+    );
+  // #327: the account doesn't trust this browser's key any more (removed,
+  // or its approval went), so its approvals would be refused. Say so before
+  // anyone clicks Approve.
+  if (s.phase === "untrusted")
+    return (
+      <Center>
+        <h1>This browser isn't trusted any more</h1>
+        <p data-untrusted={s.untrustedWhy}>
+          Your account {s.untrustedWhy === "removed" ? "removed this browser" : "no longer trusts this browser"} (<b>{s.enrollment?.cert.name ?? "this browser"}</b>,{" "}
+          {fingerprint(s.keys.id)}), so it can't approve machines or devices, or reach your machines.
+        </p>
+        <p>
+          Forget it here and enroll it again as a new device. Another of your devices approves it, or a recovery code does: the next screen asks for one.
+        </p>
+        <button class="primary" data-enroll-again onClick={() => void s.enrollAgain(true)}>
+          Forget this browser and enroll again
         </button>
+        <SignOuts s={s} />
       </Center>
     );
   if (s.phase === "turned-down")
@@ -120,12 +121,92 @@ export function ControlGate({ s }: { s: ControlSession }) {
           Try again
         </button>
         <RecoveryForm s={s} label="Use a recovery code" />
-        <button class="control-linkish" data-sign-out onClick={() => void s.signOut(false)}>
-          Sign out
-        </button>
+        <SignOuts s={s} />
       </Center>
     );
   return null;
+}
+
+/** Sign out, keeping this browser's key for next time, or forgetting it
+ * too (#327): a key the account no longer trusts only gets in the way. */
+function SignOuts({ s }: { s: ControlSession }) {
+  return (
+    <p class="control-signouts">
+      <button class="control-linkish" data-sign-out onClick={() => void s.signOut(false)}>
+        Sign out
+      </button>
+      {" · "}
+      <button class="control-linkish" data-sign-out-forget onClick={() => void s.signOut(true)}>
+        Sign out and forget this browser
+      </button>
+    </p>
+  );
+}
+
+/** Here from forgetting a stale browser: the recovery form starts open. */
+let recover: boolean | undefined;
+const recovering = () => (recover ??= cameToRecover());
+
+/** This browser waits for a device the account trusts to approve it.
+ * #326: it says it's the browser (or the app's window) being approved, by
+ * name, and that adding a machine is a separate approval that doesn't need
+ * this one. Here from a machine's approval link (`#join=`), it leads with
+ * that: the code goes to a device already in the account, which sees this
+ * browser's request alongside and approves both at once. */
+function Waiting({ s }: { s: ControlSession }) {
+  const [hash, setHash] = useState(location.hash);
+  useEffect(() => {
+    const on = () => setHash(location.hash);
+    addEventListener("hashchange", on);
+    return () => removeEventListener("hashchange", on);
+  }, []);
+  const code = joinInHash(hash);
+  const name = deviceName();
+  // "the illogical app on jake-air", or "this browser (Chrome on Mac)".
+  const what = inApp() ? `the ${name}` : `this browser (${name})`;
+  const fp = (
+    <p class="fingerprint" data-fingerprint={s.keys.id}>
+      {fingerprint(s.keys.id)}
+    </p>
+  );
+  if (code)
+    return (
+      <Center>
+        <h1>Approve the machine on a device you use</h1>
+        <p data-waiting-join={code}>
+          You're signed in as <b>{s.login}</b>, here to add a machine with code <b>{code}</b>. Only a device already in your account can approve it,
+          and this browser isn't one yet. On a browser or phone you use with illogical, open:
+        </p>
+        <CopyText text={`${s.info.url}/#join=${code}`} data-control-join-link />
+        <p>Approve the code there, and pick where the machine goes: your account, or a team you own. That's the one approval the machine needs.</p>
+        <p class="dim" data-waiting-also>
+          That device also lists {what} next to the machine, with this fingerprint. Approve it too only if you want this browser to reach your
+          machines; the machine joins either way.
+        </p>
+        {fp}
+        <p class="dim">Waiting…</p>
+        <RecoveryForm s={s} open={recovering()} />
+        <SignOuts s={s} />
+      </Center>
+    );
+  return (
+    <Center>
+      <h1>{inApp() ? "Approve this app as a device" : "Approve this browser"}</h1>
+      <p data-waiting-browser={name}>
+        You're signed in as <b>{s.login}</b>. This approves {what} as one of your devices, so it can reach your machines. A device you already use
+        approves it: open <CopyText inline text={s.info.url} data-control-url /> on that device; it asks there.
+      </p>
+      <p>It shows this fingerprint; check it matches:</p>
+      {fp}
+      <p class="dim">Waiting…</p>
+      <p class="control-aside" data-waiting-machine>
+        Here to add a machine to your account or a team? That's a separate approval, and it doesn't need this one. The machine shows a code (in
+        Getting started, or where you ran <code>illogicald join</code>): approve that code on a device you already use.
+      </p>
+      <RecoveryForm s={s} open={recovering()} />
+      <SignOuts s={s} />
+    </Center>
+  );
 }
 
 /** Signed out, but following a link (#103): say what it was for. The hash
@@ -260,13 +341,14 @@ function NameLine({ s }: { s: ControlSession }) {
   );
 }
 
-function RecoveryForm({ s, label = "Lost your other devices? Use a recovery code" }: { s: ControlSession; label?: string }) {
-  const [open, setOpen] = useState(false);
+function RecoveryForm({ s, label = "Lost your other devices? Use a recovery code", open: startOpen = false }: { s: ControlSession; label?: string; open?: boolean }) {
+  const [open, setOpen] = useState(startOpen);
   const [code, setCode] = useState("");
   const [err, setErr] = useState("");
+  // A button that looks like one (#327): as a link it read as a sentence.
   if (!open)
     return (
-      <button class="control-linkish" data-use-recovery onClick={() => setOpen(true)}>
+      <button class="control-secondary" data-use-recovery onClick={() => setOpen(true)}>
         {label}
       </button>
     );
@@ -278,7 +360,7 @@ function RecoveryForm({ s, label = "Lost your other devices? Use a recovery code
         s.useRecoveryCode(code).catch((x: Error) => setErr(x.message));
       }}
     >
-      <input placeholder="Recovery code" value={code} onInput={(e) => setCode((e.target as HTMLInputElement).value)} aria-label="Recovery code" />
+      <input placeholder="Recovery code" value={code} onInput={(e) => setCode((e.target as HTMLInputElement).value)} aria-label="Recovery code" data-recovery-input autoFocus={startOpen} />
       <button type="submit">Use it</button>
       {err ? <p class="control-error">{err}</p> : null}
     </form>
@@ -465,6 +547,9 @@ export function ControlOverlay({ s }: { s: ControlSession }) {
   const req = s.teams.flatMap((t) => (t.role === "owner" ? t.requests.map((r) => ({ t, r })) : []))[0];
   if (req) return <AdmitPrompt s={s} team={req.t} req={req.r} />;
   const asking = s.pending[0];
+  // #326: a device that came to approve a machine's join: both together.
+  const asked = asking && s.pendingJoins.get(asking.device);
+  if (asking && asked) return <JoinPrompt key={asked} s={s} code={asked} from={asking} />;
   if (asking) return <DevicePrompt s={s} c={asking} />;
   const offer = s.offers[0];
   if (offer) return <ShareOfferPrompt s={s} o={offer} />;
@@ -515,13 +600,24 @@ function dropHash() {
   history.replaceState(null, "", location.pathname + location.search);
 }
 
-function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
+/** A machine's join, by its code: from its approval link, typed in, or
+ * (#326) brought by a waiting device that came to approve it (`from`).
+ * Devices waiting with this code are listed alongside, and one Approve
+ * covers the machine and them. */
+function JoinPrompt({ s, code, from }: { s: ControlSession; code: string; from?: Cert }) {
   const [j, setJ] = useState<JoinRequest | null>(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // Control refused an approval from here (#327): closing then isn't
+  // turning the machine down. It keeps waiting for one that works.
+  const [refused, setRefused] = useState(false);
   // "" is just me; else a team's id.
   const [to, setTo] = useState("");
+  // Devices alongside that the person unticked.
+  const [skip, setSkip] = useState<Set<string>>(new Set());
   useEffect(() => {
+    // This browser's own trust, fresh, before it offers Approve (#327).
+    void s.refresh();
     s.showJoin(code).then(
       (j) => {
         setJ(j);
@@ -530,28 +626,99 @@ function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
       (e: Error) => setErr(e.message),
     );
   }, [code]);
-  // Teams I own (#100), and the one it asked for even if I don't.
-  const owned = s.teams.filter((t) => t.role === "owner" && t.verified);
-  const asked = j?.team && !owned.some((t) => t.team === j.team!.team) ? j.team : null;
-  const team = owned.find((t) => t.team === to);
-  const notOwner = !!to && !team;
+  // The machine's code is gone (approved elsewhere, expired): the device
+  // that brought it asks on its own.
+  if (from && err && !j) return <DevicePrompt s={s} c={from} />;
+  // This browser waited with this code (#326), and it's gone: most likely
+  // approved with this browser, on the device that approved both.
+  if (!from && err && !j && s.brought === normalizeCode(code))
+    return (
+      <Modal close={clearHash}>
+        <h2>Add a machine?</h2>
+        <p data-join-done={code}>
+          Code <b>{s.brought}</b> isn't waiting any more: the device that approved this browser approved the machine with it, or the code expired. The
+          machine says which.
+        </p>
+        <div class="prompt-buttons">
+          <button class="primary" onClick={clearHash}>
+            Done
+          </button>
+        </div>
+      </Modal>
+    );
+  // Teams I'm in (#332), and the one it asked for even if I can't add to it.
+  const teams = s.addableTeams();
+  const asked = j?.team && !teams.some((t) => t.team === j.team!.team) ? j.team : null;
+  const team = teams.find((t) => t.team === to);
+  const cant = !!to && !team;
+  const locked = !!asked && !!s.teams.find((t) => t.team === asked.team)?.locked;
+  // Devices waiting with this code (#326), approved with the machine
+  // unless unticked.
+  const alongside = j ? s.pending.filter((c) => s.pendingJoins.get(c.device) === j.code) : [];
+  const also = alongside.filter((c) => !skip.has(c.device));
   const cancel = () => {
-    if (j) void s.rejectJoin(j.code).catch(() => {});
+    if (j && !refused) void s.rejectJoin(j.code).then(() => s.refresh(), () => {});
     clearHash();
   };
+  const failed = (e: unknown) => {
+    setErr((e as Error).message);
+    if (e instanceof RefusedError) setRefused(true);
+    setBusy(false);
+  };
   // M49: the illogical CLI on a machine, asking to be one of your devices.
-  if (j?.cert.kind === "cli") return <CliJoin s={s} j={j} cancel={cancel} />;
+  if (j?.cert.kind === "cli") return <CliJoin s={s} j={j} cancel={cancel} refused={refused} failed={failed} />;
+  const machine = j ? (
+    <>
+      <p>
+        <b>{j.cert.name}</b> asks to join {j.team ? <>the team <b data-join-team={j.team.team}>{j.team.name}</b></> : "your account"} with code{" "}
+        <b data-join-code={j.code}>{j.code}</b>. Check it's the code the machine shows (in Getting started, or where you ran <code>illogicald join</code>).
+      </p>
+      <p class="dim">Its key: {fingerprint(j.cert.device)}</p>
+    </>
+  ) : null;
   return (
-    <Modal close={clearHash}>
-      <h2>Add a machine?</h2>
-      {err ? <p class="control-error">{err}</p> : null}
+    <Modal close={from ? undefined : clearHash}>
+      <h2>{alongside.length ? "Add a machine and a device?" : "Add a machine?"}</h2>
+      {err ? (
+        <p class="control-error" data-join-error>
+          {err}
+        </p>
+      ) : null}
       {j ? (
         <>
-          <p>
-            <b>{j.cert.name}</b> asks to join {j.team ? <>the team <b data-join-team={j.team.team}>{j.team.name}</b></> : "your account"} with code{" "}
-            <b data-join-code={j.code}>{j.code}</b>. Check it's the code the machine shows (in Getting started, or where you ran <code>illogicald join</code>).
-          </p>
-          <p class="dim">Its key: {fingerprint(j.cert.device)}</p>
+          {alongside.length ? (
+            <div class="control-both" data-join-both>
+              <div class="control-both-card" data-join-machine>
+                <div class="control-both-kind">{j.cert.name} (machine)</div>
+                {machine}
+              </div>
+              {alongside.map((c) => (
+                <div key={c.device} class="control-both-card" data-join-alongside={c.device}>
+                  <div class="control-both-kind">{c.name} (browser)</div>
+                  <p>Signed in to come here and approve this machine. Approved too, it reaches your machines. It shows this fingerprint:</p>
+                  <p class="fingerprint" data-pending={c.device}>
+                    {fingerprint(c.device)}
+                  </p>
+                  <label class="control-check">
+                    <input
+                      type="checkbox"
+                      data-join-also={c.device}
+                      checked={!skip.has(c.device)}
+                      onChange={(e) => {
+                        const next = new Set(skip);
+                        if ((e.target as HTMLInputElement).checked) next.delete(c.device);
+                        else next.add(c.device);
+                        setSkip(next);
+                      }}
+                    />{" "}
+                    Approve it too
+                  </label>
+                </div>
+              ))}
+            </div>
+          ) : (
+            machine
+          )}
           {s.enrollment ? (
             <p>
               Your account:{" "}
@@ -561,30 +728,36 @@ function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
               . Once you approve, the machine shows its account's fingerprint: check it's this one there.
             </p>
           ) : null}
-          {owned.length || asked ? (
+          {teams.length || asked ? (
             <p>
               <label>
                 Join to{" "}
                 <select class="control-select" data-join-to value={to} onChange={(e) => setTo((e.target as HTMLSelectElement).value)}>
                   <option value="">Just me</option>
-                  {owned.map((t) => (
+                  {teams.map((t) => (
                     <option key={t.team} value={t.team}>
                       {t.roster.name}
                     </option>
                   ))}
-                  {asked ? <option value={asked.team}>{asked.name} (you're not an owner)</option> : null}
+                  {asked ? (
+                    <option value={asked.team}>
+                      {asked.name} ({locked ? "locked" : "you're not in it"})
+                    </option>
+                  ) : null}
                 </select>
               </label>
             </p>
           ) : null}
-          {notOwner ? (
-            <p class="control-error" data-join-not-owner>
-              Only the team's owners add its machines. Ask one of them to approve it, or pick Just me.
+          {cant ? (
+            <p class="control-error" data-join-not-member>
+              {locked
+                ? `${asked!.name} is locked: only its owners add machines to it. Ask one of them to approve it, or pick Just me.`
+                : `Only ${asked!.name}'s members add machines to it. Ask one of them to approve it, or pick Just me.`}
             </p>
           ) : (
             <p class="dim" data-join-grants>
               {team
-                ? `The members of ${team.roster.name} reach it by their role: owners and editors drive its terminals, viewers watch.`
+                ? `Everyone in ${team.roster.name} sees it and reaches it by their role: owners and editors drive its terminals, viewers watch. Its owners also see private panes, and can take it out of the team. It stays yours.`
                 : "Only your devices reach it, and they can drive its terminals."}{" "}
               Control relays the connection but can't read it.
             </p>
@@ -595,25 +768,27 @@ function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
       )}
       <div class="prompt-buttons">
         <button data-cancel-join onClick={cancel}>
-          Cancel
+          {refused ? "Close" : "Cancel"}
         </button>
         <button
           class="primary"
           data-approve-join
-          disabled={!j || busy || notOwner}
+          disabled={!j || busy || cant}
           onClick={async () => {
             if (!j) return;
             setBusy(true);
             try {
-              await s.approveJoin(j.code, j.cert, team?.team ?? null);
+              // The machine, then the devices that came with it.
+              await s.approveJoin(j.code, j.cert, team?.team ?? null, also);
               clearHash();
             } catch (e) {
-              setErr((e as Error).message);
-              setBusy(false);
+              // The machine is in: only the device is left to ask again.
+              if (e instanceof AlongsideError) setJ(null);
+              failed(e);
             }
           }}
         >
-          Approve
+          {also.length > 1 ? "Approve them all" : also.length ? "Approve both" : "Approve"}
         </button>
       </div>
     </Modal>
@@ -623,13 +798,17 @@ function JoinPrompt({ s, code }: { s: ControlSession; code: string }) {
 /** M49: the illogical CLI on some machine asks to be one of this account's
  * devices (`illogical login`). Approved, it reaches the account's machines
  * and can approve devices and machines, as this browser can. */
-function CliJoin({ s, j, cancel }: { s: ControlSession; j: JoinRequest; cancel: () => void }) {
+function CliJoin({ s, j, cancel, refused, failed }: { s: ControlSession; j: JoinRequest; cancel: () => void; refused: boolean; failed: (e: unknown) => void }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   return (
     <Modal close={clearHash}>
       <h2>Add a terminal?</h2>
-      {err ? <p class="control-error">{err}</p> : null}
+      {err ? (
+        <p class="control-error" data-join-error>
+          {err}
+        </p>
+      ) : null}
       <p data-join-cli={j.cert.name}>
         The illogical command line on <b>{j.cert.name}</b> asks to be one of your devices, with code <b data-join-code={j.code}>{j.code}</b>. Check it's the code
         it shows where you ran <code>illogical login</code>.
@@ -647,7 +826,7 @@ function CliJoin({ s, j, cancel }: { s: ControlSession; j: JoinRequest; cancel: 
       <p class="dim">It reaches your machines (directly or through control's relay, end to end encrypted) and can approve devices, as this one can.</p>
       <div class="prompt-buttons">
         <button data-cancel-join onClick={cancel}>
-          Cancel
+          {refused ? "Close" : "Cancel"}
         </button>
         <button
           class="primary"
@@ -661,6 +840,7 @@ function CliJoin({ s, j, cancel }: { s: ControlSession; j: JoinRequest; cancel: 
             } catch (e) {
               setErr((e as Error).message);
               setBusy(false);
+              failed(e);
             }
           }}
         >
@@ -740,7 +920,10 @@ function AppLoginDone() {
   return (
     <Modal close={clearHash}>
       <h2>Sign in the app?</h2>
-      <p data-app-login-done>Signed in. Next the app asks to be approved as a new device: the prompt shows here in a moment. Then it reaches your machines.</p>
+      <p data-app-login-done>
+        Signed in. Next the app's window asks to be approved as a device, so it reaches your machines: the prompt shows here in a moment. Its own
+        machine joins separately, with a code, and doesn't need this.
+      </p>
       <div class="prompt-buttons">
         <button class="primary" onClick={clearHash}>
           Done
@@ -857,15 +1040,14 @@ const since = (ms: number) => {
   return s < 60 ? "just now" : s < 3600 ? `${Math.round(s / 60)}m ago` : s < 86400 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`;
 };
 
-/** *Move to…* on a machine (#100): into a team you own, or back to just
- * you. Only shown when there's somewhere to move it. */
+/** *Move to…* on a machine (#100): into a team you're in (#332), or back
+ * to just you. Only shown when there's somewhere to move it. */
 function MoveMachine({ s, c, team, online }: { s: ControlSession; c: Cert; team: string | null; online: boolean }) {
   const [to, setTo] = useState<string | null | undefined>(undefined);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
-  const owned = s.teams.filter((t) => t.role === "owner" && t.verified);
-  const ownsNow = !team || owned.some((t) => t.team === team);
-  if (!ownsNow || (owned.length === 0 && !team)) return null;
+  const teams = s.addableTeams();
+  if (teams.length === 0 && !team) return null;
   const name = (id: string | null) => (id ? s.teams.find((t) => t.team === id)?.roster.name ?? "a team" : "just you");
   return (
     <div class="control-move" data-move={c.device}>
@@ -882,17 +1064,18 @@ function MoveMachine({ s, c, team, online }: { s: ControlSession; c: Cert; team:
           }}
         >
           <option value="">Just me</option>
-          {owned.map((t) => (
+          {teams.map((t) => (
             <option key={t.team} value={t.team}>
               {t.roster.name}
             </option>
           ))}
+          {team && !teams.some((t) => t.team === team) ? <option value={team}>{name(team)}</option> : null}
         </select>
       </label>
       {to !== undefined ? (
         <p class="dim control-explain" data-move-explain>
           {to
-            ? `${name(to)}'s members reach ${c.name} by their role${team ? `, and ${name(team)}'s lose it` : ""}. It stays yours.`
+            ? `Everyone in ${name(to)} sees ${c.name} and reaches it by their role${team ? `, and ${name(team)}'s members lose it` : ""}; its owners also see private panes. It stays yours, and you can take it out again.`
             : `${name(team)}'s members lose ${c.name} at once; only your devices reach it.`}
           {online ? " " : " It's offline, so it moves when it next connects. "}
           <button
@@ -925,24 +1108,30 @@ function MoveMachine({ s, c, team, online }: { s: ControlSession; c: Cert; team:
   );
 }
 
+/** When a device was added and which device approved it (#327). */
+function Approved({ s, c }: { s: ControlSession; c: Cert }) {
+  if (c.approver === c.device) return <span class="dim"> · added {since(c.created)}, the first device</span>;
+  const by = s.trusted.get(c.approver);
+  const on = !by ? "on a device since removed" : by.kind === "recovery" ? `with ${by.name}` : `on ${by.name}${by.device === s.keys.id ? " (this browser)" : ""}`;
+  return (
+    <span class="dim" data-approved-by={c.approver}>
+      {" "}
+      · added {since(c.created)}, approved {on}
+    </span>
+  );
+}
+
 function Devices({ s, close }: { s: ControlSession; close: () => void }) {
   const [err, setErr] = useState("");
-  const [confirming, setConfirming] = useState<string | null>(null);
+  // The machine or device whose Remove was clicked: a dialog asks.
+  const [removing, setRemoving] = useState<Cert | null>(null);
   const [renewing, setRenewing] = useState(false);
   const devices = [...s.trusted.values()].filter((c) => c.kind !== "recovery");
   const machines = devices.filter((c) => c.kind === "daemon");
   const browsers = devices.filter((c) => c.kind !== "daemon");
   const remove = (c: Cert) => (
-    <button
-      class={confirming === c.device ? "control-revoke danger" : "control-revoke"}
-      data-remove={c.device}
-      onClick={() => {
-        if (confirming !== c.device) return setConfirming(c.device);
-        setConfirming(null);
-        s.revoke(c.device).catch((e: Error) => setErr(e.message));
-      }}
-    >
-      {confirming === c.device ? "Really remove?" : "Remove"}
+    <button class="control-revoke" data-remove={c.device} onClick={() => setRemoving(c)}>
+      Remove
     </button>
   );
   const left = s.recoveryLeft;
@@ -986,15 +1175,11 @@ function Devices({ s, close }: { s: ControlSession; close: () => void }) {
                   {d?.online ? "online" : d?.last_seen ? `seen ${since(d.last_seen)}` : "offline"}
                   {d?.online ? ` · ${path}` : ""}
                 </span>
+                <Approved s={s} c={c} />
               </span>
               <span class="dim">{fingerprint(c.device)}</span>
               {remove(c)}
               <MoveMachine s={s} c={c} team={d?.team ?? null} online={!!d?.online} />
-              {confirming === c.device ? (
-                <p class="dim control-explain" data-remove-explain>
-                  It's taken off your account at once; illogical keeps running on it, reachable only locally. <code>illogicald join</code> adds it back.
-                </p>
-              ) : null}
             </li>
           );
         })}
@@ -1009,13 +1194,11 @@ function Devices({ s, close }: { s: ControlSession; close: () => void }) {
           <li key={c.device} data-device={c.device}>
             <span>
               {c.name}
-              {c.device === s.keys.id ? " (this browser)" : ""}
-              {c.device === s.enrollment?.root ? " · first device" : ""}
-              <span class="dim"> · added {since(c.created)}</span>
+              {c.device === s.keys.id ? <b data-this-browser> (this browser)</b> : ""}
+              <Approved s={s} c={c} />
             </span>
             <span class="dim">{fingerprint(c.device)}</span>
             {c.device !== s.keys.id ? remove(c) : <span />}
-            {confirming === c.device ? <p class="dim control-explain">It loses access at once.</p> : null}
           </li>
         ))}
       </ul>
@@ -1052,6 +1235,26 @@ function Devices({ s, close }: { s: ControlSession; close: () => void }) {
         <PasskeyNudge s={s} />
       )}
       {err ? <p class="control-error">{err}</p> : null}
+      {removing ? (
+        <ConfirmRemove
+          title={`Remove ${removing.name}?`}
+          cancel={() => setRemoving(null)}
+          go={() => {
+            setRemoving(null);
+            s.revoke(removing.device).catch((e: Error) => setErr(e.message));
+          }}
+        >
+          {removing.kind === "daemon" ? (
+            <p data-remove-explain>
+              It loses access at once: it's taken off your account. illogical keeps running on it, reachable only locally. To add it back, join it again with{" "}
+              <code>illogicald join</code>, which makes a new key.
+            </p>
+          ) : (
+            <p data-remove-explain>It loses access to your machines at once. To use it again, add it as a new device: it gets a new key.</p>
+          )}
+          <p class="fingerprint">{fingerprint(removing.device)}</p>
+        </ConfirmRemove>
+      ) : null}
       <div class="prompt-buttons">
         <button onClick={() => s.signOut(false)}>Sign out</button>
         <button onClick={close}>Done</button>
@@ -1292,7 +1495,7 @@ function Teams({ s, close }: { s: ControlSession; close: () => void }) {
         ))}
       </ul>
       <p class="dim">
-        An invite link lets one person in right away (with Ask me first, an owner says yes to each). Machines join a team when an owner approves them for it.{" "}
+        An invite link lets one person in right away (with Ask me first, an owner says yes to each). Any member can add their own machines to a team; its owners can take them out.{" "}
         <a href="https://github.com/arugula-salad/illogical/blob/main/docs/teams.md" target="_blank" rel="noreferrer">
           More about teams
         </a>
@@ -1327,9 +1530,14 @@ function TeamSection({ s, t, act }: { s: ControlSession; t: Team; act: (f: () =>
   const [askFirst, setAskFirst] = useState(false);
   const [linkAsks, setLinkAsks] = useState(false);
   const [linkWhy, setLinkWhy] = useState("");
-  // Which button waits for a second click: "lock", or a member to remove.
+  // Which button waits for a second click: "lock".
   const [confirming, setConfirming] = useState<string | null>(null);
+  // The member whose Remove was clicked: a dialog asks.
+  const [removing, setRemoving] = useState<string | null>(null);
   const owner = t.role === "owner";
+  // A member's machine an owner is taking out of the team (#332).
+  const [takingOut, setTakingOut] = useState<string | null>(null);
+  const machines = s.daemons.filter((d) => d.team === t.team);
   // One-click links not used yet (#134), each with Cancel.
   const [unused, setUnused] = useState<PresignedInvite[]>([]);
   const [reload, setReload] = useState(0);
@@ -1349,17 +1557,17 @@ function TeamSection({ s, t, act }: { s: ControlSession; t: Team; act: (f: () =>
       <h3>
         {t.roster.name} {t.locked ? <span class="control-error">· locked</span> : null}
       </h3>
-      {owner ? (
+      {t.locked && !owner ? (
+        <p class="dim" data-team-add-locked>
+          It's locked: only its owners add machines to it until it's unlocked.
+        </p>
+      ) : (
         <>
           <p class="dim">
-            Team id <CopyText inline text={t.team} data-team-id />. Add a machine to it with:
+            Team id <CopyText inline text={t.team} data-team-id />. Add a machine to it with <i>In …</i> on it in <i>Devices and machines…</i>, or on the machine:
           </p>
           <CopyText text={`illogicald join ${s.info.url} --team ${t.team}`} data-team-join />
         </>
-      ) : (
-        <p class="dim" data-ask-owner>
-          Ask an owner to add a machine.
-        </p>
       )}
       <ul class="control-devices">
         {t.roster.members.map((m) => (
@@ -1383,17 +1591,8 @@ function TeamSection({ s, t, act }: { s: ControlSession; t: Team; act: (f: () =>
               <span class="dim">{roleLabel(m.role)}</span>
             )}
             {owner && m.account !== s.account ? (
-              <button
-                class={confirming === m.account ? "control-revoke danger" : "control-revoke"}
-                data-remove-member={m.account}
-                title="They lose access to the team's machines at once"
-                onClick={() => {
-                  if (confirming !== m.account) return setConfirming(m.account);
-                  setConfirming(null);
-                  act(() => s.changeTeam(t.team, (ms) => ms.filter((x) => x.account !== m.account)));
-                }}
-              >
-                {confirming === m.account ? "Really remove?" : "Remove"}
+              <button class="control-revoke" data-remove-member={m.account} title="They lose access to the team's machines at once" onClick={() => setRemoving(m.account)}>
+                Remove
               </button>
             ) : (
               <span />
@@ -1401,6 +1600,59 @@ function TeamSection({ s, t, act }: { s: ControlSession; t: Team; act: (f: () =>
           </li>
         ))}
       </ul>
+      {removing ? (
+        <ConfirmRemove
+          title={`Remove ${t.names?.[removing] ?? t.roster.members.find((m) => m.account === removing)?.name ?? "them"} from ${t.roster.name}?`}
+          cancel={() => setRemoving(null)}
+          go={() => {
+            setRemoving(null);
+            act(() => s.changeTeam(t.team, (ms) => ms.filter((x) => x.account !== removing)));
+          }}
+        >
+          <p>They lose the team's machines at once. To come back, they need a new invite.</p>
+        </ConfirmRemove>
+      ) : null}
+      {machines.length ? (
+        <ul class="control-devices" data-team-machines={t.team}>
+          {machines.map((d) => {
+            const mine = !d.account || d.account === s.account;
+            return (
+              <li key={d.id} data-team-machine={d.id}>
+                <span>
+                  {d.name}
+                  <span class="dim">{mine ? " · yours" : ` · ${d.owner_name || "a member"}'s`}</span>
+                </span>
+                <span class="dim">{d.online ? "online" : "offline"}</span>
+                {owner && !mine ? (
+                  <button class="control-revoke" data-take-out={d.id} title="Take it out of the team; it stays its owner's" onClick={() => setTakingOut(d.id)}>
+                    Take out
+                  </button>
+                ) : (
+                  <span />
+                )}
+                {takingOut === d.id ? (
+                  <p class="dim control-explain" data-take-out-explain>
+                    {t.roster.name}'s members lose {d.name} at once. It stays {d.owner_name || "its owner"}'s, and they can add it again.{" "}
+                    <button data-take-out-cancel onClick={() => setTakingOut(null)}>
+                      Cancel
+                    </button>{" "}
+                    <button
+                      class="danger"
+                      data-take-out-go
+                      onClick={() => {
+                        setTakingOut(null);
+                        act(() => s.moveDaemon(d.id, null));
+                      }}
+                    >
+                      Take it out
+                    </button>
+                  </p>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
       {owner ? (
         <>
           <div class="control-code control-invite">

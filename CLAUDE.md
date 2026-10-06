@@ -1,5 +1,8 @@
 # illogical
 
+How the code is laid out and built: [AGENTS.md](AGENTS.md), upstream's guide.
+The rules below are this fork's and come first.
+
 ## Pull requests
 
 - Open PRs ready for review, never as drafts.

@@ -9,6 +9,7 @@ import { useSubscribe } from "./hooks";
 import { AttentionBadge } from "./attention";
 import { HostCrumb, HostSection } from "./hosts";
 import { openSwarm } from "../swarm/route";
+import { openChat } from "./chat";
 import { openChanges, openFountain, openIssue, openPort, openPr } from "../blocks";
 import { startAgent } from "./agent-dialog";
 import { pickConversation } from "./conversations";
@@ -18,6 +19,7 @@ import { openPicker } from "./picker";
 import { NotifySection } from "./notify";
 import { openGettingStarted } from "./welcome";
 import { openPalette } from "./palette";
+import { HuddleButton } from "./huddle";
 
 export function PhoneHeader({ client }: { client: Client }) {
   const [open, setOpen] = useState(false);
@@ -30,10 +32,15 @@ export function PhoneHeader({ client }: { client: Client }) {
       <header class="bar phone-bar">
         <button class="sheet-button" aria-expanded={open} onClick={() => setOpen(!open)}>
           {client.state?.panes.some((p) => p.attention === "needs_input") ? <span class="att needs_input">●</span> : "☰"} <HostCrumb />
-          <span class="crumb">{session?.name}</span> ›{" "}
-          {tab && client.tabMachine(tab.id) && <span class="host-tag">VM</span>}
-          <span class="crumb">{tab ? tabLabel(client, tab) : ""}</span>
+          {session && (
+            <>
+              <span class="crumb">{session.name}</span> ›{" "}
+              {tab && client.tabMachine(tab.id) && <span class="host-tag">VM</span>}
+              <span class="crumb">{tab ? tabLabel(client, tab) : ""}</span>
+            </>
+          )}
         </button>
+        {session && <HuddleButton client={client} session={session.id} />}
         {panes.length > 1 && (
           <span class="pane-count">
             {panes.indexOf(active ?? -1) + 1}/{panes.length}
@@ -119,6 +126,11 @@ function Sheet({ client, close }: { client: Client; close: () => void }) {
           <button data-open-swarm onClick={act(openSwarm)}>
             Swarm
           </button>
+          {client.hasThreads() && (
+            <button data-open-chat onClick={act(() => openChat())}>
+              Chat
+            </button>
+          )}
           <button data-open-palette onClick={act(() => openPalette(client, true))}>
             Commands
           </button>
@@ -256,6 +268,7 @@ export function KeyBar({ client }: { client: Client }) {
   const enc = new TextEncoder();
   return (
     <div class="keybar" role="toolbar" aria-label="Extra keys">
+      <div class="keybar-keys">
       {KEYS.map((k) => {
         const on = k.mod ? client.modifiers[k.mod] : false;
         return (
@@ -282,6 +295,21 @@ export function KeyBar({ client }: { client: Client }) {
           </button>
         );
       })}
+      </div>
+      {/* M70: a photo, or the camera, into the pane. Pinned at the end,
+          outside the keys that scroll, so it's always in sight. */}
+      <button
+        class="key attach"
+        title="Attach file"
+        aria-label="Attach file"
+        onPointerDown={(e) => e.preventDefault()}
+        onClick={() => {
+          const pane = client.active();
+          if (pane !== undefined) void client.attachFiles(pane);
+        }}
+      >
+        📎
+      </button>
     </div>
   );
 }

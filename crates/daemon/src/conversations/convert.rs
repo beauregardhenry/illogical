@@ -17,14 +17,17 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{Read, Seek, SeekFrom},
-    os::unix::fs::MetadataExt,
     path::Path,
+    sync::Arc,
 };
 
 use serde_json::Value;
 
 use super::branch;
-use crate::agent::transcript::{Entry, Tool};
+use crate::agent::{
+    images,
+    transcript::{Entry, Tool},
+};
 
 /// The entries of a transcript. `finished`: nothing is running it, so a tool
 /// call that never got its result was cut off. What [`Follow`] is held to;
@@ -57,12 +60,24 @@ pub struct Follow {
 /// How much of what was read is kept to check the file still starts so.
 const TAIL: usize = 4096;
 
+/// Which file this is, so a replaced one starts over: device and inode;
+/// on Windows, its creation time (std has no stable file index there).
+fn identity(md: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (md.dev(), md.ino())
+    }
+    #[cfg(windows)]
+    (0, std::os::windows::fs::MetadataExt::creation_time(md))
+}
+
 impl Follow {
     /// Read what's new in `path`. True if the entries may have changed.
     pub fn read(&mut self, path: &Path) -> std::io::Result<bool> {
         let mut f = std::fs::File::open(path)?;
         let md = f.metadata()?;
-        let file = Some((md.dev(), md.ino()));
+        let file = Some(identity(&md));
         let mut changed = false;
         if file != self.file || !self.same(&mut f, md.len())? {
             changed = self.read > 0 || self.open.is_some();
@@ -72,6 +87,12 @@ impl Follow {
         let mut new = vec![];
         f.read_to_end(&mut new)?;
         Ok(self.add(&new) || changed)
+    }
+
+    /// The images found since this was last asked (M71), for the block to
+    /// keep: its entries name them.
+    pub fn take_images(&mut self) -> Vec<Arc<[u8]>> {
+        std::mem::take(&mut self.c.images)
     }
 
     /// The entries so far. `finished`: as for [`entries`].
@@ -124,6 +145,8 @@ struct Converter {
     /// Lines that already have a user/assistant child: a prompt under one
     /// of these was sent again from an earlier point.
     parents: HashSet<String>,
+    /// Images in prompts, not yet kept (M71).
+    images: Vec<Arc<[u8]>>,
 }
 
 impl Converter {
@@ -187,11 +210,21 @@ impl Converter {
         self.out.push(Entry::Note { text: text.into(), at_ms, forgotten: false });
     }
 
-    fn prompt(&mut self, v: &Value, text: String, at: u64) {
+    fn prompt(&mut self, v: &Value, text: String, images: Vec<String>, at: u64) {
         if v["parentUuid"].as_str().is_some_and(|p| self.parents.contains(p)) {
             self.note("Rewound: the prompt below was sent again from an earlier point", at);
         }
-        self.out.push(Entry::User { text, at_ms: at, forgotten: false });
+        self.out.push(Entry::User { text, images, at_ms: at, forgotten: false });
+    }
+
+    /// A prompt's image, by the name the block keeps it as; `[image]` in
+    /// its text if it isn't one we can keep.
+    fn image(&mut self, b: &Value) -> Option<String> {
+        let source = &b["source"];
+        let bytes = (source["type"] == "base64").then(|| images::decode(source["data"].as_str()?)).flatten()?;
+        let name = images::name(&bytes)?;
+        self.images.push(bytes.into());
+        Some(name)
     }
 
     fn user(&mut self, v: &Value, at: u64) {
@@ -212,11 +245,12 @@ impl Converter {
                 }
                 let text = strip_reminders(s);
                 if !text.is_empty() {
-                    self.prompt(v, text, at);
+                    self.prompt(v, text, vec![], at);
                 }
             }
             Value::Array(blocks) => {
                 let mut text = vec![];
+                let mut images = vec![];
                 for b in blocks {
                     match b["type"].as_str() {
                         Some("text") => {
@@ -230,13 +264,16 @@ impl Converter {
                                 }
                             }
                         }
-                        Some("image") => text.push("[image]".into()),
+                        Some("image") => match self.image(b) {
+                            Some(name) => images.push(name),
+                            None => text.push("[image]".into()),
+                        },
                         Some("tool_result") => self.result(b, at),
                         _ => {}
                     }
                 }
-                if !text.is_empty() {
-                    self.prompt(v, text.join("\n"), at);
+                if !text.is_empty() || !images.is_empty() {
+                    self.prompt(v, text.join("\n"), images, at);
                 }
             }
             _ => {}
@@ -521,7 +558,12 @@ mod tests {
         let e = entries(&fixture("shapes/compaction.jsonl"), true);
         assert!(e.iter().any(|e| matches!(e, Entry::Note { text, .. } if text == "Conversation compacted")));
         let e = entries(&fixture("shapes/image.jsonl"), true);
-        assert!(e.iter().any(|e| matches!(e, Entry::User { text, .. } if text.contains("[image]"))), "{e:#?}");
+        // M71: a prompt's image by the name its block keeps it as.
+        assert!(
+            e.iter().any(|e| matches!(e, Entry::User { text, images, .. }
+                if !text.contains("[image]") && images.len() == 1 && images[0].ends_with(".png"))),
+            "{e:#?}"
+        );
         let e = entries(&fixture("shapes/api-error.jsonl"), true);
         assert!(e.iter().all(|e| !matches!(e, Entry::User { .. })));
         let e = entries(&fixture("shapes/rewind.jsonl"), true);

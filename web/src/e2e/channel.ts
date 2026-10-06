@@ -9,7 +9,7 @@
 import { cat, Initiator, type Cipher } from "./noise.ts";
 import type { DeviceKeys } from "./keys.ts";
 import { unhex } from "./cert.ts";
-import { RelayMux, type SocketLike } from "./relaymux.ts";
+import { fullReason, RelayMux, type SocketLike } from "./relaymux.ts";
 
 const CHUNK = 16 * 1024;
 const MAX_MSG = 64 << 20;
@@ -20,10 +20,14 @@ export interface RequestHead {
   method: string;
   path: string;
   content_type?: string;
+  /** The answer may come in parts (channel.rs); the page never asks. */
+  stream?: boolean;
 }
 export interface ResponseHead {
   status: number;
   content_type?: string;
+  /** More parts follow: only for a request with `stream`. */
+  more?: boolean;
 }
 
 export type Msg =
@@ -129,6 +133,11 @@ export class E2ESocket {
   onClose: () => void = () => {};
   /** Which way it went: the first URL tried, or a later one (the relay). */
   readonly url: string;
+  /** #369: why it closed, once it has. */
+  why = "";
+  /** #369: a piece of a message arrived (any piece: a big message comes
+   * in many, and only the last one delivers it). */
+  onWire: () => void = () => {};
 
   private sendQ: Promise<void> = Promise.resolve();
   private recvQ: Promise<void> = Promise.resolve();
@@ -148,13 +157,17 @@ export class E2ESocket {
     this.recv = recv;
     this.url = ws.url;
     const take = (wire: Uint8Array) => {
-      this.recvQ = this.recvQ.then(() => this.take(wire)).catch(() => this.close());
+      this.recvQ = this.recvQ.then(() => this.take(wire)).catch((e: Error) => this.close(`couldn't read: ${e.message}`));
     };
     // What the daemon sent right after its handshake message (its hello)
     // arrived while we were still finishing ours.
     for (const w of early) take(w);
-    ws.onmessage = (e) => take(new Uint8Array(e.data as ArrayBuffer));
-    ws.onclose = () => this.close();
+    ws.onmessage = (e) => {
+      this.onWire();
+      take(new Uint8Array(e.data as ArrayBuffer));
+    };
+    // A relay channel says why control closed it (`reason`).
+    ws.onclose = () => this.close((ws as { reason?: string }).reason ? `relay closed it: ${(ws as { reason?: string }).reason}` : "socket closed");
   }
 
   /** Try each URL in order (direct ones first, the relay last). */
@@ -201,11 +214,14 @@ export class E2ESocket {
           rej(err);
         }
       };
-      ws.onclose = () => {
+      ws.onclose = (e) => {
         clearTimeout(t);
-        rej(new Error("closed during the handshake (not an approved device?)"));
+        const full = fullReason(e);
+        if (full) rej(Object.assign(new Error(full), { full: true }));
+        else rej(new Error("closed during the handshake (not an approved device?)"));
       };
       void ik
+        // Frozen (#504): the prologue both ends agree on.
         .write(new Uint8Array(), enc.encode(`illogical/1\n${daemon.id}\n`))
         .then((m) => ws.send(m))
         .catch(rej);
@@ -214,6 +230,16 @@ export class E2ESocket {
 
   get open(): boolean {
     return !this.closed && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  /** #369: what the way to the daemon looks like, for a link that's
+   * dropped: how much of a message has arrived, and the socket's state. */
+  health(): string {
+    const ws = this.ws as SocketLike & { bufferedAmount?: number; health?(): string };
+    const parts = [`${this.partialLen} B of a message in`];
+    if (ws.health) parts.push(ws.health());
+    else parts.push(`socket state ${ws.readyState}, ${ws.bufferedAmount ?? 0} B unsent`);
+    return parts.join(", ");
   }
 
   private async take(wire: Uint8Array) {
@@ -275,7 +301,7 @@ export class E2ESocket {
           if (last) break;
         }
       })
-      .catch(() => this.close());
+      .catch((e: Error) => this.close(`couldn't send: ${e.message}`));
   }
 
   sendText(text: string) {
@@ -289,7 +315,9 @@ export class E2ESocket {
   /** An HTTP request to the daemon's API, through the channel. */
   request(method: string, path: string, body?: unknown, timeoutMs = 30_000): Promise<Response> {
     const id = this.nextId++;
-    const json = body === undefined ? undefined : JSON.stringify(body);
+    // Raw bytes (an upload's chunk, M70) go as they are.
+    const raw = body instanceof Uint8Array ? body : undefined;
+    const json = body === undefined || raw ? undefined : JSON.stringify(body);
     return new Promise((res, rej) => {
       if (!this.open) return rej(new Error("not connected"));
       const t = setTimeout(() => {
@@ -309,15 +337,20 @@ export class E2ESocket {
       this.put({
         kind: "request",
         id,
-        head: { method, path, ...(json === undefined ? {} : { content_type: "application/json" }) },
-        body: json === undefined ? new Uint8Array() : enc.encode(json),
+        head: {
+          method,
+          path,
+          ...(raw ? { content_type: "application/octet-stream" } : json === undefined ? {} : { content_type: "application/json" }),
+        },
+        body: raw ?? (json === undefined ? new Uint8Array() : enc.encode(json)),
       });
     });
   }
 
-  close() {
+  close(why = "closed here") {
     if (this.closed) return;
     this.closed = true;
+    this.why = why;
     this.ws.close();
     for (const p of this.pending.values()) p.rej(new Error("connection closed"));
     this.pending.clear();

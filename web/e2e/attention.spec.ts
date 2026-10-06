@@ -4,8 +4,10 @@
 // offers Dismiss (delivered through the DevTools protocol, as S18 did).
 
 import { expect, test, type Page } from "@playwright/test";
-import { open, reset } from "./helpers";
+import { open, reset, closeContexts } from "./helpers";
 import type { PaneId } from "../src/proto";
+
+test.afterAll(closeContexts);
 
 /** A shell in a new tab that isn't shown (so nobody is looking at it). */
 async function hiddenShell(page: Page): Promise<PaneId> {
@@ -77,7 +79,7 @@ test("a push for a failure offers Dismiss", async ({ browser }) => {
       if (r) resolve(r.registrationId);
     });
   });
-  // What the daemon sends for a failure (see crates/daemon/tests/attention.rs).
+  // What the daemon sends for a failure (see crates/daemon/tests/integration/attention.rs).
   const payload = {
     title: "Failed",
     body: "cargo test failed (exit 101) after 3s",

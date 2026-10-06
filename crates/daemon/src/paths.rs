@@ -49,11 +49,13 @@ pub fn relative(dir: &str, file: &str) -> String {
     file.to_owned()
 }
 
-#[cfg(test)]
+// Unix: they make symlinks.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn relative_through_links() {
         let root = std::env::temp_dir().join(format!("ilg-paths-{}", std::process::id()));
         std::fs::create_dir_all(root.join("real/src")).unwrap();

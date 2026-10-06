@@ -163,10 +163,15 @@ pub struct Dirs {
 
 impl Dirs {
     pub fn from_env() -> Self {
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
+        let home = crate::home();
         let claude = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"));
         let desktop = if cfg!(target_os = "macos") {
             home.join("Library/Application Support/Claude")
+        } else if cfg!(windows) {
+            std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(r"AppData\Roaming"))
+                .join("Claude")
         } else {
             std::env::var_os("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
@@ -456,7 +461,8 @@ fn live(dir: &Path, ours: &Ours) -> HashMap<String, Live> {
         };
         let (Some(pid), Some(session)) = (v["pid"].as_u64(), v["sessionId"].as_str()) else { continue };
         let pid = pid as u32;
-        if !alive(pid, v["procStart"].as_str()) {
+        // Windows writes the start as `procStartFt` (a FILETIME).
+        if !alive(pid, v["procStart"].as_str().or(v["procStartFt"].as_str())) {
             continue;
         }
         let (pane, block) = ours.holder(pid).unwrap_or_else(|| scope_of(pid));
@@ -480,8 +486,7 @@ fn live(dir: &Path, ours: &Ours) -> HashMap<String, Live> {
 /// The process is running, and is the one that wrote the file: it started
 /// when `procStart` says.
 fn alive(pid: u32, proc_start: Option<&str>) -> bool {
-    // EPERM is someone's process all the same; only ESRCH means it's gone.
-    if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) == Err(nix::errno::Errno::ESRCH) {
+    if !crate::procinfo::alive(pid) {
         return false;
     }
     let Some(want) = proc_start else { return true };
@@ -491,8 +496,9 @@ fn alive(pid: u32, proc_start: Option<&str>) -> bool {
 
 /// Is `procStart` this start time ([`crate::procinfo::start_time`])?
 /// Claude Code writes field 22 of `/proc/<pid>/stat` (clock ticks since
-/// boot) on Linux, and `LC_ALL=C TZ=UTC ps -o lstart=` (`Sat Oct  3
-/// 10:17:50 2026`, to the second) elsewhere.
+/// boot) on Linux, `LC_ALL=C TZ=UTC ps -o lstart=` (`Sat Oct  3 10:17:50
+/// 2026`, to the second) on macOS, and on Windows `procStartFt`, the
+/// creation time from `GetProcessTimes` (100 ns since 1601).
 fn same_start(have: u64, want: &str) -> bool {
     if cfg!(target_os = "macos") { lstart_secs(want) == Some(have / 1_000_000) } else { want.parse() == Ok(have) }
 }
@@ -515,6 +521,7 @@ fn scope_of(pid: u32) -> (Option<PaneId>, Option<PaneId>) {
         let i = cg.find(prefix)? + prefix.len();
         cg[i..].split(['-', '.']).next()?.parse::<PaneId>().ok()
     };
+    // Frozen (#504): running panes keep the scopes they started in.
     (id("illogical-pane-"), id("illogical-agent-"))
 }
 
@@ -615,8 +622,10 @@ mod tests {
         // S20's session and its fork, with their cwd pointed at a real folder.
         for f in ["a683c96a-c2b1-4ed7-bdd4-51b7d759125b", "d1ccc1e4-4b63-4b89-80b7-38128ee9d8cc"] {
             let text = std::fs::read_to_string(fixture(&format!("scratch/{f}.jsonl"))).unwrap();
-            let text =
-                text.replace("/home/user/illogical/spikes/s20-conversations/work/scratch", work.to_str().unwrap());
+            // Escaped as JSON: a Windows path's backslashes would break the line.
+            let quoted = serde_json::to_string(work.to_str().unwrap()).unwrap();
+            let text = text
+                .replace("/home/user/illogical/spikes/s20-conversations/work/scratch", &quoted[1..quoted.len() - 1]);
             std::fs::write(proj.join(format!("{f}.jsonl")), text).unwrap();
         }
         // A subagent's transcript is in a folder of its own: not listed.
@@ -692,6 +701,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(unix)]
     /// A process's `procStart`, as Claude Code writes it on this OS.
     fn proc_start(pid: u32) -> String {
         if cfg!(target_os = "macos") {
@@ -708,6 +718,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn write_session(dir: &Path, name: &str, pid: u32, start: &str, sid: &str) {
         std::fs::write(
             dir.join(name),
@@ -716,6 +727,8 @@ mod tests {
         .unwrap();
     }
 
+    // Unix: starts processes with sh.
+    #[cfg(unix)]
     #[test]
     fn live_sessions_are_checked_against_their_start_time() {
         let root = tmp("live");
@@ -737,6 +750,31 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Windows: Claude Code writes `procStartFt`, its creation FILETIME.
+    #[cfg(windows)]
+    #[test]
+    fn live_sessions_on_windows_are_checked_against_their_filetime() {
+        let root = tmp("live-win");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let me = std::process::id();
+        let ft = crate::procinfo::start_time(me).unwrap().to_string();
+        let write = |name: &str, pid: u32, ft: &str, sid: &str| {
+            let v = json!({"pid": pid, "sessionId": sid, "procStartFt": ft, "kind": "interactive", "entrypoint": "cli", "status": "idle"});
+            std::fs::write(sessions.join(name), v.to_string()).unwrap();
+        };
+        write("a.json", me, &ft, "live-one");
+        write("b.json", me, "1", "reused-pid");
+        write("c.json", 999_999_999, &ft, "gone");
+        let l = live(&sessions, &Ours::default());
+        assert_eq!(l.keys().map(String::as_str).collect::<Vec<_>>(), ["live-one"]);
+
+        // Under one of our panes, by its ancestors.
+        let ours = Ours { panes: [(crate::procinfo::ppid(me).unwrap(), 7)].into(), ..Default::default() };
+        assert_eq!(live(&sessions, &ours)["live-one"].pane, Some(7));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn ps_start_times() {
         assert_eq!(lstart_secs("Sat Oct  3 10:17:50 2026"), Some(1_791_022_670));
@@ -753,6 +791,8 @@ mod tests {
         }
     }
 
+    // Unix: starts processes with sh and reads their ancestry.
+    #[cfg(unix)]
     #[test]
     fn a_holder_is_placed_by_its_ancestors() {
         let root = tmp("ours");
@@ -779,7 +819,7 @@ mod tests {
         // Not under any of ours.
         let l = live(&sessions, &Ours { panes: [(1, 7)].into(), ..Ours::default() });
         assert_eq!(l["in-pane"].pane.filter(|p| *p == 7), None);
-        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(claude as i32), nix::sys::signal::SIGKILL);
+        crate::procinfo::kill(claude);
         shell.wait().unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }

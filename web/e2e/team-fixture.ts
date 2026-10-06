@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, type Browser, type BrowserContextOptions, type Page } from "@playwright/test";
 import { ANY, controlPort, listen } from "./ports";
+import { labs } from "./labs";
 
 export class TeamControl {
   base = "";
@@ -26,7 +27,8 @@ export class TeamControl {
     return d;
   }
 
-  async start() {
+  /** `extra`: more arguments for control. */
+  async start(extra: string[] = []) {
     this.gh = createServer((req, res) => {
       const u = new URL(req.url!, "http://github");
       if (u.pathname === "/login/oauth/authorize") {
@@ -57,6 +59,7 @@ export class TeamControl {
           ...["--listen", ANY, "--public-url", "http://127.0.0.1:0", "--db", db],
           ...["--github-client-id", "id", "--github-client-secret", "s", "--static-dir", "dist"],
           ...["--github-url", this.github, "--github-api", this.github],
+          ...extra,
         ],
         { stdio: "ignore" },
       ),
@@ -119,7 +122,7 @@ export class TeamControl {
       spawn(
         "../target/debug/illogicald",
         [
-          ...["--listen", ANY, "--name", name, "--state-dir", state],
+          ...["--listen", ANY, "--name", name, "--state-dir", labs(state)],
           ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/sock"],
         ],
         { stdio: "ignore" },

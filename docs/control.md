@@ -25,6 +25,10 @@ repository (below).
     `illogicald` and the CLI don't come from control.
   - **hosted sandboxes.** They run on control's provider, which writes
     their trust files; the operator can read them.
+- **Huddles** (voice calls) don't go through control. Control hands
+  machines short-lived TURN credentials (from Cloudflare, for the hosted
+  control); a relayed call's audio is encrypted end to end, so the relay
+  sees only addresses and volume.
 
 **What it costs.** The hosted control is free during the beta. It's
 provided as is, without guarantees, and its pricing may change; any change
@@ -61,15 +65,30 @@ vs team machines and sharing a session:
    `--account FINGERPRINT` answers ahead, for scripts. *Join to* picks
    your account (*Just me*) or a team you own; `--team ID` picks the team
    ahead. *Cancel* turns it down. A running daemon connects within a few
-   seconds, and the machine appears in the host menu.
+   seconds, and the machine appears in the host menu. A machine runs one
+   join at a time: while Getting started's waits, `illogicald join` says
+   which code it is and where to approve it, and the other way round.
+   An approval is never lost to a second request from the same machine.
+   If control refuses an approval, the page says which check failed and
+   what to do; closing it then doesn't turn the machine down.
+   The machine's approval is the only one it needs. If the browser you
+   open its link in isn't one of your devices yet, it can't approve the
+   machine: it says so, shows the link to open on a device you already
+   use, and asks to be approved itself. That device then shows the machine
+   and the browser side by side, and *Approve both* lets both in (untick
+   the browser to leave it out: the machine joins either way). Each is
+   still a device approval, signed by the device that approves it.
 3. **Add your phone** (or any other browser): *Add a phone or browser…* in
    the host menu shows control's address as a QR code and a link. Sign in
    there. It shows a fingerprint and waits. Your devices ask *New device?*
    with the same fingerprint; approve it on one of them.
-4. **Sign in the desktop app.** Once its machine has joined (*Getting
-   started*'s *Cloud* step, or `illogicald join`), the app's window is
-   control's page. The window can't use passkeys, so the app signs in
-   through your browser:
+4. **Sign in the desktop app** (optional). Once its machine has joined
+   (*Getting started*'s *Cloud* step, or `illogicald join`), the app
+   offers to sign in, so its window reaches your other machines too; the
+   machine needs nothing more, and *Just this machine for now* skips it.
+   A machine control dropped counts as not joined: the app opens its own
+   page with *Getting started*'s join, not the sign-in. The window can't
+   use passkeys, so the app signs in through your browser:
    - *Sign in* in the app opens control in your browser and shows a short
      code;
    - signed in there, control asks *Sign in the app?* with the machine's
@@ -87,12 +106,39 @@ vs team machines and sharing a session:
    daemon's own list), and `illogical --host NAME run|ls|capture …`
    reaches any of them, directly when it lists a URL that answers, else
    through the relay, with nothing in `hosts.json`. `ILLOGICAL_VERBOSE=1`
-   says which. `attach` and `tui` don't go through control yet.
+   says which. `attach`, `tui` and `--follow` work the same way, and
+   your teams' machines and those shared with you are listed and reached
+   too ([cli.md](cli.md)).
    `illogical logout` forgets the CLI's key; remove it under *Devices and
    machines…* to revoke it.
 6. **Remove a device or machine** from *Devices and machines…* in the host
    menu. It loses access at once. A removed machine keeps running
-   illogical, reachable only locally; `illogicald join` adds it back.
+   illogical, reachable only locally. Its key never counts again, so when
+   control says it was removed, the machine sets the key aside
+   (`daemon.key.removed-…`) and asks to join again with a new one: a new
+   code to approve, shown in *Getting started* and by `illogicald join`.
+   Approved into the same account, it's back without checking the
+   fingerprint again.
+   A removed browser says so when it opens control's page, and offers to
+   forget its key and enroll again, approved by another device or a
+   recovery code.
+
+**From the desktop app, first run or after a drop**, it's one
+sequence:
+
+1. Install the app and open it. It starts the daemon and shows the
+   daemon's own page; Getting started opens once.
+2. Join the machine: Getting started's *Cloud* step ("Add … to your
+   account or team", or "Put … back" after a drop) shows a code. Approve
+   it on a device you already use, picking your account or a team there,
+   then check the account's fingerprint (*They match*). That's the one
+   approval the machine needs. After a drop, the app opens this step by
+   itself, once.
+3. Sign the app in (optional): its window then reaches your other
+   machines too. It's a second approval, of the app's window as a device;
+   the sign-in page says so, and *Just this machine for now* skips it.
+4. The machine is in the host menu of your devices and, by role, your
+   team's.
 
 **How a device reaches a machine:**
 
@@ -109,7 +155,39 @@ make it a hub): its host menu has *All your machines…*, which opens
 control's page.
 
 **Leaving.** `illogicald leave` takes a machine off your account (or its
-team). illogical keeps running there, at `http://127.0.0.1:7681`.
+team). illogical keeps running there, at `http://127.0.0.1:7681`. The
+daemon's log says it left, so a leave reads differently from a removal.
+
+**Dropped by control.** If control stops knowing a machine (it left, it
+was removed from a browser, its account was deleted), the daemon notices
+within a minute or two: control refuses its certificate refresh, or its
+relay, and asking again says it has no such machine. Then:
+
+- the machine's page shows a banner, *This machine is no longer in …*,
+  with *Join again* (Getting started's join, to the same control), and
+  the host menu says *Dropped by control*;
+- the desktop app posts a notification, once per drop; a click opens
+  Getting started at the join;
+- `illogical status` says so and exits 1;
+- the daemon logs what control said, and keeps it (and when) in
+  `<state>/control-dropped.json`.
+
+A machine removed from a browser has a key that never counts again, so
+it sets the key aside and asks to join again with a new one by itself
+(above): the banner, Getting started and `illogical status` show that
+join's code. Otherwise its `control.json` stays (control could be
+wrong): the daemon stops redialling the relay and asks again every 10
+minutes, until you join again (the old enrollment is set aside as
+`control.json.dropped`) or run `illogicald leave`. If `control.json`
+disappears while the daemon runs and nothing of illogical's removed it,
+the log says that too.
+
+`GET /api/host`'s `control_state` (for the machine's owner only) has all
+of this: `state` (`not_joined`, `joined` or `dropped`), `url`, `kind`
+(`account` or `team`), `name`, `connected`, `seen_ms`, `error`, and for a
+drop `said`, `dropped_ms`, and the `code` and `approve` link of a join
+waiting for approval. `GET /api/setup?part=control` has it as
+`control.state`.
 
 **Your sign-ins, and deleting your account:** *Sign-in and account…* in
 the host menu.
@@ -144,10 +222,12 @@ the host menu.
     more (see below).
 
 **Moving a machine** between your account and a team (or between teams):
-*Move to…* on it in *Devices and machines…*. You need to own the teams on
-both sides. Your device signs the move and the machine checks that
-signature, so control can't move a machine by itself. An offline machine
-moves when it next connects.
+*In …* on it in *Devices and machines…*, into any team you're in. Your
+device signs the move and the machine checks that signature, so control
+can't move a machine by itself. A team's owners can take a member's
+machine out of the team (*Take out* in *Teams…*): the machine checks that
+an owner of the team, in the member list it checked, signed it, and takes
+nothing else from them. An offline machine moves when it next connects.
 
 **What isn't here yet:** the CLI (`illogical`) still reaches only the local
 daemon, or others over the tailnet.
@@ -167,7 +247,7 @@ illogical-control --public-url https://control.example.com --listen 127.0.0.1:76
   - **GitHub**: register a GitHub App (or OAuth app) with the callback
     `https://control.example.com/auth/github/callback`, then set
     `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`.
-- **The GitHub App** (M40, optional): forge blocks' live updates from
+- **The GitHub App** (optional): forge blocks' live updates from
   GitHub, and read access for hosted boxes with no `gh` login. Make it
   with GitHub's manifest flow (or by hand at *Settings → Developer settings
   → GitHub Apps*):
@@ -228,6 +308,14 @@ illogical-control --public-url https://control.example.com --listen 127.0.0.1:76
   - `ILLOGICAL_RELAY_DAILY_MB` (2000): relayed traffic a day, while
     billing is off. Past it the account's relayed traffic slows to about
     64 KB/s, as billing's allowance does. Direct connections don't count.
+- **A ceiling on the relay,** every account's sockets together:
+  `ILLOGICAL_RELAY_MAX_TOTAL` (5000; 0 for none). Keep it below the
+  proxy's connection limit, so a full relay still leaves room for
+  control's pages and sign-ins. Past it a new relay socket is refused
+  (what's open stays): daemons and the CLI get `503` with
+  `Retry-After: 30`, and a browser's socket closes at once with code
+  1013 and the reason. Daemons wait that long and up to as long again;
+  a page says control is full and waits 30 to 60 seconds.
 - **Backups:** set `LITESTREAM_BUCKET` and control backs its database up
   continuously with Litestream (below).
 
@@ -246,7 +334,13 @@ The hosted control is one Fly machine (`packaging/control/fly.toml`):
 `fly.toml` (6,000 soft, 8,000 hard) are about open files, not memory.
 Control raises its open-file limit to the hard one at start and logs it
 (`open file limit open_files=…` in `fly logs`); keep `hard_limit` below
-that. Each account is held to the relay limits above.
+that. Each account is held to the relay limits above, and the relay as
+a whole to its ceiling (5,000, under Fly's soft limit, so pages and
+sign-ins still get through when it's full). Each minute it changed,
+`fly logs` has `relay sockets` with the count (`sockets`, `daemons`,
+`clients`), the ceiling (`max`) and how many were refused for it
+(`refused`); `the relay is full` and `the relay has room again` mark
+when it fills and empties.
 
 **Backups (Litestream to Cloudflare R2).** Off until its secrets are set;
 then:
@@ -309,9 +403,25 @@ To turn it on:
 
 Fly's own daily volume snapshots (kept 5 days) still run.
 
+**TURN for huddles.** Machines ask control for TURN credentials for
+their huddles (`GET /api/daemon/turn`), and control asks Cloudflare's TURN
+service for short-lived ones (8 hours; a machine reuses them for an hour).
+Without a key, machines get Cloudflare's public STUN only, which is enough
+unless both ends are behind strict NATs. In the Cloudflare dashboard,
+*Realtime → TURN Server → Create*, then:
+
+```
+fly secrets set -a illogical-control \
+  CLOUDFLARE_TURN_KEY_ID=… CLOUDFLARE_TURN_API_TOKEN=…
+```
+
+`fly logs` says `no CLOUDFLARE_TURN_KEY_ID/CLOUDFLARE_TURN_API_TOKEN` at
+start when they're missing. A self-hosted control can run coturn instead
+(not wired up yet).
+
 **A spend alert** isn't something this repository sets: it belongs to
-the Fly organization's billing settings in Fly's dashboard (#174 leaves
-it to Jake).
+the Fly organization's billing settings in Fly's dashboard (it's the
+operator's to set).
 
 ## Testing
 

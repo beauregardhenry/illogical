@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS revocations (
     device TEXT NOT NULL,
     body TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS revocations_device ON revocations (device);
 CREATE TABLE IF NOT EXISTS joins (
     code TEXT PRIMARY KEY,
     cert TEXT NOT NULL,
@@ -132,6 +133,12 @@ CREATE TABLE IF NOT EXISTS daemon_offers (
     daemon TEXT NOT NULL,
     account TEXT NOT NULL,
     since INTEGER NOT NULL,
+    PRIMARY KEY (daemon, account)
+);
+CREATE TABLE IF NOT EXISTS daemon_offer_pushes (
+    daemon TEXT NOT NULL,
+    account TEXT NOT NULL,
+    at INTEGER NOT NULL,
     PRIMARY KEY (daemon, account)
 );
 CREATE TABLE IF NOT EXISTS share_answers (
@@ -215,6 +222,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let names: Vec<String> = q.query_map([], |r| r.get(1))?.collect::<Result<_, _>>()?;
         Ok(names.iter().any(|n| n == col))
     };
+    // A revocation of one of the account's own machines (#330): only those
+    // keep a key out of every account (see `Db::revoked`).
+    if !has("revocations", "machine")? {
+        conn.execute_batch("ALTER TABLE revocations ADD COLUMN machine INTEGER NOT NULL DEFAULT 0")?;
+    }
     if !has("daemons", "team")? {
         conn.execute_batch("ALTER TABLE daemons ADD COLUMN team TEXT")?;
     }
@@ -245,8 +257,16 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if !has("sessions", "agent")? {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN agent TEXT")?;
     }
+    // Poll hashes a later join from the same machine took over from (#329).
+    if !has("joins", "replaced")? {
+        conn.execute_batch("ALTER TABLE joins ADD COLUMN replaced TEXT NOT NULL DEFAULT ''")?;
+    }
     if !has("joins", "proven")? {
         conn.execute_batch("ALTER TABLE joins ADD COLUMN proven INTEGER NOT NULL DEFAULT 0")?;
+    }
+    // #326: the machine's join code a waiting browser came to approve.
+    if !has("devices", "join_code")? {
+        conn.execute_batch("ALTER TABLE devices ADD COLUMN join_code TEXT")?;
     }
     // #208: what a passkey is (its maker, from its AAGUID), the browser
     // that added it, and when it last signed in, to tell them apart.
@@ -393,6 +413,20 @@ pub struct Join {
     pub features: String,
     /// It signed for its key when it asked (0.17 and newer).
     pub proven: bool,
+    /// Poll hashes of requests a later one from this machine took over
+    /// from, space-separated (#329).
+    pub replaced: String,
+}
+
+/// What asking for a join code did (#329).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// A new join, or this request took over the one waiting (keeping an
+    /// approval it had).
+    Waiting,
+    /// A join from this machine is waiting already, and this request can't
+    /// take it over: it didn't prove it holds the key.
+    Taken,
 }
 
 /// A row that's already there (a primary key), as opposed to anything
@@ -790,6 +824,34 @@ impl Db {
         Ok(())
     }
 
+    /// A revocation of a machine of `r.account`'s own (a `daemons` row of
+    /// that account when it was revoked): see [`Db::revoked`].
+    pub fn add_machine_revocation(&self, r: &Revocation) -> anyhow::Result<()> {
+        self.c().execute(
+            "INSERT INTO revocations (account, device, body, machine) VALUES (?1, ?2, ?3, 1)",
+            params![r.account, r.device, serde_json::to_string(r)?],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `device` is `account`'s: one of its devices (approved or
+    /// asking), one of its machines, or a join it approved that the
+    /// machine hasn't collected yet. What it may revoke.
+    pub fn is_accounts(&self, account: &str, device: &str) -> anyhow::Result<bool> {
+        if self.device(account, device)?.is_some() || self.daemon_account(device)?.as_deref() == Some(account) {
+            return Ok(true);
+        }
+        let c = self.c();
+        let mut q = c.prepare("SELECT cert FROM joins WHERE account = ?1")?;
+        let certs = q.query_map(params![account], |r| r.get::<_, String>(0))?;
+        for cert in certs {
+            if cert_of(cert?)?.device == device {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn revocations(&self, account: &str) -> anyhow::Result<Vec<Revocation>> {
         let c = self.c();
         let mut q = c.prepare("SELECT body FROM revocations WHERE account = ?1")?;
@@ -797,8 +859,38 @@ impl Db {
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
 
+    /// The first time `device` was removed as one of its account's
+    /// machines (#330), if it was: that key never joins or signs again.
+    ///
+    /// This looks across accounts, so only machine revocations count: ones
+    /// whose account had the key as a machine (a `daemons` row) when it
+    /// revoked it. That row comes only from a join, and a join for a key
+    /// control knows needs the key's proof, so the account held the key.
+    /// Any other revocation (a device row anyone can make with someone
+    /// else's public keys, through `enroll`) keeps it out of that account
+    /// only, which `Trust::evaluate` does.
+    pub fn revoked(&self, device: &str) -> anyhow::Result<Option<Revocation>> {
+        let c = self.c();
+        let mut q = c.prepare("SELECT body FROM revocations WHERE device = ?1 AND machine = 1")?;
+        let rows = q.query_map(params![device], |r| r.get::<_, String>(0))?;
+        let mut first: Option<Revocation> = None;
+        for r in rows {
+            let r: Revocation = serde_json::from_str(&r?)?;
+            if first.as_ref().is_none_or(|f| r.at < f.at) {
+                first = Some(r);
+            }
+        }
+        Ok(first)
+    }
+
     // ---- joins
 
+    /// Ask for a join code. A code is the machine's key's, so a second
+    /// request from the machine finds the first one's row (#329). Proven to
+    /// hold the key (or both unproven, as older daemons ask), it takes the
+    /// row over: the first requester's polls are told so, and an approval
+    /// already given stays, for this request to collect. Otherwise
+    /// [`Asked::Taken`].
     #[allow(clippy::too_many_arguments)]
     pub fn add_join(
         &self,
@@ -811,11 +903,51 @@ impl Db {
         features: &str,
         proven: bool,
         now: u64,
-    ) -> anyhow::Result<()> {
-        let c = self.c();
+    ) -> anyhow::Result<Asked> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
         // Old ones go first; a code can be asked for again.
-        c.execute("DELETE FROM joins WHERE created < ?1", params![now.saturating_sub(JOIN_TTL_MS)])?;
-        c.execute(
+        tx.execute("DELETE FROM joins WHERE created < ?1", params![now.saturating_sub(JOIN_TTL_MS)])?;
+        let had: Option<(String, Option<String>, bool, String)> = tx
+            .query_row(
+                "SELECT poll_hash, account, proven, replaced FROM joins WHERE code = ?1 AND rejected IS NULL",
+                params![code],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        if let Some((old, account, was_proven, replaced)) = had {
+            if !proven && (was_proven || account.is_some()) {
+                return Ok(Asked::Taken);
+            }
+            let replaced = format!("{replaced} {old}").trim().to_owned();
+            if account.is_some() {
+                // Approved: the approval (and the approver's team) stays.
+                tx.execute(
+                    "UPDATE joins SET poll_hash = ?2, replaced = ?3 WHERE code = ?1",
+                    params![code, poll_hash, replaced],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE joins SET cert = ?2, poll_hash = ?3, urls = ?4, created = ?5, team = ?6, sandbox = ?7,
+                     features = ?8, proven = ?9, replaced = ?10 WHERE code = ?1",
+                    params![
+                        code,
+                        serde_json::to_string(cert)?,
+                        poll_hash,
+                        serde_json::to_string(urls)?,
+                        now,
+                        team,
+                        sandbox,
+                        features,
+                        proven,
+                        replaced
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(Asked::Waiting);
+        }
+        tx.execute(
             "INSERT OR REPLACE INTO joins (code, cert, poll_hash, urls, created, account, team, sandbox, features, proven)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)",
             params![
@@ -830,7 +962,8 @@ impl Db {
                 proven
             ],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(Asked::Waiting)
     }
 
     pub fn join(&self, code: &str, now: u64) -> anyhow::Result<Option<Join>> {
@@ -838,7 +971,7 @@ impl Db {
             .c()
             .query_row(
                 "SELECT cert, poll_hash, urls, created, account, team, sandbox, team_sig, rejected,
-                 COALESCE(features, ''), proven FROM joins
+                 COALESCE(features, ''), proven, replaced FROM joins
                  WHERE code = ?1 AND created >= ?2",
                 params![code, now.saturating_sub(JOIN_TTL_MS)],
                 |r| {
@@ -854,6 +987,7 @@ impl Db {
                         rejected: r.get(8)?,
                         features: r.get(9)?,
                         proven: r.get(10)?,
+                        replaced: r.get(11)?,
                     })
                 },
             )
@@ -868,6 +1002,30 @@ impl Db {
             params![code, serde_json::to_string(cert)?, cert.account, team.map(|t| t.0), team.map(|t| t.1)],
         )?;
         Ok(())
+    }
+
+    /// The machine's join code a waiting device came to approve (#326), or
+    /// none: the device that approves it sees both together.
+    pub fn set_device_join(&self, account: &str, id: &str, code: Option<&str>) -> anyhow::Result<()> {
+        self.c().execute(
+            "UPDATE devices SET join_code = ?3 WHERE account = ?1 AND id = ?2 AND approved = 0",
+            params![account, id, code],
+        )?;
+        Ok(())
+    }
+
+    /// Waiting devices of an account with the join code each came to
+    /// approve, while that join is still open (not approved, turned down,
+    /// collected or expired): (device, code).
+    pub fn device_joins(&self, account: &str, now: u64) -> anyhow::Result<Vec<(String, String)>> {
+        let c = self.c();
+        let mut q = c.prepare(
+            "SELECT d.id, d.join_code FROM devices d JOIN joins j ON j.code = d.join_code
+             WHERE d.account = ?1 AND d.approved = 0 AND j.account IS NULL AND j.rejected IS NULL
+             AND j.created >= ?2",
+        )?;
+        let rows = q.query_map(params![account, now.saturating_sub(JOIN_TTL_MS)], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Turned down: the daemon learns it on its next poll.
@@ -931,6 +1089,7 @@ impl Db {
         c.execute("DELETE FROM daemon_access WHERE daemon = ?1", params![id])?;
         c.execute("DELETE FROM daemon_links WHERE daemon = ?1", params![id])?;
         c.execute("DELETE FROM daemon_offers WHERE daemon = ?1", params![id])?;
+        c.execute("DELETE FROM daemon_offer_pushes WHERE daemon = ?1", params![id])?;
         c.execute("DELETE FROM share_answers WHERE daemon = ?1", params![id])?;
         Ok(())
     }
@@ -969,6 +1128,18 @@ impl Db {
         }
         tx.commit()?;
         Ok(new)
+    }
+
+    /// Whether to push `account` of `daemon`'s offer (#232): once a day at
+    /// most, however often the daemon drops and makes it again.
+    pub fn push_offer(&self, daemon: &str, account: &str, now: u64) -> anyhow::Result<bool> {
+        const DAY: u64 = 24 * 3600 * 1000;
+        let n = self.c().execute(
+            "INSERT INTO daemon_offer_pushes (daemon, account, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (daemon, account) DO UPDATE SET at = excluded.at WHERE at <= excluded.at - ?4",
+            params![daemon, account, now, DAY],
+        )?;
+        Ok(n > 0)
     }
 
     /// Daemons offering to share with this account that it hasn't answered.
@@ -1709,6 +1880,7 @@ impl Db {
                 "DELETE FROM daemon_links WHERE daemon = ?1",
                 "DELETE FROM daemon_watches WHERE daemon = ?1",
                 "DELETE FROM daemon_offers WHERE daemon = ?1",
+                "DELETE FROM daemon_offer_pushes WHERE daemon = ?1",
                 "DELETE FROM share_answers WHERE daemon = ?1",
             ] {
                 tx.execute(sql, params![d])?;
@@ -1725,6 +1897,7 @@ impl Db {
             "DELETE FROM daemons WHERE account = ?1",
             "DELETE FROM daemon_access WHERE account = ?1",
             "DELETE FROM daemon_offers WHERE account = ?1",
+            "DELETE FROM daemon_offer_pushes WHERE account = ?1",
             "DELETE FROM share_answers WHERE account = ?1",
             "DELETE FROM push_subs WHERE account = ?1",
             "DELETE FROM notices WHERE account = ?1",

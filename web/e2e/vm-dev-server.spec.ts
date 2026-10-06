@@ -10,9 +10,12 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { devices, expect, test, type Frame, type Page } from "@playwright/test";
-import { menu, open, paneEl, text, type as typeIn } from "./helpers";
+import { menu, open, paneEl, text, type as typeIn, closeContexts } from "./helpers";
 import type { PaneId } from "../src/proto";
 import { ANY, blockPort, daemonPort } from "./ports";
+import { labs } from "./labs";
+
+test.afterAll(closeContexts);
 
 let BLOCKS = 0;
 let APP = "";
@@ -59,7 +62,7 @@ test.beforeAll(async () => {
   daemon = spawn(
     "../target/debug/illogicald",
     ["--listen", ANY, "--block-listen", ANY, "--shell", "bash --norc --noprofile"],
-    { stdio: "ignore", env: { ...process.env, ILLOGICAL_STATE_DIR: state, ILLOGICAL_WISP_URL: WISP } },
+    { stdio: "ignore", env: { ...process.env, ILLOGICAL_STATE_DIR: labs(state), ILLOGICAL_WISP_URL: WISP } },
   );
   APP = `http://127.0.0.1:${await daemonPort(state, daemon)}`;
   BLOCKS = await blockPort(state, daemon);

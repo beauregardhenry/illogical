@@ -60,6 +60,7 @@ pub fn socket_for(pane_dir: &Path) -> PathBuf {
         .as_encoded_bytes()
         .iter()
         .fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
+    // Frozen (#504): a restarted daemon finds running panes by it.
     std::env::temp_dir().join(format!("illogical-hold-{hash:016x}.sock"))
 }
 
@@ -243,12 +244,12 @@ fn watchdog(leases: &(Mutex<Leases>, Condvar), master: &OwnedFd, child: libc::pi
 /// it may be in a shared temp dir).
 fn same_user(conn: &UnixStream) -> bool {
     let me = nix::unistd::getuid().as_raw();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
         getsockopt(conn, PeerCredentials).is_ok_and(|c| c.uid() == me)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let (mut uid, mut gid) = (0, 0);
         // SAFETY: getpeereid writes two ids.

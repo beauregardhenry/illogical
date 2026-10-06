@@ -7,8 +7,11 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
-import { active, menu, open, paneEl, panes, ready, tab, tabsInSession, text, type } from "./helpers";
+import { active, menu, open, paneEl, panes, ready, tab, tabsInSession, text, type, closeContexts } from "./helpers";
 import { ANY, daemonPort } from "./ports";
+import { labs } from "./labs";
+
+test.afterAll(closeContexts);
 
 let base = "";
 let daemon: ChildProcess;
@@ -22,7 +25,7 @@ test.beforeAll(async () => {
   daemon = spawn(
     "../target/debug/illogicald",
     [
-      ...["--listen", ANY, "--state-dir", state],
+      ...["--listen", ANY, "--state-dir", labs(state)],
       ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/tailscaled.sock"],
     ],
     { stdio: "ignore", env: { ...process.env, PS1: "$ " } },

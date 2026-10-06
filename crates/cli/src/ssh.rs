@@ -6,10 +6,15 @@
 //! channel on it running `illogical bridge` on the box, which joins the
 //! channel to the daemon's Unix socket (S28, `spikes/s28-ssh`).
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+/// Windows: `--ssh` from Windows isn't there yet (#284); a stream
+/// type stands in until then.
+#[cfg(not(unix))]
+type UnixStream = std::net::TcpStream;
 use std::{
     fs,
     io::{self, BufRead, IsTerminal, Read, Write},
-    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -140,6 +145,12 @@ impl Remote {
     /// A new connection to the box's daemon: one end of a socket pair,
     /// with `ssh … illogical bridge` on the other (its stdin and stdout), so
     /// it has a real fd to poll like any other connection.
+    #[cfg(not(unix))]
+    pub fn channel(&self) -> anyhow::Result<UnixStream> {
+        bail!("--ssh from Windows isn't supported yet (#284): reach {} with --host or through control", self.dest)
+    }
+
+    #[cfg(unix)]
     pub fn channel(&self) -> anyhow::Result<UnixStream> {
         let (ours, theirs) = UnixStream::pair()?;
         // The master decides (see `master`); this matters only when the
@@ -375,6 +386,7 @@ fn forward_agent() -> bool {
     !std::env::var("ILLOGICAL_SSH_AGENT").is_ok_and(|v| v == "no")
 }
 
+#[cfg(unix)]
 /// Wait for a finished ssh in the background, so it doesn't linger as a
 /// zombie.
 fn reap(mut child: std::process::Child) {
@@ -526,7 +538,10 @@ fn cache_dir() -> PathBuf {
 /// it has to be short: the runtime dir, or the cache, or /tmp.
 fn control_dir() -> PathBuf {
     // Ours: owned by whoever owns $HOME.
+    #[cfg(unix)]
     let uid = fs::metadata(home()).map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(u32::MAX);
+    #[cfg(not(unix))]
+    let uid = 0;
     let candidates = [
         std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("illogical-ssh")),
         Some(cache_dir().join("ssh")),
@@ -537,10 +552,14 @@ fn control_dir() -> PathBuf {
             continue;
         }
         // Someone else's directory in /tmp isn't ours to put sockets in.
+        #[cfg(unix)]
         if fs::metadata(&dir).is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == uid) {
+            use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
             return dir;
         }
+        #[cfg(not(unix))]
+        return dir;
     }
     cache_dir().join("ssh")
 }
@@ -548,6 +567,22 @@ fn control_dir() -> PathBuf {
 /// `illogical bridge` (on the box, run by a client over ssh): join stdin and
 /// stdout to the daemon's socket until either side is done. With `probe`:
 /// say what's installed and whether the daemon answers, as one JSON line.
+#[cfg(unix)]
+fn connect_daemon(sock: &Path) -> io::Result<UnixStream> {
+    UnixStream::connect(sock)
+}
+
+/// Windows: the daemon's named pipe comes in M56 (#219).
+#[cfg(not(unix))]
+fn connect_daemon(_sock: &Path) -> io::Result<UnixStream> {
+    Err(io::Error::other("not on Windows yet (M56, #219)"))
+}
+
+/// Something answers at this socket path.
+fn listening(p: &Path) -> bool {
+    connect_daemon(p).is_ok()
+}
+
 pub fn bridge(sock: &Path, probe: bool) -> anyhow::Result<i32> {
     if probe {
         let daemon_version =
@@ -564,7 +599,7 @@ pub fn bridge(sock: &Path, probe: bool) -> anyhow::Result<i32> {
         println!("{v}");
         return Ok(0);
     }
-    let conn = match UnixStream::connect(sock) {
+    let conn = match connect_daemon(sock) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("illogical bridge: can't reach illogicald at {}: {e}", sock.display());
@@ -609,16 +644,19 @@ pub fn bridge(sock: &Path, probe: bool) -> anyhow::Result<i32> {
 /// #157); guests come through control and never run this.
 fn link_agent(sock: &Path) -> Option<(PathBuf, PathBuf)> {
     let agent = PathBuf::from(std::env::var_os("SSH_AUTH_SOCK")?);
-    if UnixStream::connect(&agent).is_err() {
+    if !listening(&agent) {
         return None;
     }
     let link = agent_link(sock);
-    if fs::read_link(&link).is_ok_and(|t| UnixStream::connect(&t).is_ok()) {
+    if fs::read_link(&link).is_ok_and(|t| listening(&t)) {
         return None;
     }
     let tmp = link.with_extension(format!("{}.tmp", std::process::id()));
     let _ = fs::remove_file(&tmp);
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&agent, &tmp).ok()?;
+    #[cfg(not(unix))]
+    std::os::windows::fs::symlink_file(&agent, &tmp).ok()?;
     fs::rename(&tmp, &link).ok()?;
     Some((link, agent))
 }

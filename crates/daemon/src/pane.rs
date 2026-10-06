@@ -10,11 +10,8 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::File,
-    io::{Read, Write},
-    os::fd::{AsRawFd, OwnedFd},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
@@ -22,13 +19,20 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use std::{
+    fs::File,
+    io::{Read, Write},
+    process::Child,
+};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
-use illogical_proto::{ClientId, Frame, FrameKind, PaneId, ServerMsg};
+use illogical_proto::{ClientId, Frame, FrameKind, PaneId, ServerMsg, api::HistoryKind};
 use illogical_vt::{
     GhosttyEngine, VtEngine,
     detect::{Agent, AgentState, Debounce},
 };
+#[cfg(unix)]
 use nix::{
     fcntl::{FcntlArg, FdFlag, fcntl},
     libc,
@@ -124,6 +128,9 @@ impl ClientRx {
 }
 
 /// What a client connection receives.
+// A `ServerMsg` carrying a whole `State` is a few hundred bytes; queues
+// hold a handful of these, so boxing every message isn't worth it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ToClient {
     Frame(Vec<u8>),
@@ -161,6 +168,9 @@ pub struct Subscriber {
     /// is an owner here through control (the account's own login, or a
     /// team box's owner by name).
     pub name: Option<String>,
+    /// The device it connected from, when that was through control with a
+    /// device key (M63: its huddle signatures are checked against this).
+    pub device: Option<illogical_e2e::Cert>,
 }
 
 /// What a pane tells the multiplexer.
@@ -306,16 +316,22 @@ enum Cmd {
     Input(Vec<u8>, Option<String>),
     /// Something someone did here that isn't typing (M29: an approval, a
     /// follow-up), for the pane's history.
-    Note(String, String),
+    Note(String, String, HistoryKind),
     Purge,
     Checkpoint(Sender<()>),
+    /// Text as a paste into this pane: bracketed if its program asked
+    /// (M70).
+    #[cfg_attr(windows, allow(dead_code))] // Uploads are Unix only, as serving is.
+    EncodePaste(String, Sender<Vec<u8>>),
     Capture {
         format: CaptureFormat,
         scope: CaptureScope,
         reply: Sender<String>,
     },
     /// Read this agent's state off the screen from now on (`None`: stop).
-    Agent(Option<&'static Agent>),
+    /// The second: an agent with rules that runs here but whose screen
+    /// isn't read (not configured on this machine, #145).
+    Agent(Option<&'static Agent>, Option<&'static Agent>),
     /// How the agent's screen reads now, rule by rule (`describe
     /// --detection`); `None` when no agent's screen is read.
     Detection(Sender<Option<Detection>>),
@@ -333,6 +349,10 @@ pub struct Detection {
     pub fired: Option<&'static str>,
     pub title: String,
     pub rules: Vec<DetectionRule>,
+    /// Its screen isn't read: chant's inventory doesn't list it here
+    /// (#145). No rules, then.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -412,8 +432,8 @@ impl PaneHandle {
     /// Record what `by` did here that isn't typing (an approval, a
     /// follow-up to its agent): in its history as theirs, and in `log
     /// --who` as them taking a turn.
-    pub fn note(&self, text: String, by: String) {
-        let _ = self.tx.send(Cmd::Note(text, by));
+    pub fn note(&self, text: String, by: String, kind: HistoryKind) {
+        let _ = self.tx.send(Cmd::Note(text, by, kind));
     }
     /// Let go of the session on the pane's machine without a word, before
     /// the machine is deleted (and `restart` follows).
@@ -425,9 +445,10 @@ impl PaneHandle {
     pub fn restart(&self, start: Start, note: &str) {
         let _ = self.tx.send(Cmd::Restart { start, note: note.into() });
     }
-    /// The agent the pane runs, whose screen to read (#145), or `None`.
-    pub fn watch_agent(&self, agent: Option<&'static Agent>) {
-        let _ = self.tx.send(Cmd::Agent(agent));
+    /// The agent the pane runs, whose screen to read (#145), or `None`;
+    /// `unread`, one it runs whose screen isn't read here.
+    pub fn watch_agent(&self, agent: Option<&'static Agent>, unread: Option<&'static Agent>) {
+        let _ = self.tx.send(Cmd::Agent(agent, unread));
     }
     /// How its agent's screen reads now, rule by rule; `None` when no
     /// agent's screen is read (or the pane didn't answer).
@@ -458,6 +479,14 @@ impl PaneHandle {
     pub fn capture(&self, format: CaptureFormat, scope: CaptureScope) -> Option<String> {
         let (tx, rx) = bounded(1);
         self.tx.send(Cmd::Capture { format, scope, reply: tx }).ok()?;
+        rx.recv_timeout(Duration::from_secs(5)).ok()
+    }
+    /// Text encoded as a paste for the program here now: bracketed if it
+    /// asked, with anything that could end the bracket made harmless (M70).
+    #[cfg_attr(windows, allow(dead_code))] // Uploads are Unix only, as serving is.
+    pub fn encode_paste(&self, text: String) -> Option<Vec<u8>> {
+        let (tx, rx) = bounded(1);
+        self.tx.send(Cmd::EncodePaste(text, tx)).ok()?;
         rx.recv_timeout(Duration::from_secs(5)).ok()
     }
     /// Note that input is about to be sent, before it's queued: a `wait`
@@ -513,9 +542,15 @@ impl PaneHandle {
 /// knew before. A restore (a new program) ends whatever was running.
 fn status_from(events: &[(u64, Event)]) -> (Option<CommandRec>, Option<CommandRec>, Option<String>) {
     let (mut current, mut last, mut dir) = (None::<CommandRec>, None, None);
+    let mut skip_end = false;
     for (at, e) in events {
         match e {
-            Event::Command { at_ms, text, cwd, by } => {
+            Event::Command { kind, .. } if !kind.is_command() => {
+                // A note (an answer, say) is no command: it's never the
+                // last, and it doesn't end the one that is running.
+                skip_end = true;
+            }
+            Event::Command { at_ms, text, cwd, by, .. } => {
                 current = Some(CommandRec {
                     text: text.clone(),
                     cwd: cwd.clone(),
@@ -525,6 +560,7 @@ fn status_from(events: &[(u64, Event)]) -> (Option<CommandRec>, Option<CommandRe
                     ..Default::default()
                 });
             }
+            Event::End { .. } if std::mem::take(&mut skip_end) => {}
             Event::End { at_ms, exit } => {
                 if let Some(mut rec) = current.take() {
                     (rec.end, rec.ended_ms, rec.exit) = (Some(*at), Some(*at_ms), *exit);
@@ -555,12 +591,25 @@ pub struct Spawn {
     pub env: Vec<(String, String)>,
 }
 
+/// A terminal (and the program on it) kept while the daemon restarted:
+/// its PTY master; on Windows, the pane host's pipes (`crate::host`).
+#[cfg(unix)]
+pub type Kept = std::os::fd::OwnedFd;
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct Kept {
+    pub pipe: String,
+}
+
+/// SIGKILL's number, for exits that report a signal on every system.
+const SIGKILL: i32 = 9;
+
 /// How a pane begins.
 pub enum Start {
     Now(Spawn),
     /// Take over a terminal (and the program on it) that outlived the
     /// previous daemon.
-    Adopt(OwnedFd),
+    Adopt(Kept),
     /// Reattach to a session on the pane's machine that outlived the
     /// previous daemon, having logged `received` bytes of it; if it's gone,
     /// start as `otherwise` says.
@@ -653,6 +702,9 @@ pub struct Launcher {
     /// No FD store, but keep panes anyway: each shim holds its terminal
     /// for the next daemon (`--keep-panes`, see [`crate::holder`]).
     pub hold: bool,
+    /// Windows: what pane hosts run (`crate::host::exe`).
+    #[cfg(windows)]
+    pub host: PathBuf,
 }
 
 impl Launcher {
@@ -674,9 +726,12 @@ impl Launcher {
             no_expand: version.flatten().is_some_and(|v| v >= 254),
             fd_store: systemd,
             hold: keep_panes && !systemd,
+            #[cfg(windows)]
+            host: std::env::current_exe().unwrap_or_else(|_| "illogicald.exe".into()),
         }
     }
 
+    #[cfg(unix)]
     /// A command that runs this executable (the shim) for a pane or an
     /// agent: in its own scope `unit` when there are scopes. Without the
     /// daemon's service environment, which isn't the program's.
@@ -708,6 +763,7 @@ fn fd_name(pane: PaneId) -> String {
 }
 
 /// A running process on its own PTY.
+#[cfg(unix)]
 struct Process {
     pid: u32,
     master: File,
@@ -716,6 +772,23 @@ struct Process {
     record: PathBuf,
 }
 
+/// A running process on its own pseudoconsole, which its pane host owns
+/// (Windows, M58: `crate::host`).
+#[cfg(windows)]
+struct Process {
+    pid: u32,
+    writer: Sender<Vec<u8>>,
+    /// Resizes and close, to the host.
+    ctl: Sender<HostCtl>,
+}
+
+#[cfg(windows)]
+enum HostCtl {
+    Resize(u16, u16),
+    Close,
+}
+
+#[cfg(unix)]
 impl Process {
     fn start(
         spawn: &Spawn,
@@ -734,19 +807,20 @@ impl Process {
         // Nor a stray copy of the slave beyond its stdio (the shim would
         // keep the terminal open after the program has gone).
         fcntl(&pty.slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
-        let stdio = |fd: &OwnedFd| fd.try_clone().map(Stdio::from);
+        let stdio = |fd: &std::os::fd::OwnedFd| fd.try_clone().map(Stdio::from);
 
         let cwd = if spawn.cwd.is_dir() { spawn.cwd.as_path() } else { Path::new("/") };
         let _ = std::fs::remove_file(record);
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        // Frozen (#504): scopes are read back from /proc/*/cgroup (`scope_of`).
         let mut cmd = launch.command(&format!("illogical-pane-{pane}-{nanos}"));
         cmd.arg("_shim").arg("--record").arg(record);
         let hold = launch.hold.then(|| crate::holder::socket_for(record.parent().unwrap_or(Path::new("."))));
         if let Some(socket) = &hold {
             cmd.arg("--hold").arg(socket);
             // The master goes to the shim as fd 3 (without close-on-exec).
+            use std::os::{fd::AsRawFd, unix::process::CommandExt};
             let master = pty.master.as_raw_fd();
-            use std::os::unix::process::CommandExt;
             // SAFETY: only dup2/fcntl between fork and exec.
             unsafe {
                 cmd.pre_exec(move || {
@@ -804,7 +878,7 @@ impl Process {
         }
         if launch.fd_store {
             crate::sys::remove_fd(&fd_name(pane));
-            if !crate::sys::store_fd(&fd_name(pane), master.as_raw_fd()) {
+            if !crate::sys::store_fd(&fd_name(pane), std::os::fd::AsRawFd::as_raw_fd(&master)) {
                 warn!(pane, "couldn't keep the terminal in the FD store");
             }
         }
@@ -813,7 +887,7 @@ impl Process {
 
     /// Take over a pane whose terminal and program outlived the previous
     /// daemon.
-    fn adopt(master: OwnedFd, record: &Path, pane: PaneId, events: Sender<Cmd>) -> std::io::Result<Self> {
+    fn adopt(master: Kept, record: &Path, pane: PaneId, events: Sender<Cmd>) -> std::io::Result<Self> {
         let r = crate::shim::read_record(record);
         let Some((pid, _)) = r.pid.filter(|_| crate::shim::alive(&r)) else {
             return Err(std::io::Error::other("the pane's program is gone"));
@@ -886,7 +960,7 @@ impl Process {
     fn resize(&self, cols: u16, rows: u16) {
         let ws = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: TIOCSWINSZ reads one Winsize from the pointer.
-        let rc = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+        let rc = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&self.master), libc::TIOCSWINSZ, &ws) };
         if rc < 0 {
             warn!(error = %std::io::Error::last_os_error(), "TIOCSWINSZ failed");
         }
@@ -905,6 +979,168 @@ impl Process {
             thread::sleep(Duration::from_secs(3));
             unsafe { libc::killpg(pgid, libc::SIGKILL) };
         });
+    }
+}
+
+/// Windows (M58): the program runs under its pane's host, which outlives
+/// this daemon; the daemon is the host's client, and a restarted one
+/// adopts it (`crate::host::collect`).
+#[cfg(windows)]
+impl Process {
+    fn start(
+        spawn: &Spawn,
+        launch: &Launcher,
+        record: &Path,
+        cols: u16,
+        rows: u16,
+        pane: PaneId,
+        events: Sender<Cmd>,
+    ) -> std::io::Result<Self> {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        let cwd = if spawn.cwd.is_dir() { spawn.cwd.clone() } else { crate::home() };
+        let pipe = crate::host::pipe_name(record);
+        let _ = std::fs::remove_file(record);
+        let mut cmd = Command::new(&launch.host);
+        cmd.arg("_host")
+            .arg("--record")
+            .arg(record)
+            .arg("--pipe")
+            .arg(&pipe)
+            .args(["--cols", &cols.to_string(), "--rows", &rows.to_string()])
+            .arg("--")
+            .arg(&spawn.program)
+            .args(&spawn.args)
+            .current_dir(&cwd)
+            .envs(spawn.env.iter().map(|(k, v)| (k, v)))
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env("ILLOGICAL_PANE", pane.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Out of this daemon's job, if it's in one (an ssh session, a
+        // service), so the pane outlives it.
+        let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        cmd.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB);
+        let mut host = match cmd.spawn() {
+            Ok(h) => h,
+            Err(_) => {
+                cmd.creation_flags(base);
+                cmd.spawn()?
+            }
+        };
+        // The host records the program's pid once it has started it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let pid = loop {
+            if let Some((p, _)) = crate::shim::read_record(record).pid {
+                break p;
+            }
+            if Instant::now() > deadline || host.try_wait().ok().flatten().is_some() {
+                let _ = host.kill();
+                return Err(std::io::Error::other(format!("the pane host didn't start {}", spawn.program)));
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        info!(pane, pid, program = %spawn.program, cwd = %cwd.display(), conpty = crate::conpty::which(), "started process");
+        Self::connect(&pipe, pid, pane, events)
+    }
+
+    /// Take over a pane whose host outlived the previous daemon.
+    fn adopt(kept: Kept, record: &Path, pane: PaneId, events: Sender<Cmd>) -> std::io::Result<Self> {
+        let r = crate::shim::read_record(record);
+        let Some((pid, _)) = r.pid else { return Err(std::io::Error::other("the pane's record has no program")) };
+        let p = Self::connect(&kept.pipe, pid, pane, events)?;
+        info!(pane, pid, "adopted process");
+        Ok(p)
+    }
+
+    /// Connect to the host's pipes: its output (and the program's exit) on
+    /// one, input, resizes and close on the other.
+    fn connect(pipe: &str, pid: u32, pane: PaneId, events: Sender<Cmd>) -> std::io::Result<Self> {
+        let open = |suffix: &str, write: bool| -> std::io::Result<std::fs::File> {
+            let name = format!("{pipe}-{suffix}");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match std::fs::OpenOptions::new().read(!write).write(write).open(&name) {
+                    Ok(f) => return Ok(f),
+                    // Not made yet, or still serving the last daemon.
+                    Err(e) if Instant::now() < deadline && matches!(e.raw_os_error(), Some(2 | 231)) => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+        let mut from_host = open("out", false)?;
+        let mut to_host = open("in", true)?;
+
+        let out = events.clone();
+        thread::Builder::new().name(format!("pane{pane}-read")).spawn(move || {
+            let mut code = None;
+            while let Ok((kind, p)) = crate::host::read_frame(&mut from_host) {
+                match kind {
+                    crate::host::DATA => {
+                        if out.send(Cmd::Output(p)).is_err() {
+                            return;
+                        }
+                    }
+                    crate::host::EXIT if p.len() == 4 => {
+                        code = Some(i32::from_le_bytes([p[0], p[1], p[2], p[3]]));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // Its exit, after all its output; or the host is gone (killed).
+            // A program its console closed under it (the session ending,
+            // a shutdown) ends with STATUS_CONTROL_C_EXIT: that's Unix's
+            // hangup, so the pane stays for its restore policy rather than
+            // closing as a shell's own `exit` does.
+            const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013Au32 as i32;
+            const SIGHUP: i32 = 1;
+            let (code, signal) = match code {
+                Some(STATUS_CONTROL_C_EXIT) => (Some(128 + SIGHUP), Some(SIGHUP)),
+                Some(c) => (Some(c), None),
+                None => (Some(128 + SIGKILL), Some(SIGKILL)),
+            };
+            let _ = out.send(Cmd::Exited { key: pid as u64, code, signal });
+        })?;
+
+        let (writer, inputs) = unbounded::<Vec<u8>>();
+        let (ctl, ctls) = unbounded::<HostCtl>();
+        thread::Builder::new().name(format!("pane{pane}-write")).spawn(move || {
+            loop {
+                let sent = crossbeam_channel::select! {
+                    recv(inputs) -> d => match d {
+                        Ok(d) => crate::host::write_frame(&mut to_host, crate::host::DATA, &d),
+                        Err(_) => return,
+                    },
+                    recv(ctls) -> c => match c {
+                        Ok(HostCtl::Resize(c, r)) => {
+                            let p = [c.to_le_bytes(), r.to_le_bytes()].concat();
+                            crate::host::write_frame(&mut to_host, crate::host::RESIZE, &p)
+                        }
+                        Ok(HostCtl::Close) => crate::host::write_frame(&mut to_host, crate::host::CLOSE, &[]),
+                        Err(_) => return,
+                    },
+                };
+                if sent.is_err() {
+                    return;
+                }
+            }
+        })?;
+        Ok(Self { pid, writer, ctl })
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        let _ = self.ctl.send(HostCtl::Resize(cols, rows));
+    }
+
+    fn hang_up(&self) {
+        let _ = self.ctl.send(HostCtl::Close);
     }
 }
 
@@ -946,12 +1182,14 @@ impl Backend {
 /// Keys for machine execs, above any pid.
 static NEXT_EXEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 32);
 
+#[cfg(unix)]
 /// How long a program's exit waits for its terminal to hang up (to read the
 /// last of its output first).
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(1);
 
 /// Wait for a process that may not be our child (a restarted daemon is no
 /// longer its parent), then read how it ended from the shim's record.
+#[cfg(unix)]
 fn wait_for_exit(pid: u32, record: &Path) -> (Option<i32>, Option<i32>) {
     if !crate::procinfo::wait_gone(pid) {
         // Can't be watched: poll until it's gone.
@@ -967,7 +1205,7 @@ fn wait_for_exit(pid: u32, record: &Path) -> (Option<i32>, Option<i32>) {
             None => thread::sleep(Duration::from_millis(10)),
         }
     }
-    (None, Some(libc::SIGKILL))
+    (None, Some(SIGKILL))
 }
 
 /// Recent output, addressed by absolute stream offset.
@@ -1060,6 +1298,8 @@ struct State {
     last_tick: Instant,
     /// The agent whose screen is read (#145).
     watch: Option<Watch>,
+    /// An agent with rules running here whose screen isn't read.
+    unread: Option<&'static Agent>,
 }
 
 /// Reading an agent's state off the pane's screen (#145).
@@ -1126,6 +1366,7 @@ pub fn spawn_pane(setup: Setup) -> std::io::Result<PaneHandle> {
             last_time_mark: Instant::now() - Duration::from_secs(60),
             last_tick: Instant::now(),
             watch: None,
+            unread: None,
         };
         let adopting = matches!(start, Start::Adopt(_) | Start::Resume { .. });
         if restore && !adopting {
@@ -1194,6 +1435,7 @@ fn restore_engine(log: &PaneLog, id: PaneId, cols: u16, rows: u16) -> GhosttyEng
 }
 
 /// Local time as HH:MM on a weekday, for the restored marker.
+#[cfg(unix)]
 fn local_time(ms: u64) -> String {
     let t = (ms / 1000) as libc::time_t;
     // SAFETY: localtime_r writes one tm; both pointers are valid.
@@ -1208,6 +1450,33 @@ fn local_time(ms: u64) -> String {
         tm.tm_mday,
         tm.tm_hour,
         tm.tm_min
+    )
+}
+
+#[cfg(windows)]
+fn local_time(ms: u64) -> String {
+    use windows_sys::Win32::{
+        Foundation::{FILETIME, SYSTEMTIME},
+        System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
+    };
+    // FILETIME counts 100 ns from 1601.
+    let t = (ms + 11_644_473_600_000) * 10_000;
+    let ft = FILETIME { dwLowDateTime: t as u32, dwHighDateTime: (t >> 32) as u32 };
+    // SAFETY: plain conversions between valid structs.
+    let (mut utc, mut tm): (SYSTEMTIME, SYSTEMTIME) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    unsafe {
+        FileTimeToSystemTime(&ft, &mut utc);
+        SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut tm);
+    }
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    format!(
+        "{} {:04}-{:02}-{:02} {:02}:{:02}",
+        DAYS[(tm.wDayOfWeek % 7) as usize],
+        tm.wYear,
+        tm.wMonth,
+        tm.wDay,
+        tm.wHour,
+        tm.wMinute
     )
 }
 
@@ -1263,7 +1532,7 @@ fn run(mut st: State, rx: Receiver<Cmd>, program: Receiver<Cmd>) {
                 }
                 st.input(data)
             }
-            Cmd::Note(text, by) => st.note(text, by),
+            Cmd::Note(text, by, kind) => st.note(text, by, kind),
             Cmd::Attach { sub, want } => st.attach(sub, want),
             Cmd::Ack { client, offset } => st.ack(client, offset),
             Cmd::Detach { client } => {
@@ -1273,7 +1542,10 @@ fn run(mut st: State, rx: Receiver<Cmd>, program: Receiver<Cmd>) {
             }
             Cmd::Resize { cols, rows } => st.resize(cols, rows),
             Cmd::Purge => st.purge(),
-            Cmd::Agent(agent) => st.watch_agent(agent),
+            Cmd::Agent(agent, unread) => {
+                st.watch_agent(agent);
+                st.unread = unread;
+            }
             Cmd::Detection(reply) => {
                 let _ = reply.send(st.detection());
             }
@@ -1283,6 +1555,9 @@ fn run(mut st: State, rx: Receiver<Cmd>, program: Receiver<Cmd>) {
             }
             Cmd::Capture { format, scope, reply } => {
                 let _ = reply.send(st.capture(format, scope));
+            }
+            Cmd::EncodePaste(text, reply) => {
+                let _ = reply.send(st.engine.encode_paste(&text));
             }
             Cmd::Close => {
                 st.closing = true;
@@ -1406,7 +1681,7 @@ impl State {
                 }
                 Err(e) => {
                     info!(pane = id, error = %e, "can't adopt; treating as ended");
-                    self.exited(None, Some(libc::SIGKILL));
+                    self.exited(None, Some(SIGKILL));
                 }
             },
             Start::Resume { session, received, otherwise } => {
@@ -1544,6 +1819,16 @@ impl State {
             return self.attach_exec(&host, Begin::New { spawn: spawn.clone(), image, create: !host.borrowed });
         }
         let (cols, rows) = self.engine.size();
+        // Windows: a pseudoconsole starts from what it takes for a blank
+        // screen and draws only what changes from there, so whatever the pane
+        // shows already (restored output, a finished command) goes up into
+        // scrollback first, and the two agree on the screen.
+        #[cfg(windows)]
+        if self.engine.content_rows() > 0 {
+            let leave_alt = if self.engine.alt_screen() { "\x1b[?1049l" } else { "" };
+            let up = format!("{leave_alt}\x1b[{rows};1H{}\x1b[H", "\r\n".repeat(rows as usize));
+            self.output(up.as_bytes());
+        }
         match Process::start(spawn, &self.launch, &self.record, cols, rows, self.id, self.program.clone()) {
             Ok(p) => {
                 self.pid.store(p.pid, Ordering::Relaxed);
@@ -1606,11 +1891,11 @@ impl State {
     }
 
     /// What someone did here, as a finished entry in its history.
-    fn note(&mut self, text: String, by: String) {
+    fn note(&mut self, text: String, by: String, kind: HistoryKind) {
         self.typed_by(by.clone());
         let at = self.ring.end();
         let cwd = self.status.lock().unwrap().cwd.clone();
-        self.index(at, Event::Command { at_ms: now_ms(), text: Some(text), cwd, by: Some(by) });
+        self.index(at, Event::Command { at_ms: now_ms(), text: Some(text), cwd, by: Some(by), kind });
         self.index(at, Event::End { at_ms: now_ms(), exit: Some(0) });
     }
 
@@ -1777,6 +2062,17 @@ impl State {
     }
 
     fn detection(&self) -> Option<Detection> {
+        if let (None, Some(a)) = (&self.watch, self.unread) {
+            return Some(Detection {
+                agent: a.id,
+                name: a.name,
+                shown: None,
+                fired: None,
+                title: self.engine.title(),
+                rules: vec![],
+                unread: true,
+            });
+        }
         let w = self.watch.as_ref()?;
         let (title, lines) = (self.engine.title(), self.engine.screen_lines());
         let rules = w.agent.explain(&title, &lines);
@@ -1797,6 +2093,7 @@ impl State {
                     matched: r.matched,
                 })
                 .collect(),
+            unread: false,
         })
     }
 
@@ -1859,7 +2156,16 @@ impl State {
                 let text = self.pending_text.take();
                 let cwd = self.status.lock().unwrap().cwd.clone();
                 let by = self.typed_by.clone();
-                self.index(at, Event::Command { at_ms: ms, text: text.clone(), cwd: cwd.clone(), by: by.clone() });
+                self.index(
+                    at,
+                    Event::Command {
+                        at_ms: ms,
+                        text: text.clone(),
+                        cwd: cwd.clone(),
+                        by: by.clone(),
+                        kind: HistoryKind::Command,
+                    },
+                );
                 let rec = CommandRec { text, cwd, start: at, started_ms: ms, by, ..Default::default() };
                 let mut st = self.status.lock().unwrap();
                 st.current = Some(rec);
@@ -2148,7 +2454,13 @@ mod tests {
 
     #[test]
     fn an_adopted_panes_status_comes_from_its_index() {
-        let cmd = |at_ms, text: &str| Event::Command { at_ms, text: Some(text.into()), cwd: None, by: None };
+        let cmd = |at_ms, text: &str| Event::Command {
+            at_ms,
+            text: Some(text.into()),
+            cwd: None,
+            by: None,
+            kind: HistoryKind::Command,
+        };
         let events = vec![
             (0, Event::Cwd { path: "/src".into() }),
             (10, cmd(1, "make")),
@@ -2165,6 +2477,42 @@ mod tests {
         let mut restored = events.clone();
         restored.push((40, Event::Restore { at_ms: 4 }));
         assert!(status_from(&restored).0.is_none());
+    }
+
+    #[test]
+    fn an_answer_is_never_a_panes_last_command_nor_ends_the_running_one() {
+        let note = |at_ms, text: &str| Event::Command {
+            at_ms,
+            text: Some(text.into()),
+            cwd: None,
+            by: Some("sam".into()),
+            kind: HistoryKind::Answer,
+        };
+        let cmd = |at_ms, text: &str| Event::Command {
+            at_ms,
+            text: Some(text.into()),
+            cwd: None,
+            by: None,
+            kind: HistoryKind::Command,
+        };
+        let events = vec![
+            (10, cmd(1, "make")),
+            (20, Event::End { at_ms: 2, exit: Some(0) }),
+            (30, note(3, "allowed: Bash: touch a")),
+            (30, Event::End { at_ms: 3, exit: Some(0) }),
+        ];
+        let (current, last, _) = status_from(&events);
+        assert!(current.is_none());
+        assert_eq!(last.unwrap().text.as_deref(), Some("make"), "the answer isn't the last command");
+        // Answered while a command runs: it still runs.
+        let events = vec![
+            (10, cmd(1, "claude")),
+            (30, note(3, "allowed: Bash: touch a")),
+            (30, Event::End { at_ms: 3, exit: Some(0) }),
+        ];
+        let (current, last, _) = status_from(&events);
+        assert_eq!(current.unwrap().text.as_deref(), Some("claude"));
+        assert!(last.is_none());
     }
 
     #[test]

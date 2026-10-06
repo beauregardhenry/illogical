@@ -7,9 +7,14 @@ session/resume work from a new process.
 Prompts:
   hello          a reply, a usage_update (cost grows by 0.01 per turn)
   run CMD        a tool call that asks permission, then "prints" its output
+  read PATH      a Read tool call with no command that fails (not a shell command)
   slow           streams for ~10s unless cancelled
   remember WORD  remembers WORD; "recall" says it (across processes)
   crash          exits with code 3 mid-turn
+  env NAME       says NAME from its environment ("ENV NAME=value", or
+                 "ENV NAME unset"), #379
+  expired        fails the turn as claude-agent-acp does on a stale login:
+                 authRequired (-32000), #379
   ask [one|two|preview]
                  AskUserQuestion as claude-agent-acp 0.81.2 sends it (S13):
                  a tool call, then elicitation/create with question_<n>
@@ -28,6 +33,11 @@ Prompts:
   model          says the model set_config_option chose
   mode           says the permission mode session/set_mode chose (it knows
                  claude-agent-acp's: default, acceptEdits, plan, auto)
+  look           says what came with the prompt (M71): its images' types,
+                 and any other text blocks (an image's path, to an agent
+                 that takes no images); the prompt's blocks are in
+                 $FAKE_ACP_DIR/prompt-<session>.json. Run with --images, it
+                 says it takes images (promptCapabilities.image).
   mcp TOOL JSON  calls TOOL on the session's `illogical` MCP server (an http
                  one, as illogical passes local agents, M16; or a stdio one,
                  as it passes agents in a VM, #59) with JSON as its
@@ -366,13 +376,20 @@ def mcp_call_stdio(srv, tool, args):
 def prompt(mid, p):
     sid = p["sessionId"]
     s = load(sid)
-    text = "".join(c.get("text", "") for c in p.get("prompt", []))
+    blocks = p.get("prompt", [])
+    with open(os.path.join(DIR, f"prompt-{sid}.json"), "w") as f:
+        json.dump(blocks, f)
+    text = "".join(c.get("text", "") for c in blocks)
     update(sid, s, {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": text}})
     n = len(s["updates"])
     msg = lambda t: update(sid, s, {"sessionUpdate": "agent_message_chunk", "messageId": f"m{n}",
                                    "content": {"type": "text", "text": t}})
     stop = "end_turn"
-    if text.startswith("run "):
+    if text.startswith("look"):
+        images = [c.get("mimeType") for c in blocks if c.get("type") == "image"]
+        others = [c.get("text", "") for c in blocks[1:] if c.get("type") == "text"]
+        msg(f"Saw {len(images)} image(s) {images}; text {others}")
+    elif text.startswith("run "):
         cmd = text[4:]
         tid = f"tool{n}"
         update(sid, s, {"sessionUpdate": "tool_call", "toolCallId": tid, "title": "Terminal", "kind": "execute",
@@ -396,6 +413,12 @@ def prompt(mid, p):
             update(sid, s, {"sessionUpdate": "tool_call_update", "toolCallId": tid, "status": "failed",
                             "rawOutput": "User refused permission to run tool"})
             msg("Not allowed.")
+    elif text.startswith("read "):
+        tid = f"tool{n}"
+        update(sid, s, {"sessionUpdate": "tool_call", "toolCallId": tid, "title": f"Read {text[5:]}",
+                        "kind": "read", "status": "pending"})
+        update(sid, s, {"sessionUpdate": "tool_call_update", "toolCallId": tid, "status": "failed"})
+        msg("Couldn't read it.")
     elif text == "slow":
         for i in range(50):
             if sid in cancelled:
@@ -470,6 +493,14 @@ def prompt(mid, p):
     elif text == "crash":
         msg("bye")
         os._exit(3)
+    elif text.startswith("env "):
+        name = text[4:]
+        msg(f"ENV {name}={os.environ[name]}" if name in os.environ else f"ENV {name} unset")
+    elif text == "expired":
+        msg("Failed to authenticate: OAuth session expired and could not be refreshed")
+        save(sid, s)
+        send({"id": mid, "error": {"code": -32000, "message": "Authentication required"}})
+        return
     else:
         msg("Hello! I am fake.")
     if stop != "cancelled":
@@ -493,6 +524,8 @@ def handle(m):
         # load or resume a session (M45b's Follow refuses it).
         no_load = "--agent" in sys.argv[:-1] and sys.argv[sys.argv.index("--agent") + 1] == "no-load-session"
         agent_caps = {"mcpCapabilities": {"http": True}}
+        if "--images" in sys.argv:
+            agent_caps["promptCapabilities"] = {"image": True}
         if not no_load:
             agent_caps.update({"loadSession": True, "sessionCapabilities": {"resume": {}, "fork": {}}})
         send({"id": mid, "result": {"protocolVersion": 1, "agentCapabilities": agent_caps,

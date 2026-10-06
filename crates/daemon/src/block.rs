@@ -23,7 +23,6 @@
 
 use std::{
     collections::HashMap,
-    os::fd::OwnedFd,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -33,7 +32,7 @@ use illogical_proto::{Attention, BlockType, PaneId, Policy};
 use serde_json::Value;
 
 use crate::{
-    pane::{Launcher, Notice, NoticeSink, What},
+    pane::{Kept, Launcher, Notice, NoticeSink, What},
     provider::Provider,
     store::PaneLog,
 };
@@ -160,6 +159,8 @@ pub struct BlockEnv {
     pub ids: PaneIds,
     /// Standing permission rules (#166).
     pub rules: Arc<crate::rules::Rules>,
+    /// What runs an invite the owner sent from its card (#234).
+    pub invite: crate::invite::Hook,
 }
 
 /// The ids of the daemon's panes and blocks, as the multiplexer keeps them.
@@ -186,7 +187,7 @@ pub struct BlockCtx {
     pub home: PathBuf,
     /// Descriptors systemd kept for it across a restart, by name; take what
     /// you use.
-    pub kept: Arc<Mutex<HashMap<String, OwnedFd>>>,
+    pub kept: Arc<Mutex<HashMap<String, Kept>>>,
     pub secrets: Secrets,
     pub mcp: Option<crate::mcp::Link>,
     pub fs: Arc<crate::fs::Scope>,
@@ -195,6 +196,7 @@ pub struct BlockCtx {
     ids: PaneIds,
     /// Standing permission rules (#166).
     pub rules: Arc<crate::rules::Rules>,
+    pub invite: crate::invite::Hook,
 }
 
 impl BlockCtx {
@@ -205,7 +207,7 @@ impl BlockCtx {
         sprite: Option<String>,
         restoring: bool,
         policy: Policy,
-        kept: HashMap<String, OwnedFd>,
+        kept: HashMap<String, Kept>,
     ) -> Self {
         Self {
             id,
@@ -227,6 +229,7 @@ impl BlockCtx {
             cmds: base.cmds,
             ids: base.ids,
             rules: base.rules,
+            invite: base.invite,
         }
     }
 
@@ -364,6 +367,8 @@ pub fn create(kind: BlockType, ctx: BlockCtx, config: Value) -> Result<Arc<dyn B
         BlockType::App => crate::apps::AppBlock::create(ctx, config),
         BlockType::Forge => crate::forge::ForgeBlock::create(ctx, config),
         BlockType::Fountain => crate::fountain::FountainBlock::create(ctx, config),
+        BlockType::Invite => crate::invite::card::InviteBlock::create(ctx, config),
+        BlockType::Unknown => Err("a block type this build doesn't know".into()),
     }
 }
 

@@ -49,6 +49,7 @@
 
 pub mod adapters;
 pub mod defs;
+pub mod images;
 mod link;
 pub mod transcript;
 
@@ -62,6 +63,7 @@ use std::{
 use futures_util::future::BoxFuture;
 use illogical_proto::{
     Attention, BlockType, Policy,
+    api::HistoryKind,
     ask::{self, Ask, AskKind},
 };
 use serde::{Deserialize, Serialize};
@@ -224,6 +226,25 @@ pub struct TurnStat {
     cost_base: Option<f64>,
 }
 
+/// A prompt waiting for the agent: its text, and images (M71) by name in
+/// the block's folder.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Queued {
+    pub text: String,
+    pub images: Vec<String>,
+}
+
+impl Queued {
+    /// What the block shows of it while it waits.
+    fn label(&self) -> String {
+        match self.images.len() {
+            0 => self.text.clone(),
+            1 => format!("{} [image]", self.text).trim_start().to_owned(),
+            n => format!("{} [{n} images]", self.text).trim_start().to_owned(),
+        }
+    }
+}
+
 /// Why we sent a request, for when its answer comes.
 #[derive(Debug, Clone, PartialEq)]
 enum Purpose {
@@ -263,7 +284,7 @@ enum Effect {
     /// Fountain: a turn may still be running remotely.
     CheckRemote,
     /// The agent said to try the prompt again shortly.
-    Retry(String),
+    Retry(Queued),
 }
 
 struct Inner {
@@ -282,7 +303,7 @@ struct Inner {
     caps: Value,
     title: Option<String>,
     prompt_id: Option<u64>,
-    queue: VecDeque<String>,
+    queue: VecDeque<Queued>,
     cost: Option<f64>,
     currency: Option<String>,
     turns: Vec<TurnStat>,
@@ -324,6 +345,9 @@ struct Inner {
     /// #128: illogical's own MCP token, when it goes by reference (a local
     /// Claude Code), to keep out of logs too.
     token: Option<String>,
+    /// #379: which login its Claude Code uses and how to log in to it,
+    /// said when a turn fails on authentication.
+    login: Option<String>,
 }
 
 enum Msg {
@@ -390,6 +414,7 @@ impl Inner {
             wearing: false,
             awaiting_shell: false,
             token: None,
+            login: None,
         }
     }
 
@@ -411,8 +436,8 @@ impl Inner {
     /// Queue a prompt for the agent. It's in the log, so a prompt queued
     /// while the agent is down survives a daemon restart; sending it takes
     /// it off (see `session/prompt` in `on_out`).
-    fn enqueue(&mut self, text: &str, front: bool) {
-        self.note(json!({ "e": "queue", "text": text, "front": front }));
+    fn enqueue(&mut self, q: &Queued, front: bool) {
+        self.note(json!({ "e": "queue", "text": q.text, "images": q.images, "front": front }));
     }
 
     /// The MCP servers a session gets: the block's own, and illogical's
@@ -476,7 +501,7 @@ impl Inner {
     /// Send a frame: log it, account for it, then write it.
     fn out(&mut self, frame: Value) {
         let secrets = self.secrets();
-        self.write_log("out", &redacted(&frame, &secrets));
+        self.write_log("out", &without_images(&redacted(&frame, &secrets)));
         self.on_out(&frame, now_ms());
         if let Some(link) = &self.link {
             link.send(frame.to_string().into_bytes());
@@ -502,13 +527,15 @@ impl Inner {
     fn on_note(&mut self, e: &Value, at: u64) {
         match e["e"].as_str().unwrap_or("") {
             "queue" => {
-                let text = e["text"].as_str().unwrap_or_default().to_owned();
+                let q =
+                    Queued { text: e["text"].as_str().unwrap_or_default().to_owned(), images: strings(&e["images"]) };
                 match e["front"].as_bool() {
-                    Some(true) => self.queue.push_front(text),
-                    _ => self.queue.push_back(text),
+                    Some(true) => self.queue.push_front(q),
+                    _ => self.queue.push_back(q),
                 }
             }
             "queue_clear" => self.queue.clear(),
+            "login" => self.login = e["login"].as_str().map(str::to_owned),
             "spawn" => {
                 // A new server: nothing outstanding carries over.
                 if self.prompt_id.is_some() || !self.pending.is_empty() || !self.asks.is_empty() {
@@ -646,17 +673,22 @@ impl Inner {
                     "session/set_config_option" => Purpose::SetModel,
                     "session/set_mode" => Purpose::SetMode(m["params"]["modeId"].as_str().unwrap_or("").to_owned()),
                     "session/prompt" => {
-                        let text: String = m["params"]["prompt"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
+                        // An image (or, to an agent that takes none, its
+                        // path) is named in its block's `_meta` (M71).
+                        let blocks = m["params"]["prompt"].as_array().map(Vec::as_slice).unwrap_or_default();
+                        let image = |c: &Value| c["_meta"][images::META].as_str().map(str::to_owned);
+                        let text: String = blocks
+                            .iter()
+                            .filter(|c| image(c).is_none())
                             .filter_map(|c| c["text"].as_str())
                             .collect::<Vec<_>>()
                             .join("\n");
-                        if self.queue.front() == Some(&text) {
+                        let sent = Queued { text, images: blocks.iter().filter_map(image).collect() };
+                        if self.queue.front() == Some(&sent) {
                             self.queue.pop_front();
                         }
-                        self.t.user(&text, at);
+                        let Queued { text, images } = sent;
+                        self.t.user(&text, images, at);
                         self.prompt_id = Some(id);
                         self.status = Status::Working;
                         self.error = None;
@@ -703,6 +735,11 @@ impl Inner {
             (Some(id), None) => {
                 let Some(purpose) = id.as_u64().and_then(|id| self.ours.remove(&id)) else { return fx };
                 let error = m.get("error").map(|e| e["message"].as_str().unwrap_or("error").to_owned());
+                // #379: say whose login failed, and how to log in to it.
+                let login = match (m.get("error"), &self.login) {
+                    (Some(e), Some(l)) if auth_failed(e) => format!(". {l} Then send the prompt again."),
+                    _ => String::new(),
+                };
                 let r = &m["result"];
                 match (purpose, error) {
                     (Purpose::Init, None) => {
@@ -753,9 +790,9 @@ impl Inner {
                         self.prompt_id = None;
                         self.status = Status::Ready;
                         self.turns.pop();
-                        if let Some(Entry::User { text, .. }) = self.t.entries.last().cloned() {
+                        if let Some(Entry::User { text, images, .. }) = self.t.entries.last().cloned() {
                             self.t.entries.pop();
-                            fx.push(Effect::Retry(text));
+                            fx.push(Effect::Retry(Queued { text, images }));
                         }
                     }
                     (Purpose::Prompt, result) => {
@@ -775,8 +812,8 @@ impl Inner {
                             }
                         }
                         if let Some(e) = result {
-                            self.t.note(format!("The turn failed: {e}"), at);
-                            self.error = Some(e);
+                            self.t.note(format!("The turn failed: {e}{login}"), at);
+                            self.error = Some(format!("{e}{login}"));
                         }
                         self.last_stop = Some(stop);
                         // Requests the turn left open are moot.
@@ -789,8 +826,8 @@ impl Inner {
                         self.error = Some(format!("permission mode {mode}: {e}"));
                     }
                     (Purpose::Init | Purpose::New, Some(e)) => {
-                        self.t.note(format!("The agent couldn't start a session: {e}"), at);
-                        self.error = Some(e);
+                        self.t.note(format!("The agent couldn't start a session: {e}{login}"), at);
+                        self.error = Some(format!("{e}{login}"));
                     }
                     (_, Some(e)) => warn!(error = e, "agent request failed"),
                     _ => {}
@@ -1027,7 +1064,7 @@ impl Inner {
             "current_tool": self.t.current_tool().map(|t| json!({ "id": t.id, "title": t.title, "kind": t.kind })),
             "pending": self.pending,
             "asks": self.asks.iter().map(|a| &a.ask).collect::<Vec<_>>(),
-            "queued": self.queue,
+            "queued": self.queue.iter().map(Queued::label).collect::<Vec<_>>(),
             "cost": self.cost.map(|c| json!({ "total": c, "currency": self.currency, "last_turn": self.turns.last().and_then(|t| t.cost) })),
             "tokens": { "total": total_tokens, "last_turn": self.turns.last().and_then(|t| t.tokens.clone()) },
             "turns": self.turns.len(),
@@ -1072,7 +1109,9 @@ impl Agent {
                 *m = json!({ "name": name, "command": command, "args": argv, "env": [] });
             }
         }
-        let cfg: Config = serde_json::from_value(config).map_err(|e| format!("agent config: {e}"))?;
+        let mut cfg: Config = serde_json::from_value(config).map_err(|e| format!("agent config: {e}"))?;
+        // #379: "" is the CLI saying it has none (the default login).
+        cfg.def.claude_config_dir = cfg.def.claude_config_dir.take().filter(|d| !d.trim().is_empty());
         cfg.def.check()?;
         let vm = ctx.sprite.is_some();
         if vm && ctx.provider.is_none() {
@@ -1117,7 +1156,7 @@ impl Agent {
     fn begin(&self) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(p) = inner.cfg.prompt.take() {
-            inner.enqueue(&p, false);
+            inner.enqueue(&Queued { text: p, images: vec![] }, false);
         }
         if inner.cfg.import.is_some() {
             if let Some(t) = inner.cfg.import.as_ref().and_then(|i| i.title.clone()) {
@@ -1336,6 +1375,9 @@ impl Agent {
                     }
                 }
                 with_node_on_path(&mut env, &self.ctx.home);
+                if says_login(&inner.cfg.def) {
+                    inner.note(json!({ "e": "login", "login": local_login(&env, &launch.remove) }));
+                }
                 let spawn = link::LocalSpawn {
                     id: self.ctx.id,
                     dir: &self.ctx.dir,
@@ -1365,6 +1407,9 @@ impl Agent {
                     _ => vec![],
                 };
                 secret.extend(launch.env.iter().cloned());
+                if inner.cfg.def.agent == Kind::Claude {
+                    inner.note(json!({ "e": "login", "login": vm_login(&self.ctx) }));
+                }
                 let begin = link::VmBegin::New {
                     npm: launch.npm.map(str::to_owned),
                     cwd: inner.cfg.cwd.clone().unwrap_or_else(|| "/home/sprite".into()),
@@ -1483,6 +1528,68 @@ impl Agent {
     }
 }
 
+/// #379: whether a block's failed authentication says which login it was:
+/// Claude Code's, and an ACP command that runs its adapter by hand.
+fn says_login(def: &Def) -> bool {
+    def.agent == Kind::Claude
+        || (def.agent == Kind::Acp
+            && def.command.iter().any(|w| w.rsplit('/').next().is_some_and(|n| n.starts_with("claude"))))
+}
+
+/// #379: the login a local adapter uses: what it's given over the daemon's
+/// own environment, less what's taken out.
+fn local_login(env: &[(String, String)], remove: &[String]) -> String {
+    const KEYS: [&str; 4] =
+        [defs::CLAUDE_CONFIG_DIR, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+    let mut seen: Vec<(String, String)> = KEYS
+        .iter()
+        .filter(|k| !remove.iter().any(|r| r == *k))
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect();
+    seen.extend(env.iter().filter(|(k, _)| KEYS.contains(&k.as_str())).cloned());
+    defs::login_hint(&seen)
+}
+
+/// #379: the login an agent in a VM uses (see [`secret_env`]).
+fn vm_login(ctx: &BlockCtx) -> String {
+    let has = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.len() > 0);
+    if has(&ctx.secrets.anthropic_key) {
+        format!("It used the API key in {}: put a working one there.", ctx.secrets.anthropic_key.display())
+    } else {
+        format!(
+            "It used the token in {}: put a fresh one from `claude setup-token` there.",
+            ctx.secrets.claude_token.display()
+        )
+    }
+}
+
+/// #379: an ACP error that is about logging in: `authRequired` (-32000),
+/// or a message that says so.
+fn auth_failed(e: &Value) -> bool {
+    let m = e["message"].as_str().unwrap_or_default().to_lowercase();
+    e["code"].as_i64() == Some(-32000)
+        || ["authenticat", "/login", "oauth", "not logged in", "invalid api key"].iter().any(|w| m.contains(w))
+}
+
+/// How to get a block whose adapter is missing going (#335), for its text
+/// (`tail`, `capture`, the TUI): the page has *Install* for it.
+fn adapter_fix(adapter: &Value, block: illogical_proto::PaneId) -> Option<String> {
+    let kind = adapter["kind"].as_str()?;
+    let npm = adapter["npm"].as_str().unwrap_or_default();
+    Some(match adapter["state"].as_str()? {
+        "no_node" => format!(
+            "**To start it:** install Node {}+ (`mise use -g node@22`, or nodejs.org), then `illogical setup {kind}` \
+             (or `{npm}`), then `illogical call %{block} resume`.\n\n",
+            adapter["node_major"].as_u64().unwrap_or(adapters::NODE_MAJOR as u64)
+        ),
+        "missing" => format!(
+            "**To start it:** `illogical setup {kind}` installs the adapter (or `{npm}`), then \
+             `illogical call %{block} resume`.\n\n"
+        ),
+        _ => return None,
+    })
+}
+
 /// The credentials an agent in a VM gets in its environment: an Anthropic
 /// API key if there's one, else a Claude Code token.
 fn secret_env(ctx: &BlockCtx) -> Result<Vec<(String, String)>, String> {
@@ -1587,12 +1694,12 @@ async fn run(
                         _ => {}
                     }
                     for f in fx.drain(..) {
-                        if let Effect::Retry(text) = &f {
+                        if let Effect::Retry(q) = &f {
                             retries += 1;
                             if retries > MAX_RETRIES {
                                 g.note(json!({ "e": "error", "message": "The agent kept asking to retry; send it again later" }));
                             } else {
-                                g.enqueue(text, true);
+                                g.enqueue(q, true);
                                 retry_at = Some(tokio::time::Instant::now() + RETRY_AFTER);
                             }
                             continue;
@@ -1693,6 +1800,12 @@ fn refresh_import(ctx: &BlockCtx, g: &mut Inner) -> bool {
         // Only what was appended since (#80); a held change rereads none.
         if let Ok(new) = g.follow.read(Path::new(&imp.path)) {
             if new || g.import_stamp.is_none() {
+                // Its prompts' images, kept for clients to show (M71).
+                for bytes in g.follow.take_images() {
+                    if let Err(e) = images::keep(&ctx.dir, &bytes) {
+                        warn!(block = ctx.id, error = %e, "can't keep an imported image");
+                    }
+                }
                 g.t = Transcript::from_entries(g.follow.entries(g.held.is_none()));
                 changed = true;
             }
@@ -1807,16 +1920,18 @@ fn act(ctx: &BlockCtx, g: &mut Inner, f: Effect) {
             send_next(ctx, g);
         }
         Effect::TurnEnded => {
-            // In history as a command of its own: the prompt, and whether
-            // the turn finished.
+            // In history as an entry of its own: the prompt. Not a command
+            // and no exit code: a turn that stopped early isn't a failure of
+            // anything that ran.
             if let Some(t) = g.turns.last().cloned() {
                 let cwd = g.cfg.cwd.clone();
                 let label = format!("{}: {}", g.cfg.def.label(), t.prompt.lines().next().unwrap_or(""));
                 if let Some(log) = g.log.as_mut() {
                     let at = log.end();
-                    let exit = Some(if t.stop.as_deref() == Some("end_turn") { 0 } else { 1 });
-                    let _ = log.record(at, Event::Command { at_ms: t.started_ms, text: Some(label), cwd, by: None });
-                    let _ = log.record(at, Event::End { at_ms: t.ended_ms.unwrap_or(t.started_ms), exit });
+                    let kind = HistoryKind::Agent;
+                    let _ =
+                        log.record(at, Event::Command { at_ms: t.started_ms, text: Some(label), cwd, by: None, kind });
+                    let _ = log.record(at, Event::End { at_ms: t.ended_ms.unwrap_or(t.started_ms), exit: None });
                 }
             }
             send_next(ctx, g)
@@ -1857,8 +1972,15 @@ fn act(ctx: &BlockCtx, g: &mut Inner, f: Effect) {
             let cwd = g.cfg.cwd.clone();
             if let Some(log) = g.log.as_mut() {
                 let at = log.end();
-                let exit = t.exit.or(Some(if t.status == "completed" { 0 } else { 1 }));
-                let _ = log.record(at, Event::Command { at_ms: t.started_ms, text: Some(t.label()), cwd, by: None });
+                // A shell command has its own exit code (none when it was
+                // stopped); a Read, an Edit or a Monitor isn't one, and a
+                // failed call isn't a failed command.
+                let (kind, exit) = match &t.command {
+                    Some(_) => (HistoryKind::Command, t.exit.or((t.status == "completed").then_some(0))),
+                    None => (HistoryKind::Agent, None),
+                };
+                let _ =
+                    log.record(at, Event::Command { at_ms: t.started_ms, text: Some(t.label()), cwd, by: None, kind });
                 let _ = log.record(at, Event::End { at_ms: t.ended_ms.unwrap_or(t.started_ms), exit });
             }
         }
@@ -1869,6 +1991,23 @@ fn act(ctx: &BlockCtx, g: &mut Inner, f: Effect) {
 /// A frame as the log keeps it: without illogical's MCP token (M16), and
 /// (M44) without a worn Fountain agent's secrets: its servers' headers and
 /// env, and any of `secrets` anywhere else.
+/// A prompt as the log keeps it: an image we kept (M71) by its name in the
+/// block's folder, not its data.
+fn without_images<'a>(frame: &'a Value) -> std::borrow::Cow<'a, Value> {
+    use std::borrow::Cow;
+    let kept = |c: &Value| c["_meta"][images::META].is_string() && c.get("data").is_some();
+    if !frame["params"]["prompt"].as_array().is_some_and(|p| p.iter().any(kept)) {
+        return Cow::Borrowed(frame);
+    }
+    let mut f = frame.clone();
+    for c in f["params"]["prompt"].as_array_mut().into_iter().flatten().filter(|c| kept(c)) {
+        if let Some(o) = c.as_object_mut() {
+            o.remove("data");
+        }
+    }
+    Cow::Owned(f)
+}
+
 fn redacted<'a>(frame: &'a Value, secrets: &[String]) -> std::borrow::Cow<'a, Value> {
     use std::borrow::Cow;
     let ours = |s: &Value| s["name"] == crate::mcp::SERVER_NAME;
@@ -1959,9 +2098,31 @@ fn send_next(ctx: &BlockCtx, g: &mut Inner) {
     if g.status != Status::Ready || g.prompt_id.is_some() || g.cfg.session_id.is_none() {
         return;
     }
-    let Some(text) = g.queue.front().cloned() else { return };
+    let Some(q) = g.queue.front().cloned() else { return };
     let session = g.session();
-    let mut params = json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] });
+    let mut prompt = vec![];
+    if !q.text.is_empty() {
+        prompt.push(json!({ "type": "text", "text": q.text }));
+    }
+    // M71: images as image blocks to an agent that takes them; to one that
+    // doesn't, their paths (on this host) for it to read.
+    let takes = g.caps["promptCapabilities"]["image"] == true;
+    for name in &q.images {
+        let block = match images::block(&ctx.dir, name) {
+            Ok(b) if takes => b,
+            Ok(_) => json!({
+                "type": "text",
+                "text": images::path(&ctx.dir, name).map(|p| p.display().to_string()).unwrap_or_default(),
+                "_meta": { images::META: name },
+            }),
+            Err(e) => {
+                warn!(block = ctx.id, image = %name, error = %e, "can't read a queued image");
+                json!({ "type": "text", "text": format!("[image {name}: gone]"), "_meta": { images::META: name } })
+            }
+        };
+        prompt.push(block);
+    }
+    let mut params = json!({ "sessionId": session, "prompt": prompt });
     if g.cfg.def.agent == Kind::Fountain {
         params["_meta"] = json!({ "clientRequestId": format!("illogical-{}-{}", ctx.id, g.next_id) });
     }
@@ -2097,7 +2258,16 @@ impl Agent {
         let cwd = g.cfg.cwd.clone();
         if let Some(log) = g.log.as_mut() {
             let at = log.end();
-            let _ = log.record(at, Event::Command { at_ms: a.at_ms, text: Some(text), cwd, by: by.map(str::to_owned) });
+            let _ = log.record(
+                at,
+                Event::Command {
+                    at_ms: a.at_ms,
+                    text: Some(text),
+                    cwd,
+                    by: by.map(str::to_owned),
+                    kind: HistoryKind::Answer,
+                },
+            );
             let _ = log.record(at, Event::End { at_ms: now_ms(), exit: Some(exit) });
         }
     }
@@ -2172,8 +2342,16 @@ impl Agent {
         Ok(json!({ "cancelled": true }))
     }
 
+    /// `send {text, files?}`: the next prompt. `files` (M71) are paths M70's
+    /// upload route answered for this block.
     fn send(&self, args: &Value, by: Option<&str>) -> Result<Value, String> {
-        let text = args["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or("send needs {\"text\": …}")?;
+        let text = args["text"].as_str().map(str::trim).unwrap_or_default();
+        let files = strings(&args["files"]);
+        if text.is_empty() && files.is_empty() {
+            return Err("send needs {\"text\": …}".into());
+        }
+        let mut q = Queued { text: text.to_owned(), images: vec![] };
+        attach(&self.ctx, &mut q, &files)?;
         let mut g = self.inner.lock().unwrap();
         if let Some(by) = by {
             // A follow-up from someone (M29): the transcript says whose.
@@ -2182,7 +2360,7 @@ impl Agent {
         if matches!(g.status, Status::Exited | Status::Stopped) {
             self.continue_import(&mut g)?;
         }
-        g.enqueue(text, false);
+        g.enqueue(&q, false);
         g.error = None;
         match g.status {
             Status::Exited | Status::Stopped => self.spawn(&mut g),
@@ -2288,6 +2466,9 @@ impl Block for Agent {
         for a in g.asks.iter().filter(|a| !a.ask.accepted) {
             out.push_str(&format!("**Waiting for your answer:** {} (`answer {}`)\n\n", a.ask.headline(), a.ask.id));
         }
+        if let Some(fix) = g.adapter.as_ref().and_then(|a| adapter_fix(a, self.ctx.id)) {
+            out.push_str(&fix);
+        }
         out
     }
 
@@ -2320,6 +2501,7 @@ impl Block for Agent {
                 Ok(json!({}))
             }
             "state" => Ok(self.state()),
+            "image" => images::read(&self.ctx.dir, args["name"].as_str().unwrap_or_default()),
             m => Err(no_method(BlockType::Agent, m)),
         };
         Box::pin(async move { result })
@@ -2380,6 +2562,35 @@ impl Block for Agent {
             at_ms: e.ask.at_ms,
         })
     }
+}
+
+/// A list of strings, skipping anything else.
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect()
+}
+
+/// A prompt's files (M71), uploaded for this block with M70's route: an
+/// image is kept in the block's folder (and its upload goes); anything else
+/// goes as its path.
+fn attach(ctx: &BlockCtx, q: &mut Queued, files: &[String]) -> Result<(), String> {
+    #[cfg(unix)]
+    for f in files {
+        let path = crate::upload::take(ctx.id, f).map_err(|e| format!("{f}: {e}"))?;
+        let bytes = std::fs::read(&path).map_err(|e| format!("{f}: {e}"))?;
+        if images::sniff(&bytes).is_some() {
+            q.images.push(images::keep(&ctx.dir, &bytes).map_err(|e| format!("can't keep {f}: {e}"))?);
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let sep = if q.text.is_empty() { "" } else { "\n\n" };
+            q.text = format!("{}{sep}{}", q.text, path.display());
+        }
+    }
+    #[cfg(not(unix))]
+    if !files.is_empty() {
+        let _ = (ctx, q);
+        return Err("files can't be attached on this host yet".into());
+    }
+    Ok(())
 }
 
 /// " by Sam", when a note says who (M29).

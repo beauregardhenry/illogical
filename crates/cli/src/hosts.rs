@@ -23,22 +23,24 @@ pub enum HostsCmd {
     Add {
         name: String,
         /// Its URL(s), best first: `https://box.tailnet.ts.net`. Or one
-        /// `ssh://[user@]box[:port]` (M51): reached over ssh from each client,
+        /// `ssh://[user@]box[:port]`: reached over ssh from each client,
         /// with your own ssh and its ~/.ssh/config; only that is kept.
         #[arg(required = true)]
         urls: Vec<String>,
     },
     /// Remove a daemon from the list.
     Rm { name: String },
-    /// A one-time token that lets a sandbox add itself
-    /// (`illogicald install --tailnet … --join TOKEN`).
+    /// A one-time token that lets another daemon add itself.
+    ///
+    /// Used as `illogicald install --tailnet … --join TOKEN`.
     Invite {
         /// How long it's good for (e.g. 30m, 2h).
         #[arg(long, default_value = "1h")]
         ttl: String,
     },
-    /// Mint a per-host token for a host without tailnet identity: one that
-    /// dials out (`illogicald --peer wss://this-daemon --token FILE`) or
+    /// Mint a per-host token for a host without tailnet identity.
+    ///
+    /// One that dials out (`illogicald --peer wss://this-daemon --token FILE`) or
     /// pushes its history (`--sync`). Adds it as a dial-out host if it isn't
     /// listed; replaces any token it had. Printed once; only its hash is
     /// kept.
@@ -49,9 +51,11 @@ pub enum HostsCmd {
 
 #[derive(Subcommand)]
 pub enum SandboxesCmd {
-    /// Copy the static daemon into a sandbox and keep it running there as
-    /// a provider service; it joins the host list, reached through this
-    /// daemon's tunnel (`--host NAME`).
+    /// Make a daemon resident in a sandbox.
+    ///
+    /// Copy the static daemon into it and keep it running there as a provider
+    /// service; it joins the host list, reached through this daemon's tunnel
+    /// (`--host NAME`).
     Promote {
         sandbox: String,
         /// Its name in the host list [default: the sandbox's].
@@ -221,7 +225,7 @@ pub fn run(
             });
             if json_out {
                 let c = control.as_ref().map(|(url, list)| {
-                    json!({"url": url, "machines": list.iter().map(|m| json!({"id": m.id, "name": m.name, "urls": m.urls, "online": m.online})).collect::<Vec<_>>()})
+                    json!({"url": url, "machines": list.iter().map(|m| json!({"id": m.id, "name": m.name, "urls": m.urls, "online": m.online, "account": m.account, "owner": m.account.as_ref().map(|_| m.owner()), "team": m.team})).collect::<Vec<_>>()})
                 });
                 println!(
                     "{}",
@@ -239,7 +243,9 @@ pub fn run(
                         (true, true) => "online, relayed".to_owned(),
                         (true, false) => format!("online, direct {} or relayed", m.urls.join(" ")),
                     };
-                    println!("{:<20} {:<44} (control: {url})", m.name, how);
+                    // Another account's (a team's or shared): whose.
+                    let whose = if m.account.is_some() { format!(", {}'s", m.owner()) } else { String::new() };
+                    println!("{:<20} {:<44} (control: {url}{whose})", m.name, how);
                 }
             }
             if local.is_null() {

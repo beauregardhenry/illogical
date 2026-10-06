@@ -25,13 +25,12 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use illogical_core::Mux;
-use illogical_proto::{BlockType, Machine, MachineId, PaneId, Policy};
+use illogical_proto::{BlockType, Machine, MachineId, PaneId, Policy, api::HistoryKind};
 use serde::{Deserialize, Serialize};
 
 pub const LAYOUT_VERSION: u32 = 1;
@@ -80,6 +79,11 @@ pub struct PaneMeta {
     /// Started through MCP (M16): by which client, for which agent block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_by: Option<illogical_proto::StartedBy>,
+    /// The guest (principal id) behind it: they started it, or an agent
+    /// of theirs did. Such an agent asks the owner for nothing in their
+    /// name (#234's invites).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<String>,
     /// The agent conversation running in it (#146), for a restart to
     /// resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,12 +129,12 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn private_dir(path: &Path) -> io::Result<()> {
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+    crate::perm::dir_mode(fs::DirBuilder::new().recursive(true), 0o700).create(path)
 }
 
 fn private_file() -> OpenOptions {
     let mut o = OpenOptions::new();
-    o.mode(0o600);
+    crate::perm::open_mode(&mut o, 0o600);
     o
 }
 
@@ -144,6 +148,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    // The rename itself, on disk. (Windows can't open a directory as a
+    // file; NTFS journals the rename.)
+    #[cfg(unix)]
     if let Some(dir) = path.parent() {
         File::open(dir)?.sync_all()?;
     }
@@ -159,6 +166,8 @@ impl StateDir {
         let old = root.join("panes");
         if old.is_dir() && !old.is_symlink() && !root.join("blocks").exists() {
             fs::rename(&old, root.join("blocks"))?;
+            // Only Unix daemons ever had `panes/`.
+            #[cfg(unix)]
             std::os::unix::fs::symlink("blocks", &old)?;
         }
         private_dir(&root.join("blocks"))?;
@@ -263,6 +272,9 @@ pub enum Event {
         /// Who typed it (M13).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<String>,
+        /// What it is; none is a command (older records, shells).
+        #[serde(default, skip_serializing_if = "HistoryKind::is_command")]
+        kind: HistoryKind,
     },
     /// Someone else started typing here (M13): one record per handoff, not
     /// per keystroke.
@@ -453,7 +465,10 @@ impl PaneLog {
     /// The pane closed: keep its history a while (for `illogical history`
     /// and `search`) under `closed/<id>-<time>`.
     pub fn retire(self, pane: PaneId) {
-        retire_dir(&self.dir, pane);
+        // Closed first: Windows won't move a directory with open files.
+        let dir = self.dir.clone();
+        drop(self);
+        retire_dir(&dir, pane);
     }
 }
 
@@ -532,8 +547,13 @@ mod tests {
         drop(log);
         let log = PaneLog::open(dir.clone()).unwrap();
         assert_eq!(log.end(), 6 * 1024 * 1024 + 5);
-        let mode = fs::metadata(dir.join(seg_name(0))).unwrap().permissions();
-        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777, 0o600);
+        // Modes are Unix's; Windows has the profile's ACL.
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(dir.join(seg_name(0))).unwrap().permissions())
+                & 0o777,
+            0o600
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -556,7 +576,13 @@ mod tests {
         let mut log = PaneLog::open(dir.clone()).unwrap();
         log.record(0, Event::Resize { cols: 80, rows: 24 }).unwrap();
         log.record(42, Event::Restore { at_ms: 7 }).unwrap();
-        let cmd = Event::Command { at_ms: 9, text: Some("echo \"a;b\"".into()), cwd: None, by: None };
+        let cmd = Event::Command {
+            at_ms: 9,
+            text: Some("echo \"a;b\"".into()),
+            cwd: None,
+            by: None,
+            kind: HistoryKind::Command,
+        };
         log.record(50, cmd.clone()).unwrap();
         assert_eq!(
             log.events(),
@@ -597,8 +623,9 @@ mod tests {
         };
         state.save_layout(&saved).unwrap();
         assert_eq!(state.load_layout().unwrap(), Some(saved));
-        let mode = fs::metadata(&dir).unwrap().permissions();
-        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777, 0o700);
+        // Modes are Unix's; Windows has the profile's ACL.
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&dir).unwrap().permissions()) & 0o777, 0o700);
         fs::remove_dir_all(dir).unwrap();
     }
 }

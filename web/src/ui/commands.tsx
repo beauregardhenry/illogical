@@ -3,7 +3,7 @@
 // command palette reads the same lists, so the two can't drift.
 
 import { paneIds, type Client } from "../client";
-import type { Machine, PaneId, Policy, SessionId, TabView } from "../proto";
+import type { Machine, OpenRequest, PaneId, Policy, SessionId, TabView } from "../proto";
 import { askText, type MenuItem } from "./menu";
 import { openSandboxes } from "./sandboxes";
 import { driveItems, shareSession } from "./people";
@@ -15,11 +15,15 @@ import { openPicker } from "./picker";
 import { agentNotifyItems, notificationItems } from "./notify";
 import { openGettingStarted } from "./welcome";
 import { openRules } from "./rules";
-import { desktopApp, openInNewWindow } from "../desktop";
+import { desktopApp, desktopPlatform, openInNewWindow } from "../desktop";
+import { sessionThreadItems, threadItems } from "./threads";
+import { huddleItems } from "./huddle";
 
 /** Chords, as menus and the palette show them. */
 export const PICKER_KEY = "Ctrl+Shift+G";
 export const PALETTE_KEY = "Ctrl+Shift+P";
+/** The desktop app on macOS (desktop.ts). */
+export const ATTACH_KEY = "⌘U";
 
 /** A pane's right-click menu. `workspace` is the directory it's in when
  * that is a chant workspace (M34). */
@@ -65,7 +69,7 @@ export function paneItems(client: Client, id: PaneId, phone: boolean, workspace:
       label: "Open a web page…",
       run: async () => {
         const url = await askText("Open a web page", "", "https://… or example.com");
-        if (url) void client.api("/api/blocks", { type: "browser", config: { url }, split: id }, "couldn't open that page");
+        if (url) void client.api("/api/blocks", { type: "browser", config: { url }, split: id } satisfies OpenRequest, "couldn't open that page");
       },
     },
     // A port where this pane runs: its machine, or this host.
@@ -93,6 +97,11 @@ export function paneItems(client: Client, id: PaneId, phone: boolean, workspace:
       ? [{ label: "Share machine with tab", run: () => void client.api(`/api/panes/${id}/share-machine`) } as MenuItem]
       : []),
     "separator",
+    // M70: a file onto this pane's host, its path pasted in (for an agent
+    // there to read).
+    ...(entry && client.mayType(id)
+      ? [{ label: "Attach file…", shortcut: desktopPlatform() === "macos" ? ATTACH_KEY : undefined, run: () => void client.attachFiles(id) } as MenuItem]
+      : []),
     moveToTab,
     { label: "Go to directory…", shortcut: PICKER_KEY, run: () => openPicker(client, id, phone) },
     { label: "Copy working directory", disabled: !cwd, run: () => cwd && void navigator.clipboard?.writeText(cwd) },
@@ -108,8 +117,9 @@ export function paneItems(client: Client, id: PaneId, phone: boolean, workspace:
             },
           } as MenuItem,
         ]),
-    // M65: an ssh command for a guest with only OpenSSH. The owner's.
-    ...(client.base.startsWith("/") || client.state?.roles
+    // An ssh command for a guest with only OpenSSH. The owner's. Only where
+    // this machine has labs.
+    ...(client.base.startsWith("/") || client.state?.roles || !client.hasLabs()
       ? []
       : [
           {
@@ -121,6 +131,9 @@ export function paneItems(client: Client, id: PaneId, phone: boolean, workspace:
           } as MenuItem,
         ]),
     ...driveItems(client, id),
+    "separator",
+    // M61: the people's conversation about this pane.
+    ...threadItems(client, id),
     "separator",
     ...restartItems(client, id),
     "separator",
@@ -191,6 +204,9 @@ export function sessionItems(client: Client, session: SessionId, rename: () => v
         ]
       : []),
     { label: "Rename session", run: rename },
+    // M61: the people's conversation about this session.
+    ...sessionThreadItems(client, session),
+    ...huddleItems(client, session),
     // Sharing is the daemon's owner's (M13).
     ...(client.state?.roles ? [] : [{ label: "Share session…", run: () => shareSession(session) } as MenuItem]),
     "separator",
@@ -209,7 +225,7 @@ export function sessionItems(client: Client, session: SessionId, rename: () => v
 function fountainItems(client: Client, where: { session?: number; split?: PaneId }): MenuItem[] {
   return [
     ...(client.has("fountain") ? [{ label: "Fountain agents…", run: () => void openFountain(client, where) } as MenuItem] : []),
-    ...(client.features === null || client.fountainRunner
+    ...(client.hasLabs() && (client.features === null || client.fountainRunner)
       ? [{ label: "Fountain runner…", run: () => void openFountain(client, where, "runner") } as MenuItem]
       : []),
   ];

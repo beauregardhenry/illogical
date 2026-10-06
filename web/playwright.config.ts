@@ -112,7 +112,15 @@ runDir("FAKE_ACP_DIR", "illogical-e2e-fake-acp-");
   // gh (and its bundle goes in the run's own cache: the daemon's command).
   process.env.ILLOGICAL_INFISICAL_BIN = "/bin/false";
   process.env.ILLOGICAL_GH_BIN = "/bin/false";
+  // #145: no `chant audit --agents` of the person's agent config, so every
+  // screen rule set runs whatever is configured on the host.
+  process.env.ILLOGICAL_CHANT = "";
 }
+
+// The suite's daemons have the `labs` file (e2e/labs.ts), which turns on what
+// a stranger doesn't get: the shared one here, and the ones the specs start.
+// `labs-off.spec.ts` starts one without it, and is the proof of the default.
+writeFileSync(join(runDir("ILLOGICAL_E2E_STATE", "illogical-e2e-"), "labs"), "");
 
 // By default runs against a throwaway debug daemon on 7683 (which serves
 // web/dist from disk), driving the system Chrome (E2E_CHROMIUM=1: Playwright's
@@ -129,9 +137,25 @@ if (!external) process.env.ILLOGICAL_FORGE_HOOK_BASE ??= `http://127.0.0.1:${por
 // E2E_DAEMON_LOG=/path/to/file keeps the test daemon's debug log.
 const log = process.env.E2E_DAEMON_LOG ? ` >>${process.env.E2E_DAEMON_LOG} 2>&1` : "";
 
+// CI splits the specs (#287): E2E_SET=stack runs only those on the Docker
+// test stack, E2E_SET=perf only those that time things (the frame rates,
+// and editors.spec's files in under 3 s), on a host with nothing else of
+// the run on it, E2E_SET=rest everything else, sharded across runners.
+const SETS: Record<string, RegExp> = {
+  stack: /(team-swarm-phones|testnet-hosts|editor-remote-ssh)\.spec\.ts$/,
+  perf: /(swarm-fps|editors)\.spec\.ts$/,
+};
+const set = process.env.E2E_SET;
+const WEBKIT = /\.webkit\.spec\.ts$/;
+const chrome = set && SETS[set] ? { testMatch: SETS[set] } : { testIgnore: set === "rest" ? [WEBKIT, ...Object.values(SETS)] : WEBKIT };
+
 export default defineConfig({
   testDir: "e2e",
   timeout: 30_000,
+  // CI's hosts run other jobs beside the specs (#287): an expectation gets
+  // longer there, and a spec that fails once runs again, reported as flaky.
+  expect: { timeout: process.env.CI ? 10_000 : 5_000 },
+  retries: process.env.CI ? 1 : 0,
   fullyParallel: false,
   workers: 1,
   use: {
@@ -140,8 +164,19 @@ export default defineConfig({
     storageState: { cookies: tokenCookies, origins: [] },
   },
   projects: [
-    { name: "chrome", use: { channel: process.env.E2E_CHROMIUM ? "chromium" : "chrome" }, testIgnore: /\.webkit\.spec\.ts$/ },
-    { name: "webkit", use: { browserName: "webkit" }, testMatch: /\.webkit\.spec\.ts$/ },
+    // Chrome hands a granted notification to the desktop over the session's
+    // D-Bus, and geek's CI runners run in the person's session: pointed at
+    // no bus, it keeps them to itself (getNotifications still sees them).
+    {
+      name: "chrome",
+      use: {
+        channel: process.env.E2E_CHROMIUM ? "chromium" : "chrome",
+        launchOptions: { env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent" } },
+      },
+      ...chrome,
+    },
+    // The stack's and the frame rates' specs are all Chrome's.
+    { name: "webkit", use: { browserName: "webkit" }, testMatch: set && SETS[set] ? /^$/ : WEBKIT },
   ],
   webServer: external
     ? undefined

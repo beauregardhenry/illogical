@@ -88,9 +88,16 @@ pub struct AddHost {
 
 /// `GET /api/host`: who this daemon is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct HostInfo {
     pub name: String,
     pub version: String,
+    /// The app↔daemon protocol it speaks ([`crate::PROTOCOL`], #390).
+    /// Absent from daemons older than the number, which speak
+    /// [`crate::PROTOCOL_BASELINE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
     /// Where `tailscale serve` puts the app, when tailscaled told us this
     /// node's name (#109): `https://NAME.TAILNET.ts.net`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +105,7 @@ pub struct HostInfo {
     /// The owner has come in over the tailnet since the daemon started:
     /// serve works (#110).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>"))]
     pub tailnet_seen: bool,
     /// The control this daemon joined, if any (#110).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,9 +123,166 @@ pub struct HostInfo {
     pub features: Option<HostFeatures>,
 }
 
+/// The `control_state` key of `GET /api/host`, sent beside [`HostInfo`]'s
+/// keys to the machine's owner only (#325). Read it from the answer's JSON:
+/// older daemons, and anyone else, leave it out.
+pub const CONTROL_STATE_KEY: &str = "control_state";
+
+/// A machine's standing with illogical control (#325): whether and where
+/// it's joined, whether control is reachable, or that control dropped it.
+/// The page, the tray and `illogical status` all show this.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ControlState {
+    /// `not_joined`, `joined` or `dropped`.
+    #[cfg_attr(feature = "ts", ts(type = r#""not_joined" | "joined" | "dropped""#))]
+    pub state: String,
+    /// The control it's (or was) joined to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub url: Option<String>,
+    /// `account` or `team`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional, type = r#""account" | "team""#))]
+    pub kind: Option<String>,
+    /// The team's name, or the account's login (empty until control says).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub name: Option<String>,
+    /// Joined: reachable through control now (its relay socket is up; for a
+    /// sandbox behind a provider's proxy, the last refresh worked).
+    #[serde(default)]
+    pub connected: bool,
+    /// When control last answered (ms since the epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub seen_ms: Option<u64>,
+    /// Joined: what last went wrong talking to control, until it works again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub error: Option<String>,
+    /// Dropped: what control said ("not an enrolled daemon (left, or
+    /// revoked?)", or that its key was removed, #330).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub said: Option<String>,
+    /// Dropped: when this machine first heard it (ms since the epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub dropped_ms: Option<u64>,
+    /// Dropped: a join waiting for approval, its code (a machine whose key
+    /// was removed asks to join again with a new key by itself, #330; or
+    /// someone started one), and where a signed-in device approves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub approve: Option<String>,
+}
+
+impl ControlState {
+    pub fn is_dropped(&self) -> bool {
+        self.state == "dropped"
+    }
+
+    pub fn is_joined(&self) -> bool {
+        self.state == "joined"
+    }
+
+    /// Where it is, in words: "the team arugula on control.example",
+    /// "lex00's account on …", or "an account on …".
+    pub fn place(&self) -> String {
+        let host = self.url.as_deref().map(|u| u.trim_start_matches("https://").trim_start_matches("http://"));
+        let host = host.unwrap_or("control").trim_end_matches('/');
+        let name = self.name.as_deref().unwrap_or_default();
+        match (self.kind.as_deref(), name) {
+            (Some("team"), n) if !n.is_empty() => format!("the team {n} on {host}"),
+            (Some("team"), _) => format!("a team on {host}"),
+            (_, "") => format!("an account on {host}"),
+            (_, n) => format!("{n}'s account on {host}"),
+        }
+    }
+
+    /// One line: "In the team arugula on control.example: connected",
+    /// "Not joined to illogical control", "Dropped by control: …". What the
+    /// tray's control line and `illogical status` say.
+    pub fn line(&self) -> String {
+        match self.state.as_str() {
+            "joined" if self.connected => format!("In {}: connected", self.place()),
+            "joined" => match &self.error {
+                Some(e) => format!("In {}: not connected ({e})", self.place()),
+                None => format!("In {}: connecting", self.place()),
+            },
+            "dropped" => format!(
+                "Dropped by control: no longer in {} (control says: {})",
+                self.place(),
+                self.said.as_deref().unwrap_or("it doesn't know this machine")
+            ),
+            _ => "Not joined to illogical control".into(),
+        }
+    }
+
+    /// From a `GET /api/host` answer: `None` from an older daemon, or for
+    /// someone who isn't the owner.
+    pub fn of_host(v: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(v.get(CONTROL_STATE_KEY)?.clone()).ok()
+    }
+}
+
+#[cfg(test)]
+mod control_state_tests {
+    use super::*;
+
+    #[test]
+    fn the_line_says_where_and_how() {
+        let mut s = ControlState {
+            state: "joined".into(),
+            url: Some("https://control.example/".into()),
+            kind: Some("team".into()),
+            name: Some("arugula".into()),
+            connected: true,
+            ..Default::default()
+        };
+        assert_eq!(s.line(), "In the team arugula on control.example: connected");
+        s.connected = false;
+        assert_eq!(s.line(), "In the team arugula on control.example: connecting");
+        s.error = Some("can't reach control's relay".into());
+        assert_eq!(s.line(), "In the team arugula on control.example: not connected (can't reach control's relay)");
+        s.kind = Some("account".into());
+        s.name = Some(String::new());
+        assert_eq!(s.place(), "an account on control.example");
+        let d = ControlState { state: "dropped".into(), said: Some("left".into()), ..s };
+        assert_eq!(d.line(), "Dropped by control: no longer in an account on control.example (control says: left)");
+        assert_eq!(ControlState::default().line(), "Not joined to illogical control");
+        let v = serde_json::json!({ "name": "a", "version": "1", CONTROL_STATE_KEY: d });
+        assert_eq!(ControlState::of_host(&v), Some(d));
+        assert_eq!(ControlState::of_host(&serde_json::json!({ "name": "a" })), None);
+    }
+}
+
+/// The file in a machine's state dir that turns on what a stranger doesn't
+/// get: huddles, chat, Fountain, studio, VMs, guest ssh and the swarm's extra
+/// views. Present means on, whatever it holds.
+pub const LABS_FILE: &str = "labs";
+
+/// Whether `state_dir` has the `labs` file. A `stat` on every call, never
+/// cached, so adding or removing the file takes effect with no restart. The
+/// daemon, the CLI and the page (through `HostFeatures::labs`) all read it
+/// through this one name.
+pub fn labs(state_dir: &std::path::Path) -> bool {
+    state_dir.join(LABS_FILE).exists()
+}
+
 /// The optional parts of a machine, as `GET /api/host` reports them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HostFeatures {
+    /// The machine has a `labs` file in its state dir (see [`labs`]): what a
+    /// stranger doesn't get is on. Absent from older daemons, and pages
+    /// treat that as off.
+    #[serde(default)]
+    pub labs: bool,
     /// Browser blocks on ports and editor blocks: block sites are on
     /// (`--block-listen`).
     pub blocks: bool,
@@ -128,11 +293,22 @@ pub struct HostFeatures {
     pub fountain: bool,
     /// A studio is linked (`illogical studio login`).
     pub studio: bool,
+    /// Threads on panes and sessions: with `labs`. Older daemons leave it
+    /// out, and pages hide threads there.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub threads: bool,
+    /// Huddles on sessions, likewise.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub calls: bool,
 }
 
 /// A machine's Fountain runner, for its line in the machine panel and the
 /// swarm (M45b). Read in the background, never on the request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct FountainRunnerInfo {
     /// Its name on Fountain (the unit's `--name`).
     pub name: String,

@@ -9,10 +9,22 @@
 //!   approved, the page shows the account's fingerprint to check against
 //!   the approving device, and
 //!   `POST /api/setup/control/confirm` (`{"same": true}`) saves the join;
-//!   `false` drops it.
+//!   `false` drops it. On a machine control dropped (#325), the same
+//!   button joins again: the old enrollment is set aside first.
 //! - `POST /api/setup/claude`: `claude mcp add illogical -- illogical mcp`.
+//! - `POST /api/setup/agents/{kind}` (#335), "Use Claude Code with
+//!   illogical": installs (or updates) the agent's ACP adapter, waiting for
+//!   npm, and for Claude Code adds the MCP server too; the answer says what
+//!   changed (`done`). `illogical setup claude` asks the same.
 //!
-//! `GET /api/setup` says how far along each one is. When a step needs
+//! When control says this machine's key was removed from its account
+//! (#330), the daemon makes a new key and starts a join itself; `GET
+//! /api/setup` shows that as `control.removed`, beside the new code. Back
+//! into the same account, it saves the join without asking again.
+//!
+//! `GET /api/setup` says how far along each one is; `?part=agents`, only
+//! the agents' (each adapter's state, whether its agent's CLI is on this
+//! machine, and whether Claude Code has the MCP server). When a step needs
 //! something only a person can do (a one-time sudo, a switch in
 //! Tailscale's admin console, a sign-in), the error says so, with the
 //! command or the link.
@@ -32,6 +44,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::agent::{
+    adapters::{ADAPTERS, Adapter, State as AdapterState},
+    defs::Kind,
+};
 use crate::server::App;
 
 type AppState = State<Arc<App>>;
@@ -47,6 +63,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/api/setup/control", post(control_join))
         .route("/api/setup/control/confirm", post(control_confirm))
         .route("/api/setup/claude", post(|s: AppState| async move { logged("claude", claude_mcp(s).await) }))
+        .route("/api/setup/agents/{kind}", post(use_agent))
 }
 
 /// What a button did: done, or why not and what fixes it.
@@ -59,8 +76,12 @@ struct Outcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     fix: Option<String>,
     /// A page for the person to open (Tailscale's admin console, say).
+    /// (Boxed: an `Err` of its own in `install` and `add_mcp`.)
     #[serde(skip_serializing_if = "Option::is_none")]
-    link: Option<Link>,
+    link: Option<Box<Link>>,
+    /// What changed, a line each (#335).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    done: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -93,7 +114,7 @@ impl Outcome {
         self
     }
     fn link(mut self, label: &str, url: impl Into<String>) -> Self {
-        self.link = Some(Link { label: label.into(), url: url.into() });
+        self.link = Some(Box::new(Link { label: label.into(), url: url.into() }));
         self
     }
 }
@@ -103,6 +124,9 @@ struct Status {
     tailscale: TailscaleStatus,
     control: ControlStatus,
     claude: ClaudeStatus,
+    /// Each adapter's state (`adapters::Status::json`), with `found`: its
+    /// agent's CLI is on this machine (#335).
+    adapters: Vec<Value>,
 }
 
 #[derive(Serialize, Default)]
@@ -138,9 +162,22 @@ struct ControlStatus {
     /// The last join that didn't work, and why.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Control said this machine's old key was removed from its account
+    /// (#330), so the join waiting has a new key: what it said, when and
+    /// by which device, and both keys' fingerprints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<crate::control::Removed>,
+    /// A join `illogicald join` started on this machine (#329): its code
+    /// and where to approve it. Only one join runs at a time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elsewhere: Option<crate::control::JoinLockInfo>,
     /// The control the button joins: `--control`, else illogical cloud
-    /// (#207). The page sends it back with the join.
+    /// (#207), or the one that dropped this machine (#325). The page sends
+    /// it back with the join.
     url: String,
+    /// How this machine stands with control now (#325): as `/api/host`'s
+    /// `control_state`.
+    state: crate::control::State,
 }
 
 #[derive(Serialize, Clone)]
@@ -173,6 +210,8 @@ struct ClaudeStatus {
 static JOIN: Mutex<(Option<Pending>, Option<String>)> = Mutex::new((None, None));
 /// An approved join, until the person says the account is theirs.
 static APPROVED: Mutex<Option<crate::control::Approved>> = Mutex::new(None);
+/// The old key control said was removed, until this machine is in again.
+static REMOVED: Mutex<Option<crate::control::Removed>> = Mutex::new(None);
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
@@ -338,7 +377,9 @@ struct JoinReq {
 }
 
 fn control_status(app: &App) -> ControlStatus {
-    let joined = app.control.enrolled();
+    let state = control_state(app);
+    // Dropped by control (#325): not joined, as far as joining again goes.
+    let joined = app.control.enrolled().filter(|_| !state.is_dropped());
     let saved = joined.as_ref().map(|e| &e.saved);
     let (pending, error) = JOIN.lock().unwrap().clone();
     ControlStatus {
@@ -352,13 +393,38 @@ fn control_status(app: &App) -> ControlStatus {
             place: a.joined.place.clone(),
         }),
         error: error.filter(|_| saved.is_none()),
-        url: app.control.default_url.clone(),
+        removed: REMOVED.lock().unwrap().clone().filter(|_| saved.is_none()),
+        elsewhere: crate::control::JoinLock::held(app.control.state_dir()).filter(|h| !h.mine() && saved.is_none()),
+        // Joining again after a drop goes back to the same control.
+        url: state.url.clone().filter(|_| state.is_dropped()).unwrap_or_else(|| app.control.default_url.clone()),
+        state,
     }
+}
+
+/// This machine's standing with control (#325), with the join waiting for
+/// approval when it was dropped: the one the daemon asked for by itself
+/// after its key was removed (#330), Getting started's, or `illogicald
+/// join`'s (#329). `/api/host`'s `control_state`.
+pub fn control_state(app: &App) -> crate::control::State {
+    let mut s = app.control.state();
+    if s.is_dropped() {
+        let own = JOIN.lock().unwrap().0.clone().filter(|p| p.expires_ms > now_ms()).map(|p| (p.code, p.approve));
+        let cli = || {
+            let h = crate::control::JoinLock::held(app.control.state_dir()).filter(|h| !h.mine())?;
+            Some((h.code?, h.approve?))
+        };
+        if let Some((code, approve)) = own.or_else(cli) {
+            s.code = Some(code);
+            s.approve = Some(approve);
+        }
+    }
+    s
 }
 
 async fn control_join(State(app): AppState, body: Option<Json<JoinReq>>) -> Json<Value> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    if app.control.enrolled().is_some() || APPROVED.lock().unwrap().is_some() {
+    let dropped = app.control.state().is_dropped();
+    if (app.control.enrolled().is_some() && !dropped) || APPROVED.lock().unwrap().is_some() {
         return Json(serde_json::to_value(control_status(&app)).unwrap());
     }
     // One at a time: asking again while a code is open returns that code.
@@ -367,23 +433,71 @@ async fn control_join(State(app): AppState, body: Option<Json<JoinReq>>) -> Json
     {
         return Json(serde_json::json!({ "pending": p }));
     }
+    // Control dropped this machine (#325): set what it had aside, so the
+    // join starts fresh.
+    if dropped && let Err(e) = app.control.forget_dropped() {
+        let e = format!("can't set the dropped enrollment aside: {e}");
+        JOIN.lock().unwrap().1 = Some(e.clone());
+        return Json(serde_json::json!({ "error": e }));
+    }
     let url = req.url.filter(|u| !u.trim().is_empty()).unwrap_or_else(|| app.control.default_url.clone());
+    Json(start_join(&app, &url, req.team.as_deref()).await)
+}
+
+/// Control said this machine's key was removed (#330): ask `url` to add
+/// it again, with a new key, unless a join is under way already.
+pub fn rejoin(app: Arc<App>, url: String) {
+    tokio::spawn(async move {
+        if APPROVED.lock().unwrap().is_some()
+            || JOIN.lock().unwrap().0.as_ref().is_some_and(|p| p.expires_ms > now_ms())
+        {
+            return;
+        }
+        let v = start_join(&app, &url, None).await;
+        match v["pending"]["approve"].as_str() {
+            Some(at) => tracing::warn!(approve = at, "joining again with a new key: approve it on a signed-in device"),
+            None => tracing::warn!(error = %v["error"], "can't join again with a new key"),
+        }
+    });
+}
+
+/// Ask control for a code and wait for its approval in the background.
+async fn start_join(app: &Arc<App>, url: &str, team: Option<&str>) -> Value {
     let name = app.hosts.name().to_owned();
     let dir = app.control.state_dir().to_owned();
-    match crate::control::join_start(&url, &name, req.team.as_deref(), None, &dir).await {
+    match crate::control::join_start(url, &name, team, None, &dir, "Getting started").await {
         Ok(p) => {
             let pending = Pending {
                 code: p.code.clone(),
                 approve: p.approve_url(),
                 expires_ms: now_ms() + p.expires_in_secs * 1000,
             };
+            let rejoining = p.renewed.as_ref().and_then(|r| r.root.clone());
+            if let Some(r) = &p.renewed {
+                *REMOVED.lock().unwrap() = Some(r.clone());
+            }
             *JOIN.lock().unwrap() = (Some(pending.clone()), None);
+            let app = app.clone();
             tokio::spawn(async move {
                 let r = crate::control::join_finish(p).await;
                 match &r {
                     Ok(_) => info!(step = "control", "setup step done"),
                     Err(e) => warn!(step = "control", error = %e, "setup step failed"),
                 }
+                // Back into the account it was removed from: the person
+                // checked its fingerprint when it first joined.
+                let r = match r {
+                    Ok(a) if rejoining.as_deref().is_some_and(|root| a.is_account(root)) => {
+                        let saved = a.save(app.control.state_dir()).map(|_| ());
+                        if saved.is_ok() {
+                            *REMOVED.lock().unwrap() = None;
+                        }
+                        app.control.poke();
+                        *JOIN.lock().unwrap() = (None, saved.err().map(|e| e.to_string()));
+                        return;
+                    }
+                    r => r,
+                };
                 let mut j = JOIN.lock().unwrap();
                 match r {
                     Ok(a) => {
@@ -393,12 +507,12 @@ async fn control_join(State(app): AppState, body: Option<Json<JoinReq>>) -> Json
                     Err(e) => *j = (None, Some(e.to_string())),
                 }
             });
-            Json(serde_json::json!({ "pending": pending }))
+            serde_json::json!({ "pending": pending, "removed": REMOVED.lock().unwrap().clone() })
         }
         Err(e) => {
             warn!(step = "control", %url, error = %e, "setup step failed");
             JOIN.lock().unwrap().1 = Some(e.to_string());
-            Json(serde_json::json!({ "error": e.to_string() }))
+            serde_json::json!({ "error": e.to_string() })
         }
     }
 }
@@ -424,6 +538,9 @@ async fn control_confirm(State(app): AppState, Json(req): Json<ConfirmReq>) -> J
         Some(e)
     } else {
         let r = a.save(app.control.state_dir());
+        if r.is_ok() {
+            *REMOVED.lock().unwrap() = None;
+        }
         app.control.poke();
         r.err().map(|e| e.to_string())
     };
@@ -459,29 +576,163 @@ async fn claude_status(app: &App) -> ClaudeStatus {
 }
 
 async fn claude_mcp(State(app): AppState) -> Json<Outcome> {
-    let Some(c) = claude(&app).await else {
-        return Json(
-            Outcome::err("Claude Code isn't installed on this machine.")
-                .link("Install Claude Code", "https://docs.anthropic.com/en/docs/claude-code"),
-        );
+    Json(match add_mcp(&app).await {
+        Ok(_) => Outcome::ok(),
+        Err(o) => o,
+    })
+}
+
+/// `claude mcp add`, unless Claude Code has it already: whether it added.
+async fn add_mcp(app: &App) -> Result<bool, Outcome> {
+    let Some(c) = claude(app).await else {
+        return Err(Outcome::err("Claude Code isn't installed on this machine.")
+            .link("Install Claude Code", "https://docs.anthropic.com/en/docs/claude-code"));
     };
-    if claude_status(&app).await.tools {
-        return Json(Outcome::ok());
+    if claude_status(app).await.tools {
+        return Ok(false);
     }
-    let Some(cli) = cli(&app).await else {
-        return Json(Outcome::err("Can't find the illogical CLI next to the daemon."));
+    let Some(cli) = cli(app).await else {
+        return Err(Outcome::err("Can't find the illogical CLI next to the daemon."));
     };
     let cli = cli.display().to_string();
     info!(claude = %c.display(), %cli, "adding illogical to Claude Code");
-    match run(&app, &c, &["mcp", "add", "--scope", "user", "illogical", "--", &cli, "mcp"], Duration::from_secs(20))
+    match run(app, &c, &["mcp", "add", "--scope", "user", "illogical", "--", &cli, "mcp"], Duration::from_secs(20))
         .await
     {
-        Ok((true, _, _)) => Json(Outcome::ok()),
+        Ok((true, _, _)) => Ok(true),
         Ok((false, out, err)) => {
-            Json(Outcome::err(format!("claude mcp add: {}", if err.is_empty() { out.trim().to_owned() } else { err })))
+            Err(Outcome::err(format!("claude mcp add: {}", if err.is_empty() { out.trim().to_owned() } else { err })))
         }
-        Err(e) => Json(Outcome::err(e)),
+        Err(e) => Err(Outcome::err(e)),
     }
+}
+
+// ---- agents' adapters (#335)
+
+const NODE_DOWNLOAD: &str = "https://nodejs.org/en/download";
+/// How long an install may take (npm fetching a few MB, or a slow network).
+const NPM_TIMEOUT: Duration = Duration::from_secs(300);
+/// One install at a time.
+static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Where else an agent's CLI is, when the shell's PATH doesn't have it.
+async fn agent_cli(app: &App, a: &Adapter) -> Option<PathBuf> {
+    if a.kind == Kind::Claude {
+        return claude(app).await;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let local = format!("{home}/.local/bin/{}", a.cli);
+    let brew = format!("/opt/homebrew/bin/{}", a.cli);
+    let usr = format!("/usr/local/bin/{}", a.cli);
+    find(app, a.cli, &[&local, &brew, &usr]).await
+}
+
+/// Every adapter's state, as an agent block would find it, and whether its
+/// agent's CLI is here.
+async fn adapters_status(app: &App) -> Vec<Value> {
+    let Ok((home, env)) = crate::api::agent_env(app).await else { return Vec::new() };
+    let mut list =
+        tokio::task::spawn_blocking(move || crate::agent::adapters::all(&home, &env)).await.unwrap_or_default();
+    for (v, a) in list.iter_mut().zip(ADAPTERS) {
+        v["found"] = agent_cli(app, a).await.is_some().into();
+    }
+    list
+}
+
+/// What `use_agent` said it did, a line each.
+fn installed_line(a: &Adapter, was: &AdapterState) -> String {
+    match was {
+        AdapterState::Installed { version: Some(v), .. } => {
+            format!(
+                "Updated {}'s adapter from {v} to {}: agent panes use it from their next start.",
+                a.label,
+                a.pinned()
+            )
+        }
+        _ => format!("Installed {}'s adapter ({}): {} runs as agent panes here.", a.label, a.pinned(), a.label),
+    }
+}
+
+/// The adapter, installed or updated to the pin, waiting for npm: what
+/// changed (a line), or nothing when it was current.
+async fn install(app: &App, a: &'static Adapter) -> Result<Option<String>, Outcome> {
+    let (home, env) = crate::api::agent_env(app).await.map_err(|e| Outcome::err(e.1))?;
+    let (st, path, home) = tokio::task::spawn_blocking(move || {
+        let st = crate::agent::adapters::status(a, &home, &env);
+        let path = crate::agent::adapters::node_path(&home, &env);
+        (st, path, home)
+    })
+    .await
+    .map_err(|e| Outcome::err(e.to_string()))?;
+    if let AdapterState::NoNode { .. } = st.state {
+        return Err(Outcome::err(format!(
+            "{}. Install Node (nodejs.org, or `mise use -g node@22`) and try again, or run this once Node is there:",
+            st.why()
+        ))
+        .fix(st.npm)
+        .link("Get Node", NODE_DOWNLOAD));
+    }
+    if st.current() {
+        return Ok(None);
+    }
+    let Ok(_one) = INSTALLING.try_lock() else {
+        return Err(Outcome::err("An adapter is being installed already: try again when it's done."));
+    };
+    let Some(cmd) = crate::agent::adapters::npm_install(a, &home, &path) else {
+        return Err(Outcome::err("There's no npm next to this machine's Node: install it, or run this:").fix(st.npm));
+    };
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    tracing::info!(adapter = a.package, "installing an agent's adapter (#335)");
+    match tokio::time::timeout(NPM_TIMEOUT, cmd.output()).await {
+        Err(_) => {
+            Err(Outcome::err(format!("npm didn't finish in {} s: run it yourself:", NPM_TIMEOUT.as_secs())).fix(st.npm))
+        }
+        Ok(Err(e)) => Err(Outcome::err(format!("npm: {e}")).fix(st.npm)),
+        Ok(Ok(o)) if !o.status.success() => {
+            let said = String::from_utf8_lossy(&o.stderr);
+            let tail: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).collect();
+            let tail = tail[tail.len().saturating_sub(4)..].join("\n");
+            Err(Outcome::err(format!(
+                "npm install failed: {}",
+                if tail.is_empty() { "it didn't say why" } else { &tail }
+            ))
+            .fix(st.npm))
+        }
+        Ok(Ok(_)) => Ok(Some(installed_line(a, &st.state))),
+    }
+}
+
+/// `POST /api/setup/agents/{kind}`: "Use Claude Code with illogical" (or
+/// Codex): its adapter installed or brought up to the pin, and for Claude
+/// Code illogical's MCP server added. Run by the person, never by itself.
+async fn use_agent(State(app): AppState, axum::extract::Path(kind): axum::extract::Path<String>) -> Json<Outcome> {
+    let Some(a) = ADAPTERS.iter().find(|a| a.dir == kind || a.cli == kind) else {
+        return Json(Outcome::err(format!("no agent {kind} to set up (claude or codex)")));
+    };
+    let mut done = Vec::new();
+    match install(&app, a).await {
+        Ok(Some(line)) => done.push(line),
+        Ok(None) => {}
+        Err(o) => return Json(o),
+    }
+    if a.kind == Kind::Claude {
+        match add_mcp(&app).await {
+            Ok(true) => done.push(
+                "Added illogical's MCP server to Claude Code: it can start its helpers as panes in your next session."
+                    .into(),
+            ),
+            Ok(false) => {}
+            Err(o) => return Json(Outcome { done, ..o }),
+        }
+    }
+    if done.is_empty() {
+        done.push(match a.kind {
+            Kind::Claude => "Already set up: agent panes work, and Claude Code has illogical's MCP server.".into(),
+            _ => format!("Already set up: {} runs as agent panes here.", a.label),
+        });
+    }
+    Json(Outcome { done, ..Outcome::ok() })
 }
 
 // ---- status
@@ -489,8 +740,9 @@ async fn claude_mcp(State(app): AppState) -> Json<Outcome> {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct StatusQuery {
-    /// `control`: only that (cheap, for polling while a join waits); the
-    /// others run `tailscale` and `claude`.
+    /// `control`: only that (cheap, for polling while a join waits);
+    /// `agents`: Claude Code's MCP server and the adapters (#335). The
+    /// whole runs `tailscale`, `claude` and `node`.
     part: Option<String>,
 }
 
@@ -498,13 +750,35 @@ async fn status(State(app): AppState, Query(q): Query<StatusQuery>) -> Json<Valu
     if q.part.as_deref() == Some("control") {
         return Json(serde_json::json!({ "control": control_status(&app) }));
     }
-    let (tailscale, claude) = tokio::join!(tailscale_status(&app), claude_status(&app));
-    Json(serde_json::to_value(Status { tailscale, control: control_status(&app), claude }).unwrap())
+    if q.part.as_deref() == Some("agents") {
+        let (claude, adapters) = tokio::join!(claude_status(&app), adapters_status(&app));
+        return Json(serde_json::json!({ "claude": claude, "adapters": adapters }));
+    }
+    let (tailscale, claude, adapters) =
+        tokio::join!(tailscale_status(&app), claude_status(&app), adapters_status(&app));
+    Json(serde_json::to_value(Status { tailscale, control: control_status(&app), claude, adapters }).unwrap())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_an_install_says_it_did() {
+        let claude = ADAPTERS.iter().find(|a| a.kind == Kind::Claude).unwrap();
+        let fresh = installed_line(claude, &AdapterState::Missing);
+        assert_eq!(
+            fresh,
+            format!("Installed Claude Code's adapter ({}): Claude Code runs as agent panes here.", claude.pinned())
+        );
+        let old = AdapterState::Installed { version: Some("0.81.2".into()), on_path: false };
+        assert!(installed_line(claude, &old).starts_with("Updated Claude Code's adapter from 0.81.2 to "));
+        // An outcome's lines go out only when there are some.
+        let o = serde_json::to_value(Outcome::ok()).unwrap();
+        assert!(o.get("done").is_none());
+        let o = serde_json::to_value(Outcome { done: vec![fresh], ..Outcome::ok() }).unwrap();
+        assert_eq!(o["done"].as_array().unwrap().len(), 1);
+    }
 
     #[test]
     fn serve_status_finds_this_port() {

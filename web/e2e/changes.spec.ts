@@ -12,10 +12,13 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFile
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { devices, expect, test, type Page } from "@playwright/test";
-import { open, text } from "./helpers";
+import { open, text, closeContexts } from "./helpers";
 import type { PaneId } from "../src/proto";
 import { ANY, daemonPort } from "./ports";
 import { deliver, FakePush, tap } from "./phones";
+import { labs } from "./labs";
+
+test.afterAll(closeContexts);
 
 let PORT = 0;
 let VM_PORT = 0;
@@ -44,7 +47,7 @@ let daemons: ChildProcess[] = [];
 async function start(state: string, args: string[], env: Record<string, string> = {}) {
   const d = spawn(
     "../target/debug/illogicald",
-    ["--listen", ANY, "--state-dir", state, "--shell", "bash --norc --noprofile", "--no-manager-env", ...args],
+    ["--listen", ANY, "--state-dir", labs(state), "--shell", "bash --norc --noprofile", "--no-manager-env", ...args],
     { stdio: "ignore", env: { ...process.env, ...env } },
   );
   daemons.push(d);

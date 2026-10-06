@@ -56,6 +56,17 @@ pub struct Status {
     pub ips: Vec<IpAddr>,
 }
 
+#[cfg(unix)]
+async fn connect(socket: &Path) -> anyhow::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(socket).await.with_context(|| format!("connecting to {}", socket.display()))
+}
+
+/// Windows: tailscaled has no Unix socket; the CLI answers instead.
+#[cfg(not(unix))]
+async fn connect(socket: &Path) -> anyhow::Result<tokio::io::DuplexStream> {
+    bail!("no tailscaled socket here: {}", socket.display())
+}
+
 impl LocalApi {
     /// The given socket, else tailscaled's default one if it exists, else
     /// (macOS) the Tailscale app's CLI.
@@ -96,9 +107,7 @@ impl LocalApi {
     async fn get(&self, path: &str) -> anyhow::Result<(u16, Vec<u8>)> {
         let go = async {
             let Via::Socket(socket) = &self.via else { bail!("no tailscaled socket") };
-            let mut s = tokio::net::UnixStream::connect(socket)
-                .await
-                .with_context(|| format!("connecting to {}", socket.display()))?;
+            let mut s = connect(socket).await?;
             let req = format!("GET {path} HTTP/1.0\r\nHost: local-tailscaled.sock\r\nConnection: close\r\n\r\n");
             s.write_all(req.as_bytes()).await?;
             let mut buf = Vec::new();
@@ -121,6 +130,7 @@ impl LocalApi {
         Ok(serde_json::from_slice(&body)?)
     }
 
+    #[cfg(unix)]
     pub async fn status(&self) -> anyhow::Result<Status> {
         parse_status(&self.status_json().await?).context("tailscaled isn't logged in")
     }
@@ -140,6 +150,7 @@ impl LocalApi {
         }
     }
 
+    #[cfg(unix)]
     /// `Running` once logged in and connected; `NeedsLogin`, `Starting`, …
     pub async fn backend_state(&self) -> anyhow::Result<String> {
         Ok(self.status_json().await?.get("BackendState").and_then(Value::as_str).unwrap_or_default().to_owned())

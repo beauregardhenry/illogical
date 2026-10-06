@@ -11,8 +11,11 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { controlPanel, ready, run } from "./helpers";
+import { controlPanel, ready, run, closeContexts } from "./helpers";
 import { ANY, controlPort, listen } from "./ports";
+import { labs } from "./labs";
+
+test.afterAll(closeContexts);
 
 let base = "";
 let github = "";
@@ -123,7 +126,7 @@ async function teamMachine(owner: Page, name: string, team: string) {
     spawn(
       "../target/debug/illogicald",
       [
-        ...["--listen", ANY, "--name", name, "--state-dir", state],
+        ...["--listen", ANY, "--name", name, "--state-dir", labs(state)],
         ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/sock"],
       ],
       { stdio: "ignore" },

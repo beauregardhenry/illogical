@@ -24,8 +24,10 @@ use futures_util::stream::{self, StreamExt};
 use illogical_proto::{
     Driver, EventKind, Frame, FrameKind, PaneId, SessionId,
     api::{
-        AttentionRequest, KeysRequest, MouseRequest, Process, PromptRequest, PromptResult, RunRequest, RunResponse,
-        SendRequest, WaitResult,
+        AttentionRequest, Empty, HistoryKind, Invitable, KeysRequest, MouseRequest, NotifyPref, NotifyRequest,
+        OpenConversationRequest, OpenConversationResponse, OpenResponse, Process, PromptRequest, PromptResult,
+        RunRequest, RunResponse, SendRequest, ThreadAgent, ThreadMessages, ThreadPostRequest, ThreadPosted,
+        ThreadReadRequest, Unreached, UnreachedWhy, WaitResult,
     },
 };
 use regex::Regex;
@@ -46,7 +48,7 @@ use crate::{
 type AppState = State<Arc<App>>;
 
 pub fn routes() -> Router<Arc<App>> {
-    Router::new()
+    let r = Router::new()
         .route("/api/panes", get(panes))
         .route("/api/run", post(run))
         .route("/api/panes/{id}/send", post(send))
@@ -62,6 +64,9 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/api/panes/{id}/hook", post(hook))
         .route("/api/panes/{id}/inbox", post(inbox))
         .route("/api/panes/{id}/followup", post(followup))
+        .route("/api/turn", get(turn))
+        .route("/api/threads/{target}", get(thread_get).post(thread_post))
+        .route("/api/threads/{target}/read", post(thread_read))
         .route("/api/panes/{id}/close", post(close))
         .route("/api/panes/{id}/capture", get(capture))
         .route("/api/panes/{id}/process", get(process))
@@ -76,6 +81,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/api/rules/{index}", axum::routing::delete(rules_forget))
         .route("/api/hosts/self/shell-env", get(shell_env_get))
         .route("/api/hosts/self/shell-env/refresh", post(shell_env_refresh))
+        .route("/api/hosts/self/agents", get(agents_get))
+        .route("/api/hosts/self/agents/refresh", post(agents_refresh))
         .route("/api/editors", get(editors))
         .route("/api/editors/vsix", get(vsix))
         .route("/api/ide/mention", post(ide_mention))
@@ -100,7 +107,16 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/api/push/key", get(push_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/test", post(push_test))
-        .route("/api/notify", get(notify_get).post(notify_set))
+        .route("/api/notify", get(notify_get).post(notify_set));
+    // M70: a file onto the pane's host, and its path pasted.
+    #[cfg(unix)]
+    let r = r
+        .route(
+            "/api/panes/{id}/upload",
+            post(crate::upload::upload).layer(axum::extract::DefaultBodyLimit::max(crate::upload::CHUNK_MAX)),
+        )
+        .route("/api/panes/{id}/paste", post(crate::upload::paste));
+    r
 }
 
 pub struct ApiError(pub StatusCode, pub String);
@@ -115,9 +131,9 @@ fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
-type Res<T> = Result<T, ApiError>;
+pub(crate) type Res<T> = Result<T, ApiError>;
 
-async fn pane(app: &App, id: PaneId) -> Res<PaneHandle> {
+pub(crate) async fn pane(app: &App, id: PaneId) -> Res<PaneHandle> {
     app.mux.api(|r| Api::Pane(id, r)).await.flatten().ok_or(ApiError(StatusCode::NOT_FOUND, format!("no pane %{id}")))
 }
 
@@ -142,7 +158,10 @@ fn tap(pane: PaneHandle, from: u64) -> Tap {
     let client = NEXT_TAP.fetch_add(1, Ordering::Relaxed);
     let (data, rx) = crate::pane::client_queue();
     let (ctrl, _ctrl) = mpsc::unbounded_channel();
-    pane.attach(Subscriber { client, data, ctrl, principal: crate::acl::Principal::Owner, name: None }, Some(from));
+    pane.attach(
+        Subscriber { client, data, ctrl, principal: crate::acl::Principal::Owner, name: None, device: None },
+        Some(from),
+    );
     Tap { pane, client, rx, _ctrl }
 }
 
@@ -351,7 +370,7 @@ pub(crate) async fn prompt(
 /// when no agent's screen is read there.
 async fn screen_state(app: &App, id: PaneId) -> Option<Option<&'static str>> {
     let p = pane(app, id).await.ok()?;
-    tokio::task::spawn_blocking(move || p.detection()).await.ok().flatten().map(|d| d.shown)
+    tokio::task::spawn_blocking(move || p.detection()).await.ok().flatten().filter(|d| !d.unread).map(|d| d.shown)
 }
 
 async fn pane_info(app: &App, id: PaneId) -> Option<illogical_proto::PaneInfo> {
@@ -430,6 +449,7 @@ async fn attention_list(
 async fn act(
     State(app): AppState,
     who: Option<axum::Extension<crate::acl::Principal>>,
+    headers: HeaderMap,
     Json(req): Json<illogical_proto::api::ActRequest>,
 ) -> Res<Response> {
     use illogical_proto::api::{ActResponse, ActResult};
@@ -437,6 +457,15 @@ async fn act(
     let panes = req.targets();
     if panes.is_empty() {
         return Err(bad("name a pane (pane) or several (panes)"));
+    }
+    // An agent's invite (#234): the owner's alone, and not an agent's on
+    // the owner's CLI (a courtesy, as for `call`).
+    if !who.is_owner() || crate::invite::agent(&headers) {
+        for p in &panes {
+            if is_invite(&app, *p).await {
+                return Err(ApiError(StatusCode::FORBIDDEN, crate::invite::OWNER_ONLY.into()));
+            }
+        }
     }
     // All or nothing on access: a list with one pane you can't change is
     // refused whole, so a bundle never half-happens for that reason.
@@ -623,6 +652,9 @@ async fn ask(
     Json(req): Json<AskRequest>,
 ) -> Res<Json<serde_json::Value>> {
     use illogical_proto::ask::{self, Ask, AskKind};
+    if is_invite(&app, id).await {
+        return Err(not_on_invites());
+    }
     let questions = req.questions.as_array().filter(|q| !q.is_empty()).ok_or_else(|| bad("no questions"))?;
     let message = match questions.as_slice() {
         [q] => q["question"].as_str().unwrap_or_default().to_owned(),
@@ -681,6 +713,9 @@ async fn permit(
     Json(hook): Json<serde_json::Value>,
 ) -> Res<Json<serde_json::Value>> {
     use illogical_proto::ask::{self, Ask, AskKind};
+    if is_invite(&app, id).await {
+        return Err(not_on_invites());
+    }
     let tool = hook["tool_name"].as_str().ok_or_else(|| bad("no tool_name"))?.to_owned();
     let input = hook["tool_input"].clone();
     let session = format!("{}/{}", hook["session_id"].as_str().unwrap_or(""), hook["agent_id"].as_str().unwrap_or(""));
@@ -807,8 +842,132 @@ async fn ask_withdraw(
     Path(id): Path<PaneId>,
     Json(req): Json<WithdrawRequest>,
 ) -> Res<Json<serde_json::Value>> {
+    if is_invite(&app, id).await {
+        return Err(not_on_invites());
+    }
     app.mux.send(Cmd::Api(Api::AskWithdraw(id, req.id, None)));
     Ok(Json(serde_json::json!({})))
+}
+
+// ---- threads (M61)
+
+fn thread_target(key: &str) -> Res<illogical_proto::ThreadTarget> {
+    illogical_proto::ThreadTarget::parse(key)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "a thread is pane-N or session-N".into()))
+}
+
+fn thread_err(e: crate::mux::ThreadError) -> ApiError {
+    ApiError(StatusCode::from_u16(e.0).unwrap_or(StatusCode::BAD_REQUEST), e.1)
+}
+
+fn gone() -> ApiError {
+    ApiError(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down".into())
+}
+
+/// A thread's messages, as the caller may read them.
+async fn thread_get(
+    State(app): AppState,
+    Path(key): Path<String>,
+    who: Option<axum::Extension<crate::acl::Principal>>,
+) -> Res<Json<ThreadMessages>> {
+    let who = who.map(|axum::Extension(w)| w).unwrap_or(crate::acl::Principal::Owner);
+    let target = thread_target(&key)?;
+    let messages = app.mux.api(|r| Api::ThreadGet(target, who, r)).await.ok_or_else(gone)?.map_err(thread_err)?;
+    Ok(Json(ThreadMessages { target, messages }))
+}
+
+/// Post in a thread. An `@agent` in a pane's thread, from someone who may
+/// drive the pane, also goes to its agent as a follow-up.
+async fn thread_post(
+    State(app): AppState,
+    Path(key): Path<String>,
+    who: Option<axum::Extension<crate::acl::Principal>>,
+    Json(req): Json<ThreadPostRequest>,
+) -> Res<Json<ThreadPosted>> {
+    let who = who.map(|axum::Extension(w)| w).unwrap_or(crate::acl::Principal::Owner);
+    let owner = who.is_owner();
+    let target = thread_target(&key)?;
+    let post = crate::mux::ThreadPost { target, who, as_agent: None, text: req.text, quote: req.quote };
+    let (msg, to_agent, mut unreached) =
+        app.mux.api(|r| Api::ThreadPost(post, r)).await.ok_or_else(gone)?.map_err(thread_err)?;
+    let mut agent = None;
+    if to_agent && let illogical_proto::ThreadTarget::Pane(pane) = target {
+        agent = Some(match tell_agent(&app, pane, &msg).await {
+            Ok(now) => ThreadAgent { delivered: Some(now), error: None },
+            Err(e) => ThreadAgent { delivered: None, error: Some(e) },
+        });
+    }
+    // The owner, who sees every grant and roster already, is offered to
+    // invite whom an @ named but who can't read the thread (#297). Nobody
+    // else's post does any of this, so theirs says nothing about who exists.
+    let invitable = if owner { Some(invitable(&app, target, &mut unreached).await) } else { None };
+    Ok(Json(ThreadPosted { message: msg, agent, unreached, invitable }))
+}
+
+/// Whom an owner's `@`s that reached nobody name, of those an invite may
+/// name, who can't read the thread and could once invited (not on a
+/// private pane's). Their tokens leave `unreached`: the offer says it.
+async fn invitable(app: &App, target: illogical_proto::ThreadTarget, unreached: &mut Vec<Unreached>) -> Vec<Invitable> {
+    let tokens: Vec<String> =
+        unreached.iter().filter(|u| u.why == UnreachedWhy::Nobody).map(|u| u.token.clone()).collect();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let named: Vec<(String, crate::invite::Person)> = crate::invite::nameable(app)
+        .into_iter()
+        .filter_map(|p| {
+            let t = tokens.iter().find(|t| crate::threads::names(t, &p.id, &p.name))?;
+            Some((t.clone(), p))
+        })
+        .collect();
+    if named.is_empty() {
+        return Vec::new();
+    }
+    let ids = named.iter().map(|(_, p)| p.id.clone()).collect();
+    let Some(reads) = app.mux.api(|r| Api::CanRead(target, ids, r)).await.flatten() else { return Vec::new() };
+    let out: Vec<(String, crate::invite::Person)> =
+        named.into_iter().zip(reads).filter(|(_, reads)| !reads).map(|(n, _)| n).collect();
+    unreached.retain(|u| !out.iter().any(|(t, _)| *t == u.token));
+    // One taken for another (a login by an account's name) says whom.
+    out.into_iter().map(|(token, p)| Invitable { token, who: p.id, name: p.name, merged: p.merged }).collect()
+}
+
+/// Hand a thread message to the pane's agent, as a follow-up from its
+/// author (M61). `Ok(true)`: it went straight in; `Ok(false)`: queued.
+async fn tell_agent(app: &App, pane: PaneId, msg: &illogical_proto::ThreadMsg) -> Result<bool, String> {
+    let mut text = format!("{} wrote in this pane's thread: {}", msg.name, msg.text);
+    if let Some(q) = &msg.quote {
+        text.push_str(&format!("\n\nQuoting %{}:\n{}", q.pane, q.text));
+    }
+    text.push_str("\n\n(Answer in the thread with illogical's post_thread tool.)");
+    let by = Driver { who: msg.who.clone(), name: msg.name.clone() };
+    if let Some(b) = app.mux.api(|r| Api::Block(pane, r)).await.flatten() {
+        let name = (by.who != "owner").then_some(by.name.as_str());
+        return b.call_by("send", serde_json::json!({ "text": text }), name).await.map(|_| true);
+    }
+    app.mux.api(|r| Api::FollowUp(pane, text, by, r)).await.unwrap_or_else(|| Err("daemon is shutting down".into()))
+}
+
+async fn thread_read(
+    State(app): AppState,
+    Path(key): Path<String>,
+    who: Option<axum::Extension<crate::acl::Principal>>,
+    Json(req): Json<ThreadReadRequest>,
+) -> Res<Json<Empty>> {
+    let who = who.map(|axum::Extension(w)| w).unwrap_or(crate::acl::Principal::Owner);
+    let target = thread_target(&key)?;
+    app.mux.send(Cmd::Api(Api::ThreadRead(target, who, req.upto)));
+    Ok(Json(Empty {}))
+}
+
+/// Whether a block is an agent's invites (#234): the owner's to answer,
+/// and it shows only its own cards.
+async fn is_invite(app: &App, id: PaneId) -> bool {
+    app.mux.api(|r| Api::Block(id, r)).await.flatten().is_some_and(|b| b.kind() == illogical_proto::BlockType::Invite)
+}
+
+fn not_on_invites() -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, "an invite block shows only its own cards".into())
 }
 
 /// What to call whoever made a request (M13), to attribute what they did.
@@ -900,14 +1059,25 @@ async fn answer_terminal(
     };
     match app.mux.api(|r| Api::AskReply(id, ask_id, reply, by, r)).await {
         Some(Ok(a)) => Ok(Json(serde_json::json!({ "answered": a.id }))),
+        Some(Err(e)) if e == crate::invite::OWNER_ONLY => Err(ApiError(StatusCode::FORBIDDEN, e)),
         Some(Err(e)) => Err(bad(e)),
         None => Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down".into())),
     }
 }
 
-async fn close(State(app): AppState, Path(id): Path<PaneId>) -> Res<Json<serde_json::Value>> {
+async fn close(
+    State(app): AppState,
+    Path(id): Path<PaneId>,
+    who: Option<axum::Extension<crate::acl::Principal>>,
+    headers: HeaderMap,
+) -> Res<Json<Empty>> {
+    // An agent's invites (#234) are the owner's to close, not an agent's.
+    let owner = who.is_none_or(|axum::Extension(w)| w.is_owner());
+    if (!owner || crate::invite::agent(&headers)) && is_invite(&app, id).await {
+        return Err(ApiError(StatusCode::FORBIDDEN, crate::invite::CLOSE_OWNER_ONLY.into()));
+    }
     match app.mux.api(|r| Api::Close(id, r)).await {
-        Some(true) => Ok(Json(serde_json::json!({}))),
+        Some(true) => Ok(Json(Empty {})),
         _ => Err(ApiError(StatusCode::NOT_FOUND, format!("no pane %{id}"))),
     }
 }
@@ -952,8 +1122,13 @@ async fn open_block(
     who: Option<axum::Extension<crate::acl::Principal>>,
     headers: HeaderMap,
     Json(mut req): Json<illogical_proto::api::OpenRequest>,
-) -> Res<Json<serde_json::Value>> {
+) -> Res<Json<OpenResponse>> {
     let who = who.map(|axum::Extension(w)| w);
+    // An invite block (#234) is MCP's invite_person's to make, for what it
+    // checked: never anyone's from here.
+    if req.kind == illogical_proto::BlockType::Invite {
+        return Err(ApiError(StatusCode::FORBIDDEN, "invite blocks are made by MCP's invite_person".into()));
+    }
     // M44: a worn Fountain agent runs on this host with the owner's
     // secrets: the owner's alone.
     if req.kind == illogical_proto::BlockType::Agent
@@ -973,7 +1148,7 @@ async fn open_block(
         if req.config["issue"] == "new" && req.config.is_object() {
             let by = who_is(&app, who.clone().unwrap_or(crate::acl::Principal::Owner)).await;
             req.config["by"] = serde_json::json!(by.map(|d| d.name));
-            if headers.get("x-illogical-agent").is_some() {
+            if crate::invite::agent(&headers) {
                 req.config["agent"] = true.into();
             }
         }
@@ -992,7 +1167,7 @@ async fn open_block(
         }
     }
     match app.mux.api(|r| Api::Open(req, who, r)).await {
-        Some(Ok(block)) => Ok(Json(serde_json::json!({ "block": block }))),
+        Some(Ok(block)) => Ok(Json(OpenResponse { block })),
         Some(Err(e)) => Err(bad(e)),
         None => Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down".into())),
     }
@@ -1115,37 +1290,22 @@ pub async fn list_conversations(app: &App, q: ConversationsQuery) -> Result<serd
     Ok(serde_json::json!({ "conversations": out, "total": total }))
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct OpenConversation {
-    /// Its id, or a unique prefix.
-    pub id: String,
-    /// Then `continue` or `fork` it.
-    #[serde(default)]
-    pub then: Option<String>,
-    #[serde(default)]
-    pub session: Option<String>,
-    #[serde(default)]
-    pub split: Option<PaneId>,
-    #[serde(default)]
-    pub from_pane: Option<PaneId>,
-}
-
 /// `POST /api/conversations/open` (M33): a conversation as an agent block,
 /// stopped, showing its transcript; the block that already has it, if one
 /// does. `then` continues or forks it.
 async fn open_conversation(
     State(app): AppState,
     who: Option<axum::Extension<crate::acl::Principal>>,
-    Json(req): Json<OpenConversation>,
-) -> Res<Json<serde_json::Value>> {
+    Json(req): Json<OpenConversationRequest>,
+) -> Res<Json<OpenConversationResponse>> {
     open_conversation_as(&app, who.map(|axum::Extension(w)| w), req).await.map(Json)
 }
 
 pub async fn open_conversation_as(
     app: &App,
     who: Option<crate::acl::Principal>,
-    req: OpenConversation,
-) -> Result<serde_json::Value, ApiError> {
+    req: OpenConversationRequest,
+) -> Result<OpenConversationResponse, ApiError> {
     let id = req.id.clone();
     let c = tokio::task::spawn_blocking(move || crate::conversations::Index::global().lock().unwrap().find(&id))
         .await
@@ -1180,7 +1340,7 @@ pub async fn open_conversation_as(
             }
         }
     };
-    let mut out = serde_json::json!({ "block": block, "opened": opened, "conversation": c.id });
+    let mut out = OpenConversationResponse { block, opened, conversation: c.id, error: None };
     if let Some(then) = req.then.as_deref() {
         let method = match then {
             "continue" | "fork" => then,
@@ -1188,7 +1348,7 @@ pub async fn open_conversation_as(
         };
         let b = app.mux.api(|r| Api::Block(block, r)).await.flatten().ok_or_else(|| bad("the block went away"))?;
         if let Err(e) = b.call(method, serde_json::json!({})).await {
-            out["error"] = serde_json::json!(e);
+            out.error = Some(e);
         }
     }
     Ok(out)
@@ -1236,6 +1396,7 @@ async fn call(
         serde_json::from_slice(&body).map_err(|e| bad(e.to_string()))?
     };
     let who = who.map(|axum::Extension(w)| w).unwrap_or(crate::acl::Principal::Owner);
+    let owner = who.is_owner();
     let by = match method.as_str() {
         // M11: a file block's `open` is the owner's only. M36: a forge
         // block's writes say who sent them.
@@ -1244,11 +1405,16 @@ async fn call(
         _ => None,
     };
     if let Some(b) = app.mux.api(|r| Api::Block(id, r)).await.flatten() {
+        // An agent's invites (#234) are the owner's, and not for an agent
+        // on the owner's CLI either (as a forge's drafts, a courtesy).
+        if b.kind() == illogical_proto::BlockType::Invite && (!owner || crate::invite::agent(&headers)) {
+            return Err(ApiError(StatusCode::FORBIDDEN, crate::invite::OWNER_ONLY.into()));
+        }
         // The CLI says when an agent runs it (CLAUDECODE, AI_AGENT): a forge
         // block makes its writes drafts then (M36). A courtesy, not a
         // boundary.
         if b.kind() == illogical_proto::BlockType::Forge
-            && headers.get("x-illogical-agent").is_some()
+            && crate::invite::agent(&headers)
             && let Some(o) = args.as_object_mut()
         {
             o.insert("agent".into(), true.into());
@@ -1387,6 +1553,12 @@ async fn detection(State(app): AppState, Path(id): Path<PaneId>) -> Res<Json<ser
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(match found {
+        // Not read here: what chant found configured instead.
+        Some(d) if d.unread => {
+            let mut v = serde_json::to_value(d).unwrap_or_default();
+            v["configured"] = serde_json::json!(app.mux.inventory.snapshot().runtimes());
+            v
+        }
         Some(d) => serde_json::to_value(d).unwrap_or_default(),
         None => serde_json::json!({ "agent": null, "command": command }),
     }))
@@ -1756,6 +1928,9 @@ struct HistoryQuery {
     cwd: Option<String>,
     #[serde(rename = "match", default)]
     matching: Option<String>,
+    /// `command`, `answer` or `agent`; none is all.
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
     /// Another host's synced history (`*`: every host's).
@@ -1823,9 +1998,15 @@ async fn drivers(State(app): AppState, Path(id): Path<PaneId>) -> Res<Response> 
 
 async fn history_(State(app): AppState, Query(q): Query<HistoryQuery>) -> Res<Response> {
     let matching = q.matching.as_deref().map(Regex::new).transpose().map_err(|e| bad(format!("match: {e}")))?;
+    let kind = q
+        .kind
+        .as_deref()
+        .map(|k| HistoryKind::parse(k).ok_or_else(|| bad(format!("kind: {k:?} isn't command, answer or agent"))))
+        .transpose()?;
     let filter = Filter {
         pane: q.pane,
         failed: q.failed == Some(1),
+        kind,
         since_ms: q.since.map(|s| now_ms().saturating_sub(s * 1000)),
         cwd: q.cwd,
         matching,
@@ -1909,23 +2090,15 @@ async fn push_subscribe(
     Ok(Json(serde_json::json!({ "subscriptions": push.subscriptions() })))
 }
 
-#[derive(Deserialize)]
-struct NotifyRequest {
-    /// One session; none: everything you may edit here.
-    #[serde(default)]
-    session: Option<SessionId>,
-    on: bool,
-}
-
 /// What "needs you" notifications you get here (M29): `GET` yours, `POST`
 /// to opt in or out of a session's agents, or all of them.
 async fn notify_get(
     State(app): AppState,
     who: Option<axum::Extension<crate::acl::Principal>>,
-) -> Res<Json<crate::acl::NotifyPref>> {
+) -> Res<Json<NotifyPref>> {
     let who = who.map(|axum::Extension(w)| w).unwrap_or(crate::acl::Principal::Owner);
     if who.is_owner() {
-        return Ok(Json(crate::acl::NotifyPref { all: true, ..Default::default() }));
+        return Ok(Json(NotifyPref { all: true, ..Default::default() }));
     }
     Ok(Json(app.acl.notify_pref(who.id())))
 }
@@ -1934,7 +2107,7 @@ async fn notify_set(
     State(app): AppState,
     who: Option<axum::Extension<crate::acl::Principal>>,
     Json(req): Json<NotifyRequest>,
-) -> Res<Json<crate::acl::NotifyPref>> {
+) -> Res<Json<NotifyPref>> {
     let who = who.map(|axum::Extension(w)| w).unwrap_or(crate::acl::Principal::Owner);
     if who.is_owner() {
         return Err(bad("the owner is always told"));
@@ -1997,7 +2170,7 @@ async fn diff_of(
 }
 
 /// Home and the environment an agent block gets.
-async fn agent_env(app: &App) -> Res<(std::path::PathBuf, Vec<(String, String)>)> {
+pub(crate) async fn agent_env(app: &App) -> Res<(std::path::PathBuf, Vec<(String, String)>)> {
     let (home, env) = app
         .mux
         .api(Api::AgentEnv)
@@ -2171,6 +2344,33 @@ async fn shell_env_refresh(
     owner_only(&who)?;
     state.0.mux.shell_env.refresh();
     shell_env_get(state, who).await
+}
+
+/// `GET /api/hosts/self/agents` (#145): the agents configured on this
+/// machine, as `chant audit --agents` last found them, and which screen
+/// rule sets run here because of it.
+async fn agents_get(
+    State(app): AppState,
+    who: Option<axum::Extension<crate::acl::Principal>>,
+) -> Res<Json<serde_json::Value>> {
+    owner_only(&who)?;
+    Ok(Json(agents_json(&app.mux.inventory.snapshot())))
+}
+
+/// `POST /api/hosts/self/agents/refresh`: ask chant again, and wait.
+async fn agents_refresh(
+    State(app): AppState,
+    who: Option<axum::Extension<crate::acl::Principal>>,
+) -> Res<Json<serde_json::Value>> {
+    owner_only(&who)?;
+    Ok(Json(agents_json(&app.mux.inventory.refresh_now().await)))
+}
+
+fn agents_json(snap: &crate::inventory::Snapshot) -> serde_json::Value {
+    let mut v = serde_json::to_value(snap).unwrap_or_default();
+    let (runs, off): (Vec<_>, Vec<_>) = illogical_vt::detect::AGENTS.iter().map(|a| a.id).partition(|id| snap.runs(id));
+    v["rules"] = serde_json::json!({ "run": runs, "off": off });
+    v
 }
 
 fn owner_only(who: &Option<axum::Extension<crate::acl::Principal>>) -> Res<()> {
@@ -2358,4 +2558,9 @@ async fn studio_follower(Path(name): Path<String>, Json(req): Json<FollowerLink>
 async fn studio_unfollow(Path(name): Path<String>) -> Res<Json<serde_json::Value>> {
     studio()?.set_follower(&name, None).map_err(bad)?;
     Ok(Json(serde_json::json!({})))
+}
+
+/// ICE servers for a huddle (M63): TURN credentials from control, or STUN.
+async fn turn(State(app): AppState) -> Json<serde_json::Value> {
+    Json(app.control.ice_servers().await)
 }

@@ -38,7 +38,11 @@ use crate::{ApiError, App, err};
 pub const SESSION_COOKIE: &str = "ilg_session";
 const STATE_COOKIE: &str = "ilg_oauth";
 const SESSION_DAYS: u64 = 30;
-pub const AUTH_HEADER: &str = "x-illogical-auth";
+/// The signature header, under either name (#504): daemons and CLIs send
+/// `x-illogical-auth` until the rename, `x-arugula-auth` after.
+pub fn auth_header(headers: &HeaderMap) -> Option<&HeaderValue> {
+    illogical_core::rename::either(illogical_core::rename::AUTH, |n| headers.get(n))
+}
 const SKEW_MS: u64 = 5 * 60 * 1000;
 
 pub fn token() -> String {
@@ -79,7 +83,7 @@ impl FromRequestParts<Arc<App>> for Session {
         match parts.extensions.get::<Signed>() {
             Some(Signed(Ok(cert))) if cert.kind == Kind::Cli => return Ok(Session { account: cert.account.clone() }),
             Some(Signed(Ok(_))) => return Err(err(StatusCode::UNAUTHORIZED, "sign in first")),
-            Some(Signed(Err((status, msg)))) => return Err(crate::ApiError(*status, msg.clone())),
+            Some(Signed(Err((status, msg)))) => return Err(err(*status, msg)),
             None => {}
         }
         let upgrade = parts.headers.contains_key(header::UPGRADE);
@@ -155,7 +159,7 @@ pub async fn verify_daemon(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if !req.headers().contains_key(AUTH_HEADER) {
+    if auth_header(req.headers()).is_none() {
         return next.run(req).await;
     }
     let (mut parts, body) = req.into_parts();
@@ -169,7 +173,7 @@ pub async fn verify_daemon(
 
 fn check_daemon(app: &App, parts: &Parts, body: &[u8]) -> Result<Cert, ApiError> {
     let bad = || err(StatusCode::UNAUTHORIZED, "bad daemon signature");
-    let h = parts.headers.get(AUTH_HEADER).and_then(|v| v.to_str().ok()).ok_or_else(bad)?;
+    let h = auth_header(&parts.headers).and_then(|v| v.to_str().ok()).ok_or_else(bad)?;
     let f: Vec<&str> = h.split_whitespace().collect();
     let (id, ms, sig, msg) = match f.as_slice() {
         ["v2", id, ms, nonce, sig] => {
@@ -202,7 +206,12 @@ fn check_daemon(app: &App, parts: &Parts, body: &[u8]) -> Result<Cert, ApiError>
             None if app.db.daemon_account_deleted(id)? => {
                 return Err(err(StatusCode::UNAUTHORIZED, "this machine's account was deleted"));
             }
-            None => return Err(err(StatusCode::UNAUTHORIZED, "not an enrolled daemon (left, or revoked?)")),
+            // Removed from a browser (#330): Gone, for the daemon to make
+            // a new key and join again.
+            None => match crate::api::removed(app, id, Kind::Daemon, false)? {
+                Some((msg, _)) => return Err(err(StatusCode::GONE, &msg)),
+                None => return Err(err(StatusCode::UNAUTHORIZED, "not an enrolled daemon (left, or revoked?)")),
+            },
         },
     };
     if !illogical_e2e::cert::verify_hex(&cert.sign, msg.as_bytes(), sig) {
@@ -233,7 +242,7 @@ impl FromRequestParts<Arc<App>> for DaemonAuth {
         match parts.extensions.get::<Signed>() {
             Some(Signed(Ok(cert))) if cert.kind == Kind::Daemon => Ok(DaemonAuth { cert: cert.clone() }),
             Some(Signed(Ok(_))) => Err(err(StatusCode::UNAUTHORIZED, "not an enrolled daemon")),
-            Some(Signed(Err((status, msg)))) => Err(crate::ApiError(*status, msg.clone())),
+            Some(Signed(Err((status, msg)))) => Err(err(*status, msg)),
             None => Err(err(StatusCode::UNAUTHORIZED, "bad daemon signature")),
         }
     }
