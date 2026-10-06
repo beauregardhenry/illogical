@@ -89,7 +89,10 @@ pub fn require(profile: &str, host: &str, test: &str) -> bool {
         docker.is_ok_and(|s| s.success()),
         "{test} needs Docker, which isn't available (ILLOGICAL_SKIP_DOCKER=1 skips it)"
     );
-    if !reachable(host) {
+    // control's profile writes control.env; the ssh profile alone (up from
+    // an earlier `just testnet up ssh`) answers on the same boxes without it.
+    let ready = reachable(host) && (profile != "control" || state().join("control.env").exists());
+    if !ready {
         let mut up = Command::new(root().join("testnet/up.sh"));
         up.arg(profile).env("COMPOSE_PROJECT_NAME", name()).stdout(Stdio::null());
         // control mounts the box's binaries: the same ones the tests install
