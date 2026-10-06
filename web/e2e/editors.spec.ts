@@ -17,11 +17,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { chromium, expect, test, type FrameLocator, type Page } from "@playwright/test";
-import { menu, paneEl, panes, ready, reset, run } from "./helpers";
+import { menu, paneEl, panes, ready, reset, run, closeContexts } from "./helpers";
 import type { PaneId } from "../src/proto";
 import { tokenCookies } from "./local-token";
 import { ANY, blockPort, daemonPort } from "./ports";
 import { iphone, launchWebkit, pixel7 } from "./phones";
+import { labs } from "./labs";
+
+test.afterAll(closeContexts);
 
 let PORT = 0;
 let BLOCKS = 0;
@@ -48,7 +51,7 @@ async function start() {
   daemon = spawn(
     "../target/debug/illogicald",
     [
-      ...["--listen", PORT ? `127.0.0.1:${PORT}` : ANY, "--block-listen", BLOCKS ? `127.0.0.1:${BLOCKS}` : ANY, "--state-dir", state],
+      ...["--listen", PORT ? `127.0.0.1:${PORT}` : ANY, "--block-listen", BLOCKS ? `127.0.0.1:${BLOCKS}` : ANY, "--state-dir", labs(state)],
       ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--owner", OWNER, "--tailscale-socket", "/nonexistent/sock"],
     ],
     // code-server keeps its own logs under XDG_DATA_HOME: not the user's.

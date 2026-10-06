@@ -25,7 +25,7 @@ or an account skip without it and name what's missing
 
 | Command | What it runs | In CI |
 |---|---|---|
-| `cargo test --workspace` (in `just test`) | unit tests in every crate, and the daemon's integration tests in `crates/daemon/tests/`, `ssh.rs` and `reboot.rs` among them (Docker) | Linux and macOS |
+| `cargo nextest run --workspace` (in `just test`) | unit tests in every crate, and the daemon's integration tests in `crates/daemon/tests/`, `ssh.rs` and `reboot.rs` among them (Docker) | Linux and macOS |
 | `just e2e-interop` (in `just test`) | the browser's end-to-end crypto (`web/src/e2e`) against Rust's (`crates/e2e`): certificate vectors made by `crates/e2e/examples/interop.rs`, and a Noise handshake with its `responder` | Linux and macOS |
 | `just control-smoke` (in `just test`) | `web/control-smoke.ts`: a fake GitHub, Stripe, push service and Sprites API, the real `illogical-control` and real daemons; headless devices sign in, enroll, approve the daemons' join codes and reach them directly and through the relay; the CLI (M49) logs in with a code the device approves and, with no daemon of its own, runs, lists and captures on one machine directly and one through the relay | Linux and macOS |
 | `just e2e` | the Playwright specs in `web/e2e/` against throwaway daemons (`just e2e <url>` tests a running one): the `chrome` project, and `webkit` for `*.webkit.spec.ts` | Linux (Playwright's Chromium and WebKit) |
@@ -34,16 +34,46 @@ or an account skip without it and name what's missing
 | `just forges`, `just testnet-hosts`, `just testnet-editors` | real forges, two hosts and VS Code over Remote-SSH, in Docker ([below](#real-forges-two-hosts-vs-code-over-remote-ssh)) | the forges nightly (`forges-nightly.yml`) |
 | `just macos <test>` | the tart VM's checks: launchd with no GUI session, real Safari, iTerm2, the desktop app ([below](#a-fresh-mac-the-tart-vm-harness)) | no |
 | `just desktop-check` | rustfmt and clippy for `crates/desktop` | Linux |
-| `just desktop-xvfb` | the Linux desktop app under Xvfb in a container (`packaging/desktop/xvfb/`): `join` (#204) and `m46` (see [The desktop app's tests](#the-desktop-apps-tests)) | no |
+| `just desktop-xvfb` | the Linux desktop app under Xvfb in a container (`packaging/desktop/xvfb/`): `join` (#204), `m46`, `m47` and `stale` (#317) (see [The desktop app's tests](#the-desktop-apps-tests)) | no |
 | `just desktop-packages ARCH` | the .deb on Ubuntu 22.04 and the .rpm on Fedora 42 install and claim `illogical://` (after `just desktop-linux ARCH`) | no |
-| `testnet/macos/desktop.sh`, `testnet/macos/update.sh` | the macOS app from its .dmg in a fresh tart VM, and its updater | no |
+| `testnet/macos/desktop.sh`, `testnet/macos/update.sh`, `testnet/macos/stale-daemon.sh` | the macOS app from its .dmg in a fresh tart VM, its updater, and a daemon too old for it (#317) | no |
 | `just check-macos` | clippy for the macOS target from Linux (compiles, doesn't link) | Linux |
 
-CI (`.github/workflows/check.yml`) runs on pushes, on our own machines: the
-testnet's ssh and control profiles, `just check` and `just e2e` on Linux
-(geek); `just test` and `just e2e-webkit` on macOS (jake-mini). Both
-runners need Docker (the testnet, and `ssh.rs` in `just test`): without it
-the run fails. `just browsers` installs Playwright's browsers (with their
+CI (`.github/workflows/check.yml`) runs on pushes, every job it can at
+once (#287); a new push to a branch cancels that branch's run:
+- **lint** (GitHub's runners): rustfmt, shellcheck, `just test-scripts`
+  and gitleaks.
+- On geek's pool (eight runners, `linux-x86_64-ci`):
+  - **build** and **static**: the debug binaries (with `--features
+    debug-embed`, so they carry `web/dist`) and the box's static ones,
+    once, kept for the run's other jobs (`scripts/ci-env keep`);
+  - **clippy**: Linux, both Macs (`just check-macos`), the desktop app
+    and `just notices`;
+  - **test**: `just test`, the box's binaries from static;
+  - **testnet**: the test stack's ssh and control profiles;
+  - **e2e**: the specs (`E2E_SET=rest`) in six `--shard`s, each with its
+    own test daemon on a free port; **stack**: those on the test stack
+    (`E2E_SET=stack`); **perf**: the specs that time things (`E2E_SET=perf`:
+    the frame rates, `editors.spec.ts`), after the shards, which leave geek
+    too busy to measure them.
+  Each job takes one of two build directories kept for its kind of job,
+  and a test stack with its own name, ports and subnet (`scripts/ci-env`),
+  so jobs and runs on geek don't share either.
+  Pushes to branches other than main skip testnet, stack and perf (geek
+  runs several branches at once, and their load failed the tests that
+  time things); `gh workflow run check.yml --ref BRANCH` runs them all.
+- **macos** (GitHub's `macos-15`, Apple silicon, free for a public repo):
+  `just test` and `just e2e-webkit`, with `ILLOGICAL_SKIP_DOCKER=1` (no
+  Docker there; geek's test runs the ssh tests).
+
+The Rust tests run under cargo-nextest (`.config/nextest.toml`): each in
+its own process and all at once, `ssh.rs` and `reboot.rs` one at a time
+(the test stack). CI's profile (`NEXTEST_PROFILE=ci`) retries a failure
+once and reports a test that passes the second time as flaky.
+
+geek needs Docker (the testnet, and `ssh.rs` in `just test`): without it
+the run fails. To run one shard's specs locally: `E2E_SET=rest
+pnpm exec playwright test --shard=2/6` in `web/`. `just browsers` installs Playwright's browsers (with their
 system libraries on Linux, if sudo needs no password; otherwise run `sudo
 pnpm exec playwright install-deps` in `web/` once). See
 [development.md](development.md) for the runners.
@@ -79,7 +109,9 @@ output goes nowhere. The rest is the test's to say:
   `--block-listen 127.0.0.1:0`.
 - `.env()`, `.envs()`, `.env_remove()`, and `.path()` for its `PATH`, so a
   test can keep it from finding something installed on this machine (chant,
-  say).
+  say). `ILLOGICAL_CHANT` is empty by default, so no test daemon reads the
+  host's agent config with `chant audit --agents`; a test that wants an
+  inventory sets it to a stand-in.
 - `.wait_secs()`: how long `wait_for` waits (15 s by default).
 - `.start()` runs it as a child of the test; `.service()` as a transient
   systemd user service (FD store and scopes as in production), or `None`,
@@ -108,7 +140,7 @@ do.
 Also in the crate: `listen`, which reads the port a daemon took from
 `state/listen` (don't pick a free port yourself and pass it in: it can be
 taken before the daemon binds it, #66); `strays`, the cleanup above; and
-`Scratch`, a temp dir removed on drop. `crates/daemon/tests/agentd/` builds
+`Scratch`, a temp dir removed on drop. `crates/daemon/tests/integration/agentd/` builds
 on it for agent block tests: a sessions dir for the fake agent, and helpers
 to open blocks and wait on them.
 
@@ -136,6 +168,13 @@ nonce, or control takes the second for a replay (`forge_wire.rs`). The
 first of these turned up a daemon bug: a pane read its agent's screen
 only when no command had come for a whole tick, so polling more often
 than that kept the screen from being read at all.
+
+Two connections don't keep each other's order: in `team-answers.spec.ts`
+the owner's trust grant goes over one and the teammate's follow-up over
+another, so the spec waits for the pane's `trusted` before sending (#258).
+A shell command that has to pause until the test is ready waits for a
+file the test creates (`reattach.spec.ts`), not for a `sleep`: 2000 runs
+of `sleep 0.0005` took 17 s on a Mac.
 
 ### Standing permission rules
 
@@ -184,7 +223,7 @@ before checking it in. Codex isn't installed where these were made, so
 `fixtures/screens/` and says so in its header.
 
 `replay.py` plays one. A test installs it with `Replay::install(dir,
-"claude", "claude_turn")` (`crates/daemon/tests/replay/`), which copies it
+"claude", "claude_turn")` (`crates/daemon/tests/integration/replay/`), which copies it
 to `dir/claude` with the recording beside it as `dir/claude.cast`, so the
 daemon sees a program named `claude` and reads its screen as Claude
 Code's (`$ILLOGICAL_REPLAY` names another recording). Where the recording
@@ -207,7 +246,9 @@ writes to the real `CLAUDE_CONFIG_DIR`.
 
 Where they're used: `crates/vt/src/detect/tests.rs` plays each recording
 through the terminal and checks every marker; `agent_screens.rs` runs them
-in a live pane with no hooks; `prompt.rs` and `mcp.rs` prompt the replayed
+in a live pane with no hooks, checks going quiet changes nothing for an
+agent whose screen is read, and has a stand-in chant print a recorded
+`chant audit --agents` document to decide whose rules run; `prompt.rs` and `mcp.rs` prompt the replayed
 Claude Code and wait; `resume.rs` stops and starts the daemon the way a
 reboot does and checks each pane comes back in its own conversation, a
 deleted transcript comes back as a shell that says so, and a session id
@@ -229,11 +270,12 @@ Recorded from real systems and checked in, so tests see real shapes:
 | `crates/vt/fixtures/` | raw PTY output of scripted sessions (`.bin`) and their sizes and resizes (`.json`) | `just fixtures [names]` (`record.py`) |
 | `crates/vt/fixtures/screens/` | Claude Code and Codex screens, the title on the first line | by hand, from a real terminal or a recording |
 | `crates/vt/fixtures/agents/` | Claude Code and Codex sessions with their timing, for the replay agent | `crates/vt/fixtures/agents/record.py NAME` |
-| `crates/daemon/tests/fixtures/github`, `gitlab`, `forgejo` | API responses for real PRs and issues (from S23) | by hand, as in `spikes/s23-forge/` |
-| `crates/daemon/tests/fixtures/conversations/` | Claude Code transcripts, one per shape (S20) | by hand, as in `spikes/s20-conversations/` |
+| `crates/daemon/tests/fixtures/github`, `gitlab`, `forgejo` | API responses for real PRs and issues (from S23) | by hand, as in `archive/spikes:spikes/s23-forge/` |
+| `crates/daemon/tests/fixtures/conversations/` | Claude Code transcripts, one per shape (S20) | by hand, as in `archive/spikes:spikes/s20-conversations/` |
 | `crates/daemon/tests/fixtures/conversations/desktop/` | the Claude desktop app's Code tab session records (#81, #83), made up from the fields S20 saw | by hand |
 | `crates/daemon/tests/fixtures/s13-*`, `s18-*` | Claude Code hook payloads | by hand |
 | `crates/daemon/tests/fixtures/fountain/`, `chant/` | Fountain API and chant output | by hand |
+| `crates/daemon/tests/fixtures/chant/audit-agents.json` | `chant audit --agents --scope system,user --format json` (chant 0.95.0), with only Claude Code configured | `chant audit --agents` with `HOME` a scratch dir holding only `.claude/CLAUDE.md` and `.claude/settings.json` |
 
 Scrub anything personal or secret before checking a recording in;
 `gitleaks` runs in CI.
@@ -257,6 +299,13 @@ loads each spec in the runner as well as the worker (#62).
 `E2E_DAEMON_LOG=<file>` keeps the test daemon's debug log, and
 `E2E_CONTROL_LOG=1` shows control's output in `sandboxes.spec.ts`.
 
+The whole run shares one browser, and Playwright closes only the contexts
+its `context` fixture made. A context a spec opens with
+`browser.newContext()` stays open, its pages still connected and drawing,
+through every spec after it, so later specs ran on a busier machine than
+they do alone (#258). Every spec that uses `browser` has
+`test.afterAll(closeContexts)` (from `helpers.ts`); a new one should too.
+
 A check that should hold in Chrome and WebKit goes in a plain module both
 projects' specs import, since a spec importing another spec registers its
 tests twice. The command palette (#139) is the example:
@@ -278,18 +327,20 @@ WebKit needs `pnpm exec playwright install webkit` once.
 
 ### Spike: blocks through control (S27)
 
-`spikes/s27-blocks/` has its own Playwright suite for #148 (blocks served
-from control's block domain, carried to the daemon over Noise by a service
-worker). It isn't part of `just e2e`; run it from that directory:
+S27 (`spikes/s27-blocks/`, now on the `archive/spikes` branch) has its own
+Playwright suite for #148 (blocks served from control's block domain, carried
+to the daemon over Noise by a service worker). It isn't part of `just e2e`;
+check the branch out in its own worktree and run it from the spike's directory:
 
 ```sh
-cd spikes/s27-blocks
-pnpm install
-./fetch-code-server.sh      # once, for tests/code-server.spec.ts (it skips without)
+git worktree add ../illogical-spikes archive/spikes
+cd ../illogical-spikes/spikes/s27-blocks
 pnpm test                   # builds s27 and the worker, then Chromium and WebKit
 pnpm typecheck
 ./linux-webkit.sh [specs]   # WebKit on Linux in Playwright's container (Docker, Zig)
 node safari/safari.ts       # real Safari via safaridriver; --ios for the Simulator
+./webkitgtk.sh              # the same in the desktop app's WebKitGTK (Ubuntu 22.04, Docker)
+./netem.sh                  # the latency spec with control, box and browser 20 ms apart (Docker)
 ```
 
 Hostnames (`control.test`, `*.blocks.test`) go to 127.0.0.1 through a
@@ -360,27 +411,43 @@ the testnet's `control` claims use both. `approve` takes a CLI's code from
 
 ## The desktop app's tests
 
-M46's promises, each checked with nobody at the keyboard. Linux runs in a
+M46's and M47's promises, each checked with nobody at the keyboard. Linux runs in a
 container under Xvfb and Openbox with xdotool typing; macOS runs in a fresh
 tart VM clone (`testnet/macos/vm.sh`) where System Events types into the
 logged-in session over ssh.
 
 | Claim | Linux (`just desktop-xvfb m46 CLAIM`) | macOS (`testnet/macos/desktop.sh CLAIM`) | A failure means |
 |---|---|---|---|
-| Chords reach the page | `keys`: Ctrl-W, T, N, Q, Tab, F1, F10, Alt-x arrive in a recording pane as bytes | `keys`: Ctrl-W, T, N, Q, Tab as bytes; Cmd-W closes the pane and not the window; Cmd-T opens a tab; Cmd-Q, H, M leave the app up | a menu or the toolkit took a key the terminal needs |
-| Tabs in the titlebar | `titlebar`: no decorations; dragging the bar moves the window; the bar's maximize and minimize work | `tabs`: Cmd-N opens a window as a native tab | the window can't be moved or managed without the system's titlebar |
+| Chords reach the page | `keys`: Ctrl-W, T, N, Q, Tab, F1, F10, Alt-x arrive in a recording pane as bytes | `keys`: Ctrl-W, T, N, Q, Tab as bytes; Cmd-W closes the pane and not the window; Cmd-T opens a tab; Cmd-M leaves the app up; Cmd-H hides it and Cmd-Q quits it, the panes still running | a menu or the toolkit took a key the terminal needs |
+| Tabs in the titlebar | `titlebar`: no decorations; dragging the bar moves the window; the bar's maximize and minimize work | `tabs`: Cmd-N opens a window as a native tab; with two and three tabs the page's bar starts below AppKit's tab bar, and Cmd-Shift-W back to one tab hides the strip (#323). `this`: the tray's *This machine*, clicked three times, adds no window or tab | the window can't be moved or managed without the system's titlebar |
+| App-supplied dragging (#316) | `bare`: a plain page with no drag markup at `ILLOGICAL_URL` moves by its top strip, not below it, and a double-click on the strip maximizes | `drag` (drag.js, CGEvents): the page's bar moves the window as before; a plain page with no drag markup moves by its top strip, not below it, and a double-click there zooms | a page from an older daemon leaves the window stuck |
 | `illogical://` | `links`: a second launch with `illogical://open?cwd=DIR` opens a tab in DIR in the running app and shows it; `illogical://pane/%N` shows N | `links`: the same through `open URL` (the URL scheme in Info.plist) | links start a second app, or open nothing |
 | Global hotkey | `hotkey`: off by default; on, Ctrl+Alt+Space hides the focused window and brings it back | `hotkey`: the same with Ctrl-Option-Space | |
 | Service registration | (the systemd unit: `illogicald install`, unchanged) | `agent`: the first start registers the launch agent through SMAppService, BTM lists it, the bundle's daemon answers the linked CLI, no second plist | the app runs a daemon that isn't the one Login Items shows, or two |
 | Working pane, no terminal | | `install`, `pane`: the .dmg installs, and a command typed into the window runs | |
 | Panes outlive the app | | `restart`: the daemon's pids and panes are the same after the app restarts | |
-| Packages | `just desktop-packages ARCH`: .deb and .rpm install, libraries resolve, xdg-mime hands `illogical://` to the app | `install` above | |
-| Updates | | `update.sh`: 0.17.0 refuses a manifest signed with another key, then replaces itself with 0.17.1 and restarts; a running vim and a counting build carry on | |
+| Right-click a folder (M47) | `m47` (`just desktop-xvfb m47`): with the packages' .desktop file and Nautilus extension, a right-click on a folder (and inside one) in Nautilus, *Open in illogical*, opens a tab there in the running app and shows it | `finder`: the service is registered (`pbs`); a right-click on a folder in Finder, *New illogical Tab Here*, opens a tab there; a `.command` file opened with the app runs in a new pane | the file manager's menu has no entry, or it starts a second app |
+| Packages | `just desktop-packages ARCH`: .deb and .rpm install, libraries resolve, xdg-mime hands `illogical://` to the app, the .desktop file passes the link (`%u`) and has a New Tab action, the Nautilus extension is in place | `install` above | |
+| A daemon too old for the app (#317) | `just desktop-xvfb stale`: a 0.8.0 stand-in (`old-daemon.py`, no protocol) installed as the service, stopped (`stopped`) or running (`running`): the app says 0.8.0 runs and 0.19.0 is needed, 0.8.0 still answers afterwards, and it served no page | `stale-daemon.sh`: the same with the released 0.8.0 (`OLD=` another below 0.19.0), installed with its own `illogicald install` | the app shows an old daemon's page, or replaces a daemon (#392) |
+| Updates | | `update.sh`: 0.17.0 refuses a manifest signed with another key, then replaces itself with 0.17.1 and restarts; the new app carries a newer daemon and leaves the running one alone (#392); a running vim and a counting build carry on | |
 
 `update.sh` makes a throwaway updater key and builds the app twice with
-it. Both versions carry the same daemon, so the daemon isn't restarted by
-that test; `upgrade.rs`'s path (a newer bundled daemon replaces the
-running one, panes kept) is #176's. The macOS app is copied in without
+it. The installed one carries a daemon one minor version older than the
+tree's (built from a copy of the tree with only the version changed, kept
+in `target/update-old`), so the new app carries a newer daemon than the
+one running and must leave it alone (#392): the same process, at the same
+version, with its panes.
+
+Nautilus and Finder are driven as a person would: the mouse right-clicks
+the folder (xdotool at the spot AT-SPI reports, under Xvfb; a CGEvent at
+the row's position in the VM, since System Events' `AXShowMenu` opens no
+menu on a Finder row), and the menu item is clicked through AT-SPI or
+System Events. The VM sends Finder no Apple Events: those need a person
+to allow them. The Xvfb image links `/usr/lib/libpython3.10.so.1.0`
+because 22.04's arm64 `python3-nautilus` looks for it there (amd64's
+looks in the right place).
+
+The macOS app is copied in without
 the quarantine flag: an ad-hoc signed download needs a person's
 right-click > Open past Gatekeeper, which only a notarized build (#177)
 removes.
@@ -395,14 +462,25 @@ Three tests cover M49, from fastest to most faithful:
   loopback, approved by the headless device, then `--host box` (direct, it
   has `--direct-url`) and `--host box2` (no URL, so relayed) each `run`,
   `ls` and `capture`, with the CLI's `ILLOGICAL_SOCK` pointing at no
-  daemon. `illogical-control`'s own `routing_wire` test checks the join
+  daemon. On both, `events --follow` and `tail --follow` must print while
+  they're still running (#254: a streamed answer, in parts), and `attach`
+  with a pipe for stdin types a command, sees its answer and detaches on
+  Ctrl-]. `illogical-control`'s own `routing_wire` test checks the join
   and the signed requests (`cargo test -p illogical-control the_cli_joins`).
 - `web/e2e/host-menu-control.spec.ts` (`just e2e`): a daemon joined by
   code (approved by the device) has *All your machines…* in its host menu,
   opening control's page; one that isn't joined doesn't.
 - The testnet's `m49` claim (`just testnet test control m49`; Docker):
   the CLI on the bastion, with no daemon, logs in and reaches box-bare
-  directly and box-systemd through the relay. It's in the
+  directly and box-systemd through the relay; on box-systemd it also
+  follows events and a pane's output, and drives `attach` and `tui` in a
+  pty (`ssh -tt`, keys piped in with pauses). `m49team` reaches another
+  account's machine: an owner (a second headless device, `devs FILE` in
+  `testnet/test.sh`) makes a team and joins box-systemd to it, the CLI's
+  account asks to join and is let in, and the CLI lists the box as the
+  owner's, captures its pane and attaches to it as a team editor. Under
+  `BREAK=1` the CLI has pinned another root for the owner's account, so the
+  box is refused. Both are in the
   [SSH track's table](#the-ssh-tracks-tests) and
   [testnet/README.md](../testnet/README.md#claims). Beside another
   worktree's stack: `COMPOSE_PROJECT_NAME=illo-j
@@ -460,7 +538,7 @@ stack recreate the boxes they use, so give each worktree its own stack
 | Test | Also needs | Run |
 |---|---|---|
 | the testnet's claims | `ssh`: nothing more. `control`: node, and the static binaries (`just static aarch64` on Apple silicon, `just static` on x86_64) | `just testnet up ssh` (or `control`), `just testnet test ssh`, `just testnet break ssh`, `just testnet down` |
-| `crates/daemon/tests/ssh.rs`, `reboot.rs` (in `just test`) | the box's static binaries (or `ILLOGICAL_SSH_BINARIES`); `reboot.rs` also node and Playwright's Chromium in `web/` (`cd web && pnpm install`) | `cargo test -p illogicald --test ssh` (or `--test reboot`); they bring the `ssh` profile up themselves |
+| `crates/daemon/tests/integration/ssh.rs`, `reboot.rs` (in `just test`) | the box's static binaries (or `ILLOGICAL_SSH_BINARIES`); `reboot.rs` also node and Playwright's Chromium in `web/` (`cd web && pnpm install`) | `cargo test -p illogicald --test integration ssh::` (or `reboot::`); they bring the `ssh` profile up themselves |
 | `testnet/measure-tailnet.sh` (S28) | the static binaries | `just testnet measure tailnet`; it brings the `tailnet` profile up itself |
 | `team-swarm-phones.spec.ts`, "a machine on another network, behind netem" (in `just e2e`) | `just static <arch>`; it builds a small Debian image with `tc` and `socat`, names its container and network after `COMPOSE_PROJECT_NAME`, and removes them after | `just e2e` |
 | `just desktop-xvfb` | podman or Docker | `just desktop-xvfb` |
@@ -488,7 +566,7 @@ These aren't part of `just check`: each has its own recipe.
 | #17 on two machines: home's layout holds panes on `mac`, which drops off the network (`docker network disconnect`) and comes back | `just testnet-hosts` | [testnet/hosts/README.md](../testnet/hosts/README.md) |
 | M28 in real VS Code (downloaded by `@vscode/test-electron`) over Microsoft's Remote-SSH into a box running illogicald: a phone follows the cursor, a breakpoint is a card it continues, an edit is accepted from its rail | `just testnet-editors` (downloads VS Code, its server and Remote-SSH; on Linux it runs under `xvfb-run`) | [testnet/editors/README.md](../testnet/editors/README.md) |
 
-The forge tests are `crates/daemon/tests/forges_real.rs`, marked
+The forge tests are `crates/daemon/tests/integration/forges_real.rs`, marked
 `#[ignore]` so `cargo test` doesn't need the containers;
 `testnet/forges/test.sh` runs them with `--ignored` against the stack
 `up.sh` started, and they fail if it isn't there. The other two are
@@ -502,7 +580,7 @@ their own recipes, which set `ILLOGICAL_TESTNET_HOSTS=1` or
 
 `.github/workflows/forges-nightly.yml` runs every night and on demand
 (never on pull requests): the Forgejo and GitLab tests above, and
-`crates/daemon/tests/forges_github_real.rs` against github.com, which
+`crates/daemon/tests/integration/forges_github_real.rs` against github.com, which
 covers #93's GitHub boxes (a review approved from the rail, a red Actions
 check rerun, a box with no `gh` login reading through the App's
 installation token and refusing writes, and the App's webhook poking the
@@ -525,7 +603,7 @@ checking GitHub's signature on a real delivery is not covered there.
 ## The SSH track's tests
 
 S28 (#153), M51 (#154), M52 (#155) and M65 (#198) each promise something
-about reaching a machine over ssh (PLAN.md, "SSH track" and M65). The
+about reaching a machine over ssh (plan-archive.md, "SSH track" and M65). The
 tests below guard those promises, so when one fails, the table says which
 promise broke.
 
@@ -539,7 +617,8 @@ The promises:
    pane works while the owner is attached with their agent, and not
    without it.
 4. ssh is enough to join control (M52). Afterwards control reaches the box
-   with ssh closed, and again after the box reboots.
+   with ssh closed, and again after the box reboots, including from a
+   phone.
 5. A box that can't reach control is told so clearly, and stays reachable
    over `--ssh`.
 6. A guest with only OpenSSH can watch or drive one pane, and nothing else
@@ -565,7 +644,9 @@ a machine in those promises:
   its relay, at a private address on the inner network that the boxes
   reach by dialing out, and fake GitHub, Stripe and Web Push.
   `web/fixtures/device-cli.ts` on the host is the person's phone or
-  browser ([A device that approves things](#a-device-that-approves-things)).
+  browser ([A device that approves things](#a-device-that-approves-things)),
+  and `web/fixtures/m52-phones.ts` drives real phone pages (a Pixel 7 in
+  Chrome, an iPhone in WebKit) against it.
 - `headscale`, `ts-box` and `ts-client` (the `tailnet` profile): the
   tailnet path that S28 compares ssh against.
 
@@ -578,13 +659,15 @@ reached only over ssh.
 | Test | Closes | What it does | A failure means |
 |---|---|---|---|
 | `just testnet test ssh` (`login`, `jump`, `inner`, `bare`, `stdio`, `agent`, `push`, `linger`) | the ground under #153 (S28) and #154 (M51) | checks the stack is the shape the other tests assume: the key and host keys work, ProxyJump works, box-bare has no route out and no illogical, 1 MiB of random bytes cross ssh's stdio unchanged, a forwarded agent shows on the box, `git push` works with only the forwarded agent, and a user turns on lingering with no sudo | the environment changed, not illogical: read it before any other failure. `bare` fails on a box an earlier run installed on (`just testnet down` and `up`); `stdio` means the transport S28's bridge rides on isn't clean; `linger` means no Linux box could keep a daemon past logout without sudo |
-| `crates/daemon/tests/ssh.rs` | #154 (M51): "an e2e test drives it against a local sshd"; `git push` uses the client's agent | on a recreated box-bare: the first `--ssh box-bare ls` installs and starts the daemon; `run` and `capture` a pane; the client's key shows in a pane while a client is attached; a `git push` from a pane reaches the git server; the same push with `ILLOGICAL_SSH_AGENT=no` is refused; the pane outlives the connection; a saved `ssh://box-bare` host works with `--host`, and an option as a destination (`ssh://-oProxyCommand=id`) is refused | promise 1 (no install or no daemon on a fresh box), promise 3 (the push failed with the agent, or worked without it, so panes see some other agent or none), promise 2 (the pane went with the connection), or the host list |
-| `crates/daemon/tests/reboot.rs` | #26; M52's "the box survives a reboot" on Linux | installs over `--ssh` as a lingering user service, builds #26's session (splits, a nested directory, coloured output, every restart policy, a browser block, an agent block), then `docker restart` twice with nobody logged in; checks the daemon is up, the journal's "saved for shutdown" and "restored", layout, directories, scrollback with `── restored`, each pane by its policy, both blocks, and a headless web client (`web/reconnect-watch.ts`) reconnecting without a reload | promise 2 on Linux if the daemon isn't up after the restart (lingering, the user service); otherwise a restore regressed (#26), named by the assertion |
+| `crates/daemon/tests/integration/ssh.rs` | #154 (M51): "an e2e test drives it against a local sshd"; `git push` uses the client's agent | on a recreated box-bare: the first `--ssh box-bare ls` installs and starts the daemon; `run` and `capture` a pane; the client's key shows in a pane while a client is attached; a `git push` from a pane reaches the git server; the same push with `ILLOGICAL_SSH_AGENT=no` is refused; the pane outlives the connection; a saved `ssh://box-bare` host works with `--host`, and an option as a destination (`ssh://-oProxyCommand=id`) is refused | promise 1 (no install or no daemon on a fresh box), promise 3 (the push failed with the agent, or worked without it, so panes see some other agent or none), promise 2 (the pane went with the connection), or the host list |
+| `crates/daemon/tests/integration/reboot.rs` | #26; M52's "the box survives a reboot" on Linux | installs over `--ssh` as a lingering user service, builds #26's session (splits, a nested directory, coloured output, every restart policy, a browser block, an agent block), then `docker restart` twice with nobody logged in; checks the daemon is up, the journal's "saved for shutdown" and "restored", layout, directories, scrollback with `── restored`, each pane by its policy, both blocks, and a headless web client (`web/reconnect-watch.ts`) reconnecting without a reload | promise 2 on Linux if the daemon isn't up after the restart (lingering, the user service); otherwise a restore regressed (#26), named by the assertion |
 | `just testnet test control signin reach` | the ground under #155 (M52) | a device signs in with the fake GitHub and is trusted; box-systemd reaches control at its inner address | the stack, not M52: the fakes or the inner network |
-| `just testnet test control m52` | #155 (M52): one step plus the approval, the pane opens from the phone, ssh out of the picture, the box survives a reboot | on a fresh box-systemd, `illogical --ssh box-systemd join` installs and starts the daemon and prints a code; the device approves it; the box is on the device list and online; with the CLI's ssh master closed and the bastion paused, a marker round-trips through a pane over the relay; after `docker restart` the pane answers over the relay again | promise 4: the join over ssh, the approval, the relay with ssh gone, or coming back after a reboot (which also rests on promise 2) |
+| `just testnet test control m52` | #155 (M52): one step plus the approval, the pane opens from the phone, ssh out of the picture, the box survives a reboot | on a fresh box-systemd, `illogical --ssh box-systemd join` installs and starts the daemon and prints a code; the device approves it; the box is on the device list and online; with the CLI's ssh master closed and the bastion paused, a marker round-trips through a pane over the relay. Then `web/fixtures/m52-phones.ts`: a Pixel 7 (Chrome) and an iPhone (WebKit) sign in to the stack's control, the device approves each, and each opens the box's pane, taps it and types a marker, which the device reads back from the box's pane over the relay; the script `docker restart`s the box, and the same open pages reach it again by themselves and type a second marker; after that the device's own marker round-trips too | promise 4: the join over ssh, the approval, the relay with ssh gone, a phone's page reaching the box through control, or coming back after a reboot (which also rests on promise 2). `m52-phones:` on stderr names the phone and the step |
 | `just testnet test control unreachable` | #155 (M52): "a box that can't reach control says so and stays reachable over `--ssh`" | box-bare, with no route out, joins the hosted control; the output must name the box and control and give `illogical --ssh box-bare tui`, and `--ssh box-bare ls` still works | promise 5 |
-| `just testnet test control m49` | #149 (M49) | box-systemd and box-bare join over ssh; the CLI on the bastion, with no daemon, logs in with a code the device approves, lists both from control, and runs, lists and captures on box-bare directly and box-systemd through the relay ([M49](#m49-the-cli-through-control)) | the CLI through control (login, `hosts`, direct or relayed routing); the joins it starts with are promise 4 |
-| `crates/daemon/tests/guest_ssh.rs`, `web/e2e/guest-ssh.spec.ts` | #198 (M65): the direct path and the pane menu entry | the system OpenSSH client as a guest against a dev daemon ([below](#guest-ssh-m54)) | promise 6; the test's name says which part (read-only, read-write, ending a session, refusals, the CLI) |
+| `just testnet test control m49` | #149 (M49), #254 | box-systemd and box-bare join over ssh; the CLI on the bastion, with no daemon, logs in with a code the device approves, lists both from control, and runs, lists and captures on box-bare directly and box-systemd through the relay; on box-systemd, `events --follow` and `tail --follow` print while running, and `attach` and `tui` in a pty type a command, see the answer and leave with Ctrl-] ([M49](#m49-the-cli-through-control)) | the CLI through control (login, `hosts`, direct or relayed routing, streamed answers, `/ws` over the channel); the joins it starts with are promise 4 |
+| `just testnet test control m49team` | #254: a team machine listed and reachable from `illogical hosts` | an owner's team with box-systemd in it; the CLI's account asks to join and is admitted; `hosts` lists box-systemd as the owner's, and the CLI captures its pane and attaches to it (relayed) | pinning and checking another account's root, or a team member's CLI device not taken by the team's machine |
+| `crates/daemon/tests/integration/guest_ssh.rs`, `web/e2e/guest-ssh.spec.ts` | #198 (M65): the direct path and the pane menu entry | the system OpenSSH client as a guest against a dev daemon ([below](#guest-ssh-m65)) | promise 6; the test's name says which part (read-only, read-write, ending a session, refusals, the CLI) |
+| `guest_ssh.rs`'s `a_guest_reaches_a_daemon_behind_nat_through_controls_jump_host` | #253 (M65's relay) | box-systemd joined to the `control` profile's control, a guest on the host through control's jump host | promise 6 for a box behind NAT, and control can't read the pane |
 | `testnet/measure-tailnet.sh` (`just testnet measure tailnet`) | #153 (S28): the tailnet comparison | installs illogical on ts-box over ssh from ts-client, checks both paths see the same panes, then times `illogical ls` and an 8 MiB `illogical export` over `--ssh` and over the tailnet | one path no longer reaches the daemon, or the two disagree about its panes. Slower numbers don't fail it: compare them with `spikes/s28-ssh/README.md` |
 | `just macos launchd` | #153 (S28) and #155 (M52): jake-mini with no GUI session | in a fresh macOS VM, a user who never had a GUI session runs `illogicald install` over ssh: it installs the background agent, warns that it won't start after a reboot by itself, and the daemon and pane outlive the ssh session; `illogical --ssh` from the host starts it and passes the warning on; `install --system` survives a VM restart with nobody logged in, its pane restored; `uninstall` leaves nothing of either ([its claims](#the-tests)) | promise 2 on macOS: the install a Mac reached only over ssh gets, and what it says about reboots |
 
@@ -614,7 +697,7 @@ case instead (`ssh.rs`'s push with `ILLOGICAL_SSH_AGENT=no`,
 
 ### Guest ssh (M65)
 
-`crates/daemon/tests/guest_ssh.rs` runs the system OpenSSH client
+`crates/daemon/tests/integration/guest_ssh.rs` runs the system OpenSSH client
 (`/usr/bin/ssh`, 8.5 or later for `KnownHostsCommand`) against a dev
 daemon started with `--guest-ssh 127.0.0.1:0 --guest-ssh-host 127.0.0.1`.
 Each guest is the command the daemon printed, run by `sh` on a
@@ -637,8 +720,27 @@ ssh config and agent stay out of it. They check:
 - `illogical share --guest` prints a command that works, and `illogical
   guests` lists and revokes.
 
-Run them with `cargo test -p illogicald --test guest_ssh`. They skip,
-saying so, if there's no `ssh` on PATH. `web/e2e/guest-ssh.spec.ts`
+The relay path, `a_guest_reaches_a_daemon_behind_nat_through_controls_jump_host`,
+runs against the `control` profile (Docker; `just static` first, and
+`node` for the approving device). box-systemd, which has no route out but
+to control and which nothing on the host can reach, joins control over ssh
+and runs a pane; `illogical --ssh box-systemd share --guest` then gives a
+command through control's jump host (`127.0.0.1:22982`,
+`ILLOGICAL_TESTNET_GUEST_SSH_PORT`), and a guest on the host runs it. The
+hop's `ssh` is wrapped in a `tee` both ways, which records exactly what
+control's jump host carried for the session. The test checks:
+
+- the guest sees the pane's screen and its live output, and `illogical
+  guests` on the box counts them;
+- what control carried starts with the daemon's `SSH-2.0-` banner and has
+  neither the pane's text nor the token in it, and control's log has
+  neither (nor the route): control relays ciphertext;
+- a wrong route, and the same command after `guests revoke`, are refused
+  at the hop, with nothing passed on to the daemon.
+
+Run them with `cargo test -p illogicald --test integration guest_ssh::`. They skip,
+saying so, if there's no `ssh` on PATH; the relay test fails without
+Docker unless ILLOGICAL_SKIP_DOCKER=1. `web/e2e/guest-ssh.spec.ts`
 covers *Invite over ssh…* in the pane menu, on desktop and phone viewports,
 with the same system ssh (`pnpm exec playwright test e2e/guest-ssh.spec.ts`
 in `web/`, after `cargo build -p illogicald` and `pnpm run build`).
@@ -648,16 +750,7 @@ in `web/`, after `cargo build -p illogicald` and `pnpm run build`).
 - **Tailscale SSH's check mode** (S28): it sends the user to an identity
   provider's login, so no test can answer whether its prompt shows in the
   client's terminal. It's in [By hand](#by-hand).
-- **The guest ssh relay path** (M65, through control's ssh jump host):
-  not built. `a_guest_reaches_a_daemon_behind_nat_through_controls_jump_host`
-  in `guest_ssh.rs` is an `#[ignore]`d stub until it is, and its test will
-  run against the `control` profile.
-- **M49's attach, `tui` and event streams through control, and team
-  machines through control**: not built, so `m49` covers `run`, `ls` and
-  `capture` only.
-- **M53**, the desktop app over ssh: gated (PLAN.md), no tests.
-
-The relay path and M49's streams are in [Planned](#planned).
+- **M53**, the desktop app over ssh: gated (plan-archive.md), no tests.
 
 ## A fresh Mac: the tart VM harness
 
@@ -725,7 +818,7 @@ What they found (2026-10-05, macOS 26.6.2 in the VM):
   logs in to the GUI again, and an ssh login doesn't. A LaunchDaemon with
   `UserName` survives both, with its panes restored. `illogicald install`
   now picks the Background agent when there's no GUI domain and says the
-  restart caveat, and `--system` installs the LaunchDaemon (PLAN.md, M52);
+  restart caveat, and `--system` installs the LaunchDaemon (plan-archive.md, M52);
   every `launchd` check passes, and every one fails with `BREAK=1`.
 - **A hard stop loses recent pane output.** `tart stop` on this image is
   a power cut (the guest doesn't shut down in time), and a pane made a
@@ -766,7 +859,7 @@ what's missing:
 |---|---|
 | `agents_real.rs`, `swarm-real.spec.ts` | `ILLOGICAL_REAL_AGENTS=claude,codex,screen,...` (real agents; costs a few cents); `screen` uses `ANTHROPIC_API_KEY` when it's set, and VM agents `~/.config/illogical/claude-oauth-token` or `anthropic-key` |
 | `mcp.spec.ts`, "the real Claude Code runs a build over MCP" | `ANTHROPIC_API_KEY` and `claude` on PATH (costs a few cents) |
-| `resident.rs`, `machines.rs`, `fs.rs`, `mcp.rs`'s VM test, `resident.spec.ts`, `editors-vm.spec.ts` | a wispd token (`ILLOGICAL_WISP_TOKEN_FILE` or `~/.local/share/wisp/token`), and `just static` for the resident tests |
+| `resident.rs`, `machines.rs`, `vm_reboot.rs`, `fs.rs`, `mcp.rs`'s VM test, `resident.spec.ts`, `editors-vm.spec.ts` | a wispd token (`ILLOGICAL_WISP_TOKEN_FILE` or `~/.local/share/wisp/token`), and `just static` for the resident tests |
 | `sandbox.spec.ts` (`just e2e-sandbox`) | `ILLOGICAL_E2E_TAILNET_AUTHKEY_FILE` and wispd |
 | `forges_github_real.rs` | the test organization's variables and secrets ([the nightly job](#the-nightly-job-against-githubcom)) |
 | `guest_ssh.rs`, `guest-ssh.spec.ts` | an `ssh` client on PATH |
@@ -808,12 +901,10 @@ Real gaps, each one automatable:
   detach and reattach ([development.md](development.md#testing-iterm2))
   aren't in `just macos iterm2` yet; they can be, with the same
   AppleScript.
-- **S27 in real Safari:** `spikes/s27-blocks/safari/safari.ts` (and
-  `--ios`) in the tart VM, unattended.
+- **S27 in iOS Safari:** `archive/spikes:spikes/s27-blocks/safari/safari.ts --ios`
+  needs the Simulator, so the Xcode image (#257). macOS Safari runs
+  unattended with `testnet/macos/s27-safari.sh`.
 - **The tart tests in CI** on the macos-arm64 runner ([above](#on-the-macos-arm64-runner)).
-- **The guest ssh relay path** (M65), once control's jump host is built.
-- **M49's attach, `tui` and event streams, and team machines, through
-  control**, once built.
 - **Control checking GitHub's signature on a real webhook delivery**: it
   needs a URL github.com can reach.
 - **Cursor's Remote-SSH and the Dev Containers extension** (M28).

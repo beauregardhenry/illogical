@@ -17,6 +17,7 @@ mod db;
 mod forge;
 #[cfg(test)]
 mod forge_wire;
+mod guest_jump;
 mod limit;
 mod passkey;
 mod push;
@@ -29,6 +30,7 @@ mod routing_wire;
 mod sandboxes;
 mod sprites;
 mod teams;
+mod turn;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -42,6 +44,7 @@ use axum::{
     serve::ListenerExt,
 };
 use clap::Parser;
+use illogical_control_wire as wire;
 use rust_embed::Embed;
 use serde_json::json;
 use tracing::info;
@@ -106,6 +109,15 @@ struct Args {
     sprites_url: String,
     #[arg(long, env = "SPRITES_TOKEN", hide_env_values = true)]
     sprites_token: Option<String>,
+
+    /// TURN for huddles (M63): a Cloudflare TURN key's id and API token.
+    /// Without them, daemons get public STUN only.
+    #[arg(long, env = "CLOUDFLARE_TURN_KEY_ID", hide_env_values = true)]
+    turn_key_id: Option<String>,
+    #[arg(long, env = "CLOUDFLARE_TURN_API_TOKEN", hide_env_values = true)]
+    turn_api_token: Option<String>,
+    #[arg(long, default_value = "https://rtc.live.cloudflare.com", env = "ILLOGICAL_TURN_API", hide = true)]
+    turn_api: String,
     /// The static daemon (x86_64 musl) to put in them.
     #[arg(long, default_value = "/illogicald", env = "ILLOGICAL_SANDBOX_BINARY")]
     sandbox_binary: PathBuf,
@@ -145,6 +157,12 @@ struct Args {
     relay_max_machines: usize,
     #[arg(long, default_value_t = 2_000, env = "ILLOGICAL_RELAY_DAILY_MB")]
     relay_daily_mb: u64,
+    /// Relay sockets at once, every account's together (#344), 0 for no
+    /// limit. Keep it below the proxy's connection limit (Fly's
+    /// `soft_limit`), so a full relay still leaves room for pages and
+    /// sign-ins.
+    #[arg(long, default_value_t = 5_000, env = "ILLOGICAL_RELAY_MAX_TOTAL")]
+    relay_max_total: usize,
 
     /// Off-site backup with Litestream (#174).
     #[command(flatten)]
@@ -177,6 +195,17 @@ struct Args {
     /// copy (development).
     #[arg(long)]
     static_dir: Option<PathBuf>,
+
+    /// An ssh jump host for guests of daemons behind NAT (M65: a daemon's
+    /// `illogical share --guest` goes through it when the daemon has no
+    /// address of its own), listening here. Off unless set.
+    #[arg(long, env = "ILLOGICAL_CONTROL_GUEST_SSH")]
+    guest_ssh: Option<SocketAddr>,
+
+    /// The host[:port] guests dial for the jump host [default: the public
+    /// URL's host, and --guest-ssh's port].
+    #[arg(long, env = "ILLOGICAL_CONTROL_GUEST_SSH_HOST")]
+    guest_ssh_host: Option<String>,
 }
 
 pub struct Github {
@@ -215,6 +244,12 @@ pub struct App {
     pub app_logins: app_login::Tickets,
     /// Daemon signatures (and join proofs) already taken.
     pub daemon_sigs: auth::Replays,
+    /// TURN credentials for huddles (M63).
+    pub turn: Option<turn::Turn>,
+    /// The ssh jump host for guests (M65), when it's on, and the routes
+    /// daemons registered for it.
+    pub jump: Option<guest_jump::Jump>,
+    pub guest_routes: guest_jump::Routes,
 }
 
 #[cfg(test)]
@@ -245,22 +280,31 @@ impl App {
             forge: Default::default(),
             app_logins: Default::default(),
             daemon_sigs: Default::default(),
+            turn: None,
+            jump: None,
+            guest_routes: Default::default(),
         }
     }
 }
 
-/// An API error: `{"error": "..."}` with a status.
+/// An API error: `{"error": "..."}` with a status, and a `reason` code
+/// where a client acts on which refusal it was (#327).
 #[derive(Debug)]
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(StatusCode, String, Option<&'static str>);
 
 pub fn err(status: StatusCode, msg: &str) -> ApiError {
-    ApiError(status, msg.to_owned())
+    ApiError(status, msg.to_owned(), None)
+}
+
+/// An error with a reason code beside the sentence.
+pub fn refusal(status: StatusCode, reason: &'static str, msg: &str) -> ApiError {
+    ApiError(status, msg.to_owned(), Some(reason))
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         tracing::warn!(error = %e, "internal error");
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "something went wrong".into())
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "something went wrong".into(), None)
     }
 }
 
@@ -272,7 +316,10 @@ impl From<serde_json::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        match self.2 {
+            Some(reason) => (self.0, Json(json!({ "error": self.1, "reason": reason }))).into_response(),
+            None => (self.0, Json(json!({ "error": self.1 }))).into_response(),
+        }
     }
 }
 
@@ -294,7 +341,7 @@ pub fn day(ms: u64) -> String {
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
-        .route("/control.json", get(control_json))
+        .route(wire::CONTROL_JSON, get(control_json))
         .route("/auth/github", get(auth::github_start))
         .route("/auth/github/callback", get(auth::github_callback))
         .route("/auth/logout", post(auth::logout))
@@ -321,14 +368,14 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/devices/{id}/reject", post(api::reject))
         .route("/api/revocations", post(api::revoke))
         .route("/api/recovery", post(api::add_recovery))
-        .route("/api/join", post(api::join))
-        .route("/api/join/{code}", get(api::join_poll))
+        .route(wire::JOIN, post(api::join))
+        .route(wire::JOIN_POLL, get(api::join_poll))
         .route("/api/joins/{code}", get(api::join_show))
         .route("/api/joins/{code}/approve", post(api::join_approve))
         .route("/api/joins/{code}/reject", post(api::join_reject))
         .route("/api/daemons/{id}/team", post(api::move_daemon))
-        .route("/api/daemon/trust", get(api::daemon_trust))
-        .route("/api/daemon/leave", post(api::daemon_leave))
+        .route(wire::TRUST, get(api::daemon_trust))
+        .route(wire::LEAVE, post(api::daemon_leave))
         .route("/api/directory", get(api::directory))
         .route("/api/shares/{daemon}", post(teams::answer_share))
         .route("/api/people", get(teams::person))
@@ -344,10 +391,11 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/invites/{team}/{code}/preview", get(teams::preview_invite))
         .route("/api/presigned/{team}/{key}", get(teams::show_presigned))
         .route("/api/presigned/{team}/{key}/preview", get(teams::preview_presigned))
-        .route("/api/daemon/team", get(teams::daemon_team))
-        .route("/api/daemon/peers", get(teams::daemon_peers))
-        .route("/api/daemon/teams", get(teams::daemon_teams))
-        .route("/api/daemon/access", post(teams::daemon_access))
+        .route(wire::TEAM, get(teams::daemon_team))
+        .route(wire::PEERS, get(teams::daemon_peers))
+        .route("/api/daemon/turn", get(turn::daemon_turn))
+        .route(wire::TEAMS, get(teams::daemon_teams))
+        .route(wire::ACCESS, post(teams::daemon_access))
         .route("/api/relay/link/{id}", get(relay::link))
         .route("/api/push/subscribe", post(push::subscribe))
         .route("/api/push/unsubscribe", post(push::unsubscribe))
@@ -362,7 +410,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/stripe/webhook", post(billing::webhook))
         .route("/github/webhook", post(forge::webhook))
         .route("/api/daemon/github/token", post(forge::daemon_token))
-        .route("/api/relay/dial", get(relay::dial))
+        .route(wire::RELAY_DIAL, get(relay::dial))
         .route("/api/relay/c/{id}", get(relay::client))
         .route("/api/relay/m", get(relay::many))
         .fallback(asset)
@@ -372,19 +420,31 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-async fn control_json(axum::extract::State(app): axum::extract::State<Arc<App>>) -> Json<serde_json::Value> {
+/// A typed answer, as JSON.
+pub fn reply<T: serde::Serialize>(answer: &T) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::to_value(answer).map_err(anyhow::Error::from)?))
+}
+
+async fn control_json(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+) -> Json<illogical_control_wire::ControlInfo> {
     // Passkeys need a domain name: WebAuthn refuses IP addresses.
     let passkeys = url::Url::parse(&app.cfg.public_url).is_ok_and(|u| matches!(u.host(), Some(url::Host::Domain(_))));
-    Json(json!({
-        "control": true, "url": app.cfg.public_url, "github": app.cfg.github.is_some(), "passkeys": passkeys,
-        "vapid": app.vapid.public(),
-        "github_app": app.github_app.as_ref().map(|g| g.slug.clone()),
+    Json(illogical_control_wire::ControlInfo {
+        control: true,
+        url: app.cfg.public_url.clone(),
+        github: app.cfg.github.is_some(),
+        passkeys,
+        vapid: app.vapid.public(),
+        github_app: app.github_app.as_ref().map(|g| g.slug.clone()),
         // How daemons sign their requests here (auth.rs): 2 takes body
         // hashes and nonces.
-        "daemon_auth": 2,
+        daemon_auth: 2,
         // The CLI joins with a code and signs its requests (M49).
-        "cli_join": 1,
-    }))
+        cli_join: 1,
+        // The ssh jump host for guests of daemons behind NAT (M65).
+        guest_ssh: app.jump.as_ref().map(guest_jump::Jump::describe),
+    })
 }
 
 /// Nothing frames control's pages, and nothing on them comes from elsewhere
@@ -496,8 +556,14 @@ fn github_app(a: &Args) -> anyhow::Result<Option<forge::GithubApp>> {
     Ok(Some(forge::GithubApp::new(id, a.github_app_slug.clone(), secret, &a.github_api, key)))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // ARUGULA_X for ILLOGICAL_X (#504), before the runtime's threads exist.
+    // SAFETY: nothing else runs yet.
+    unsafe { illogical_core::rename::alias_env() };
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "illogical_control=info".into()),
@@ -567,6 +633,38 @@ async fn main() -> anyhow::Result<()> {
         a.stripe_minutes_price,
         a.stripe_minutes_event,
     )?;
+    let turn = match (set(a.turn_key_id), set(a.turn_api_token)) {
+        (Some(key_id), Some(token)) => Some(turn::Turn { key_id, token, api: a.turn_api }),
+        _ => {
+            tracing::warn!("no CLOUDFLARE_TURN_KEY_ID/CLOUDFLARE_TURN_API_TOKEN: huddles get STUN only");
+            None
+        }
+    };
+    // The guests' jump host: bound now, so its port is known.
+    let guest_ssh = match a.guest_ssh {
+        Some(addr) => {
+            let l = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("listening for guest ssh on {addr}"))?;
+            let port = l.local_addr()?.port();
+            // `host:port`, or a host (an IPv6 address has more than one colon).
+            let (host, port) = match set(a.guest_ssh_host.clone()) {
+                Some(h) => match h.split_once(':') {
+                    Some((name, p)) if !p.contains(':') => {
+                        (name.to_owned(), p.parse().context("--guest-ssh-host's port")?)
+                    }
+                    _ => (h, port),
+                },
+                None => (url::Url::parse(&public_url)?.host_str().unwrap_or("localhost").to_owned(), port),
+            };
+            Some((l, guest_jump::Jump::new(&guest_jump::key_path(&a.db), host, port)?))
+        }
+        None => None,
+    };
+    let (guest_listener, jump) = match guest_ssh {
+        Some((l, j)) => (Some(l), Some(j)),
+        None => (None, None),
+    };
     let app = Arc::new(App {
         cfg: Config {
             push_hosts: a.push_hosts,
@@ -583,6 +681,7 @@ async fn main() -> anyhow::Result<()> {
             sockets: a.relay_max_sockets,
             daemons: a.relay_max_machines,
             daily_bytes: a.relay_daily_mb * 1_000_000,
+            total: a.relay_max_total,
         }),
         passkeys: Default::default(),
         limits: limit::Limits::new(a.trust_proxy_header),
@@ -593,7 +692,15 @@ async fn main() -> anyhow::Result<()> {
         forge: Default::default(),
         app_logins: Default::default(),
         daemon_sigs: Default::default(),
+        turn,
+        jump,
+        guest_routes: Default::default(),
     });
+    if let (Some(l), Some(j)) = (guest_listener, &app.jump) {
+        info!(addr = %l.local_addr()?, host = %j.host, port = j.port, "guest ssh jump host");
+        tokio::spawn(guest_jump::serve(app.clone(), l));
+    }
+    tokio::spawn(relay::Relay::log_counts(app.clone()));
     if !app.cfg.old_daemon_signatures {
         info!("refusing daemons' pre-0.17 request signatures");
     }

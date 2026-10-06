@@ -23,6 +23,11 @@ bootstrap:
 web:
     cd web && pnpm run build
 
+# Write the web client's wire types (web/src/proto.gen.ts) from
+# crates/proto. Without `write`, check they're current, as CI does.
+proto-ts mode="write":
+    {{ if mode == "write" { "ILLOGICAL_WRITE_TS=1" } else { "" } }} cargo test -q -p illogical-proto --features ts ts::
+
 # Release build of everything.
 build: web
     {{cargo}} build --release
@@ -106,6 +111,11 @@ desktop arch="":
 desktop-linux arch="x86_64" *tauri_args="":
     #!/usr/bin/env bash
     set -euo pipefail
+    # An unset GitHub secret arrives as "": treat it as unset, or Tauri
+    # takes APPLE_CERTIFICATE="" for a certificate to import.
+    for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+      [ -n "${!v:-}" ] || unset "$v"
+    done
     root={{justfile_directory()}}
     dist=$root/dist
     mkdir -p "$dist"
@@ -114,6 +124,8 @@ desktop-linux arch="x86_64" *tauri_args="":
     arch={{arch}}
     case "$arch" in x86_64) platform=linux/amd64 ;; aarch64) platform=linux/arm64 ;; *) echo "arch: x86_64 or aarch64" >&2; exit 2 ;; esac
     src={{target_dir}}/$arch-unknown-linux-musl/release
+    # The daemon release's binaries (app-release.yml's `scripts/release sidecars`).
+    src=${ILLOGICAL_DESKTOP_BINARIES:-$src}
     mkdir -p crates/desktop/binaries
     for b in illogicald illogical; do install -m 755 "$src/$b" "crates/desktop/binaries/$b-$arch-unknown-linux-gnu"; done
     engine=$(command -v podman || command -v docker) || { echo "the Linux desktop build needs podman or docker" >&2; exit 1; }
@@ -159,6 +171,11 @@ desktop-packages arch="x86_64":
 desktop-macos arch="" *tauri_args="":
     #!/usr/bin/env bash
     set -euo pipefail
+    # An unset GitHub secret arrives as "": treat it as unset, or Tauri
+    # takes APPLE_CERTIFICATE="" for a certificate to import.
+    for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+      [ -n "${!v:-}" ] || unset "$v"
+    done
     root={{justfile_directory()}}
     dist=$root/dist
     mkdir -p "$dist"
@@ -174,6 +191,9 @@ desktop-macos arch="" *tauri_args="":
     # The Mac's own arch builds without --target (`just build`).
     src={{target_dir}}/$t/release
     if [ "$t" = "$host" ] && [ -x {{target_dir}}/release/illogicald ]; then src={{target_dir}}/release; fi
+    # A test's own daemon and CLI (testnet/macos/update.sh's older ones), or
+    # the daemon release's (app-release.yml's `scripts/release sidecars`).
+    src=${ILLOGICAL_DESKTOP_BINARIES:-$src}
     out=${CARGO_TARGET_DIR:-$PWD/target}
     flags=()
     if [ "$t" = "$host" ]; then out=$out/release; else
@@ -182,8 +202,13 @@ desktop-macos arch="" *tauri_args="":
     fi
     mkdir -p binaries
     for b in illogicald illogical; do install -m 755 "$src/$b" "binaries/$b-$t"; done
+    # The bundler runs `xattr -crs` from PATH: pyenv's shim (Python's
+    # xattr, no -c or -r) can come first and fail it (#467). Only the
+    # system xattr goes first; the rest of PATH stays as it was.
+    sysbin=$(mktemp -d); trap 'rm -rf "$sysbin"' EXIT
+    ln -s /usr/bin/xattr "$sysbin/xattr"
     # ${flags[@]+…}: macOS bash 3.2 calls an empty array unbound.
-    cargo tauri build --bundles app ${flags[@]+"${flags[@]}"} {{tauri_args}}
+    PATH="$sysbin:$PATH" cargo tauri build --bundles app ${flags[@]+"${flags[@]}"} {{tauri_args}}
     app=$out/bundle/macos/illogical.app
     "$root/scripts/macos-sign" app "$app"
     # A zip of the app: ditto keeps its signature and symlinks.
@@ -217,11 +242,13 @@ desktop-macos arch="" *tauri_args="":
 # The Linux desktop app under Xvfb, in a container: builds the app (debug,
 # no bundle) in its build image (packaging/desktop/Containerfile) and runs
 # packaging/desktop/xvfb's tests against a static daemon: `join` (#204,
-# test.sh, with a stand-in control) and `m46` (m46.sh: keys, the titlebar,
-# illogical:// links, the global hotkey). Needs podman or docker; the
-# container runs the host's architecture (aarch64 under Docker Desktop on a
-# Mac). `just desktop-xvfb m46 keys` runs one claim.
-desktop-xvfb *tests="join m46":
+# test.sh, with a stand-in control), `m46` (m46.sh: keys, the titlebar,
+# illogical:// links, the global hotkey), `m47` (a right-click in
+# Nautilus opens a tab) and `stale` (#317, stale.sh: a 0.8.0 daemon, stopped
+# or running, gets the setup page and is left alone). Needs podman or
+# docker; the container runs the host's architecture (aarch64 under Docker
+# Desktop on a Mac). `just desktop-xvfb m46 keys` runs one claim.
+desktop-xvfb *tests="join m46 m47 stale":
     #!/usr/bin/env bash
     set -euo pipefail
     root={{justfile_directory()}}
@@ -260,14 +287,16 @@ desktop-check:
 # THIRD_PARTY.md: notices for the Rust crates (cargo-about) and the npm
 # packages bundled into the web client; crates/desktop/THIRD_PARTY.md for
 # the desktop app's own crates (its about.toml also accepts MPL-2.0).
+# Needs cargo-about 0.9.2; leaves both files alone when anything fails.
 notices:
-    cargo about generate about.hbs > THIRD_PARTY.md
-    scripts/web-notices >> THIRD_PARTY.md
-    cd crates/desktop && cargo about generate -c about.toml ../../about.hbs > THIRD_PARTY.md
+    scripts/notices
 
-# All tests.
+# All tests. The Rust ones run under cargo-nextest (.config/nextest.toml),
+# which `just bootstrap` installs; the doctests, which it can't run, under
+# cargo test.
 test: web
-    {{cargo}} test --workspace
+    {{cargo}} nextest run --workspace
+    {{cargo}} test --workspace --doc
     cd web && pnpm run typecheck
     just e2e-interop control-smoke
 
@@ -338,11 +367,13 @@ screenshots:
     cd web && pnpm exec playwright test -c screenshots.config.ts
     scripts/webp
 
-# The project page (site/) with install.sh beside it, in target/site.
+# The project page (site/) with install.sh and install.ps1 beside it, in
+# target/site.
 site:
     rm -rf target/site && mkdir -p target/site
     cp -r site/. target/site/
     cp scripts/install.sh target/site/install.sh
+    cp scripts/install.ps1 target/site/install.ps1
 
 # Publish the page (wrangler.jsonc: static assets on Cloudflare, at
 # illogical.widgets.wtf). Uses wrangler's login, or CLOUDFLARE_API_TOKEN.
@@ -367,7 +398,7 @@ testnet cmd="test" profile="ssh" *claims:
         up) arch=$(docker info --format '{{{{.Architecture}}')
             case "$arch" in arm64) arch=aarch64 ;; amd64) arch=x86_64 ;; esac
             [ -n "${ILLOGICAL_TESTNET_BINARIES:-}" ] || just static "$arch" >&2 ;;
-        test|break) {{cargo}} build -q -p illogical ;;
+        test|break) [ -n "${ILLOGICAL_CLI:-}" ] || {{cargo}} build -q -p illogical ;;
       esac
     fi
     case "{{cmd}}" in
@@ -429,13 +460,16 @@ macos cmd="launchd" *args:
 
 # Tests for the shell side of releases: install.sh picks the right release
 # per machine, and the ratchet that what a release ships is named the same
-# everywhere (release.yml, scripts/release, Homebrew, install.sh, the site).
+# everywhere (release.yml, scripts/release, Homebrew, install.sh, the site);
+# and `just notices` keeping THIRD_PARTY.md when cargo-about fails.
 test-scripts:
     scripts/tests/install.sh
     scripts/tests/release-targets.sh
+    scripts/tests/notices.sh
 
 # What CI runs.
 check: test
+    just proto-ts check
     {{cargo}} fmt --all --check
     {{cargo}} clippy --workspace --all-targets -- -D warnings
 

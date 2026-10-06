@@ -15,7 +15,9 @@
 // Built by itself into dist/sw.js as a classic worker (vite.sw.config.ts).
 
 import { E2ESocket } from "./e2e/channel.ts";
+import type { ActRequest } from "./proto";
 import { existingKeys, loadWorkerDirectory } from "./e2e/keys.ts";
+import { tapThread, tapUrl } from "./tap.ts";
 
 /** The parts of a service worker's global scope used here (the project's
  * types are the page's). */
@@ -89,6 +91,8 @@ interface Msg {
   reason?: { kind: string; actions: string[] };
   /** Control's own (#104): a device or a person waits for approval. */
   control?: boolean;
+  /** M61: an @mention in this thread (`pane-7`, `session-2`). */
+  thread?: string;
 }
 
 sw.addEventListener("push", (event: PushEvent) => {
@@ -125,14 +129,14 @@ sw.addEventListener("push", (event: PushEvent) => {
       icon: "/icon.svg",
       requireInteraction: !!(approve || ask),
       actions,
-      data: { pane: msg.pane, daemon: msg.daemon, approve, ask, reason, control: msg.control === true },
+      data: { pane: msg.pane, daemon: msg.daemon, thread: msg.thread, approve, ask, reason, control: msg.control === true },
     } as NotificationOptions),
   );
 });
 
 /** `POST /api/attention/act` to the daemon a notification came from: this
  * page's own, or one reached through control over a channel of our own. */
-async function act(daemon: string | undefined, body: Record<string, unknown>): Promise<boolean> {
+async function act(daemon: string | undefined, body: ActRequest): Promise<boolean> {
   try {
     if (!daemon) {
       const res = await fetch("/api/attention/act", {
@@ -188,7 +192,7 @@ sw.addEventListener("notificationclick", (event: ClickEvent) => {
     const choice = ask.options[Number(picked[1])];
     event.waitUntil(
       (async () => {
-        const body = { action: "answer", pane, id: ask.id, content: { [ask.field]: choice } };
+        const body = { action: "answer", pane, id: ask.id, content: { [ask.field]: choice } } satisfies ActRequest;
         if (!(await act(data.daemon, body))) await failed(pane, data.daemon, choice);
       })(),
     );
@@ -224,18 +228,16 @@ sw.addEventListener("notificationclick", (event: ClickEvent) => {
     );
     return;
   }
-  // A tap: open the pane (its card shows over it). Through control (M21)
-  // a notification names its daemon.
-  // Something that wants you (M24's reason) opens at its card on the swarm's
-  // rail (M26); anything else at the pane.
-  const where = data.reason ? "swarm" : "pane";
-  const url = pane ? (data.daemon ? `/#${where}=${data.daemon}.${pane}` : `/#${where}=${pane}`) : "/";
+  // A tap: open the pane (its card shows over it), or the card, or the
+  // thread (tapUrl).
+  const thread = tapThread(data.thread);
+  const url = tapUrl(data);
   event.waitUntil(
     (async () => {
       const wins = await sw.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const w of wins) {
         if (w.focus) {
-          w.postMessage({ type: data.reason ? "open-card" : "open-pane", pane, daemon: data.daemon });
+          w.postMessage({ type: data.reason ? "open-card" : "open-pane", pane, daemon: data.daemon, thread });
           return w.focus();
         }
       }

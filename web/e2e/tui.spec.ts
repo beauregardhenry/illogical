@@ -8,8 +8,11 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
-import { menu, open, paneEl, panes, ready, tab, text, type } from "./helpers";
+import { menu, open, paneEl, panes, ready, tab, text, type, closeContexts } from "./helpers";
 import { ANY, daemonPort } from "./ports";
+import { labs } from "./labs";
+
+test.afterAll(closeContexts);
 
 let base = "";
 const TMUX = ["-L", `illogical-e2e-tui-${process.pid}`];
@@ -34,7 +37,7 @@ test.beforeAll(async () => {
   daemon = spawn(
     "../target/debug/illogicald",
     [
-      ...["--listen", ANY, "--state-dir", state],
+      ...["--listen", ANY, "--state-dir", labs(state)],
       ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/tailscaled.sock"],
     ],
     { stdio: "ignore", env: { ...process.env, PS1: "$ " } },

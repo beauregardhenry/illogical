@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, type Locator, type Page } from "@playwright/test";
+import { expect, type Browser, type Locator, type Page } from "@playwright/test";
 import type { Client } from "../src/client";
 import type { HostDirectory } from "../src/hosts";
 import type { ControlSession } from "../src/control";
@@ -15,6 +15,7 @@ declare global {
       remotes: { client(host: string): Client | undefined };
       control: ControlSession | null;
       fleet: import("../src/fleet").Fleet;
+      huddle: import("../src/call").Huddle | null;
       summaries(): Client;
       text(pane: PaneId): string;
       screen(pane: PaneId): string;
@@ -23,6 +24,16 @@ declare global {
       selection(pane: PaneId): string;
     };
   }
+}
+
+/** The run shares one browser, and Playwright closes only the contexts of
+ * its own `context` fixture: one a spec opens with `browser.newContext()`
+ * (or a helper does for it) would keep its pages drawing, polling and
+ * reconnecting through every later spec, which then run on a busier
+ * machine than they do alone (#258). Every spec that uses `browser` closes
+ * what's left when it ends: `test.afterAll(closeContexts)`. */
+export async function closeContexts({ browser }: { browser: Browser }) {
+  await Promise.all(browser.contexts().map((c) => c.close()));
 }
 
 export async function open(page: Page) {
@@ -161,3 +172,34 @@ export const controlPanel = (page: Page, panel: string) =>
     panel,
     { timeout: 20_000 },
   );
+
+/** M70: paste a file onto a pane's terminal, as a browser does when an
+ * image is on the clipboard. */
+export async function pasteFile(page: Page, pane: PaneId, bytes: Buffer, name: string, type: string) {
+  await paneEl(page, pane)
+    .locator(".term-host")
+    .first()
+    .evaluate(
+      (host, [b64, name, type]) => {
+        const data = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const dt = new DataTransfer();
+        dt.items.add(new File([data], name, { type }));
+        host.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+      },
+      [bytes.toString("base64"), name, type] as const,
+    );
+}
+
+/** M70: the path of an upload as it shows on a pane's screen once pasted
+ * (wrapped lines joined). */
+export async function uploadedPath(page: Page, pane: PaneId, ext = "png"): Promise<string> {
+  const re = new RegExp(`/\\S*?illogical-uploads/\\d+/[0-9a-f]{16}\\.${ext}`);
+  let path = "";
+  await expect
+    .poll(async () => {
+      path = re.exec((await text(page, pane)).replace(/\n/g, ""))?.[0] ?? "";
+      return path;
+    })
+    .not.toBe("");
+  return path;
+}

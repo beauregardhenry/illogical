@@ -478,11 +478,7 @@ fn validate(mut req: AddHost, this: &str) -> Result<AddHost, String> {
 }
 
 fn random<const N: usize>() -> [u8; N] {
-    let mut b = [0u8; N];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
-        .expect("/dev/urandom");
-    b
+    crate::push::random()
 }
 
 pub fn digest(token: &str) -> String {
@@ -515,12 +511,25 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
 }
 
-async fn host(State(app): AppState) -> Json<HostInfo> {
+/// `GET /api/host`: [`HostInfo`], and for the owner this machine's
+/// standing with control (#325), beside it.
+#[derive(Serialize)]
+struct HostAnswer {
+    #[serde(flatten)]
+    info: HostInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_state: Option<illogical_proto::hosts::ControlState>,
+}
+
+async fn host(State(app): AppState, who: Option<axum::Extension<crate::acl::Principal>>) -> Json<HostAnswer> {
+    // Only the owner hears how this machine stands with control (#325).
+    let owner = who.is_none_or(|axum::Extension(p)| p.is_owner());
     let joined = app.control.enrolled();
     let saved = joined.as_ref().map(|e| &e.saved);
-    Json(HostInfo {
+    let info = HostInfo {
         name: app.hosts.name().to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        protocol: Some(illogical_proto::PROTOCOL),
         tailnet_url: app.access.tailnet_url(),
         tailnet_seen: app.tailnet_seen.load(std::sync::atomic::Ordering::Relaxed),
         control: saved.map(|s| s.url.clone()),
@@ -530,17 +539,26 @@ async fn host(State(app): AppState) -> Json<HostInfo> {
         // M45b: only where the runner's unit is; from what was last read.
         fountain_runner: crate::fountain::runner::host_info(&app.mux.shell_env),
         features: Some(features(&app)),
-    })
+    };
+    Json(HostAnswer { info, control_state: owner.then(|| crate::setup::control_state(&app)) })
 }
 
 /// What this machine is set up for, so the menus offer only that (#180)
 /// or say how to turn it on (#171). Cheap: nothing here asks anyone.
-fn features(app: &App) -> HostFeatures {
+///
+/// What a stranger doesn't get follows the `labs` file in the state dir:
+/// threads and huddles are its alone, and Fountain, studio and VMs need it
+/// as well as their own setup.
+pub(crate) fn features(app: &App) -> HostFeatures {
+    let labs = illogical_proto::hosts::labs(app.control.state_dir());
     HostFeatures {
+        labs,
         blocks: crate::sites::get().is_some(),
-        vms: app.mux.provider.is_some(),
-        fountain: fountain_login_here(&app.mux.shell_env),
-        studio: crate::apps::studio::get().and_then(|s| s.url()).is_some(),
+        vms: labs && app.mux.provider.is_some(),
+        fountain: labs && fountain_login_here(&app.mux.shell_env),
+        studio: labs && crate::apps::studio::get().and_then(|s| s.url()).is_some(),
+        threads: labs,
+        calls: labs,
     }
 }
 
@@ -735,8 +753,14 @@ mod tests {
         assert_eq!(h.host_for_token(&t.token).as_deref(), Some("sbx"));
         let saved = std::fs::read_to_string(d.join("host-tokens.json")).unwrap();
         assert!(!saved.contains(&t.token) && saved.contains(&digest(&t.token)));
-        let mode = std::fs::metadata(d.join("host-tokens.json")).unwrap().permissions();
-        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777, 0o600);
+        // Modes are Unix's; Windows has the profile's ACL.
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(d.join("host-tokens.json")).unwrap().permissions()
+            ) & 0o777,
+            0o600
+        );
         // A new one replaces the old.
         let t2 = h.mint_token("sbx").unwrap();
         assert_eq!(h.host_for_token(&t.token), None);

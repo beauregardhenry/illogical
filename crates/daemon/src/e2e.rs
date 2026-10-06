@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    body::Body,
+    body::{Body, HttpBody},
     extract::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -156,19 +156,43 @@ async fn serve(app: Arc<App>, mut inbound: mpsc::Receiver<Vec<u8>>, out: mpsc::S
     out.send(m2).await?;
     let out = Arc::new(Out { ch: Arc::new(ch), q: tokio::sync::Mutex::new(out) });
     let ch = out.ch.clone();
-    info!(device = device.device, name = device.name, who = principal.id(), "channel open");
 
     // An owner here through control has a name of their own (M30).
     let name = principal.is_owner().then(|| app.control.name_of_account(&device.account)).flatten();
     let client = app.new_client_id();
+    info!(
+        device = device.device,
+        account = device.account,
+        name = device.name,
+        who = principal.id(),
+        client,
+        "channel open"
+    );
     let (data_tx, mut data_rx) = client_queue();
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+    app.hands.connect(
+        client,
+        ctrl_tx.clone(),
+        principal.is_owner(),
+        Some((device.device.clone(), device.name.clone())),
+    );
     app.mux.send(Cmd::Connect {
-        sub: Subscriber { client, data: data_tx, ctrl: ctrl_tx, principal: principal.clone(), name },
+        sub: Subscriber {
+            client,
+            data: data_tx,
+            ctrl: ctrl_tx,
+            principal: principal.clone(),
+            name,
+            // A read-only link's stand-in has no signing key.
+            device: Some(device.clone()).filter(|d| !d.sign.is_empty()),
+        },
     });
+    // The callers drop this future when the socket's reader ends first,
+    // which is how most channels end: leave the mux and the hands then too.
+    let _left = Leave { app: app.clone(), client, device: device.device.clone(), opened: std::time::Instant::now() };
     let router = crate::server::channel_router(app.clone());
     let mut changed = app.control.changed.subscribe();
-    let result = loop {
+    loop {
         tokio::select! {
             w = inbound.recv() => {
                 let Some(w) = w else { break Ok(()) };
@@ -211,10 +235,26 @@ async fn serve(app: Arc<App>, mut inbound: mpsc::Receiver<Vec<u8>>, out: mpsc::S
                 }
             }
         }
-    };
-    app.mux.send(Cmd::Disconnect { client });
-    info!(device = device.device, "channel closed");
-    result
+    }
+}
+
+/// A channel's client leaving the mux and the hands, however the channel ends.
+struct Leave {
+    app: Arc<App>,
+    client: illogical_proto::ClientId,
+    device: String,
+    /// So "channel closed" says how long it lasted: a device that keeps
+    /// reopening its channel stands out in the log (#369).
+    opened: std::time::Instant,
+}
+
+impl Drop for Leave {
+    fn drop(&mut self) {
+        self.app.mux.send(Cmd::Disconnect { client: self.client });
+        self.app.hands.disconnect(self.client);
+        let lasted_ms = self.opened.elapsed().as_millis() as u64;
+        info!(device = self.device, client = self.client, lasted_ms, "channel closed");
+    }
 }
 
 /// `None`: hang up.
@@ -228,15 +268,45 @@ fn to_msg(o: ToClient) -> Option<Msg> {
 }
 
 async fn answer(router: Router, out: Arc<Out>, id: u32, head: RequestHead, body: Vec<u8>, who: crate::acl::Principal) {
+    let say = |status, content_type, more, body| Msg::Response {
+        id,
+        head: ResponseHead { status, content_type, more },
+        body,
+    };
+    let stream = head.stream;
     let (status, content_type, body) = match call(router, head, body, who).await {
         Ok(r) => r,
-        Err(e) => (
-            400,
-            Some("application/json".to_owned()),
-            serde_json::to_vec(&serde_json::json!({ "error": e.to_string() })).unwrap(),
-        ),
+        Err(e) => {
+            let body = serde_json::to_vec(&serde_json::json!({ "error": e.to_string() })).unwrap();
+            let _ = out.put(&say(400, Some("application/json".to_owned()), false, body)).await;
+            return;
+        }
     };
-    let _ = out.put(&Msg::Response { id, head: ResponseHead { status, content_type }, body }).await;
+    // A body of no fixed length (a follow) goes in parts when the client
+    // can take them; otherwise whole, as before.
+    if !stream || body.size_hint().exact().is_some() {
+        let body = match axum::body::to_bytes(body, MAX_MSG - 1024).await {
+            Ok(b) => b.to_vec(),
+            Err(e) => {
+                let body = serde_json::to_vec(&serde_json::json!({ "error": e.to_string() })).unwrap();
+                let _ = out.put(&say(400, Some("application/json".to_owned()), false, body)).await;
+                return;
+            }
+        };
+        let _ = out.put(&say(status, content_type, false, body)).await;
+        return;
+    }
+    if out.put(&say(status, content_type.clone(), true, Vec::new())).await.is_err() {
+        return;
+    }
+    let mut parts = body.into_data_stream();
+    while let Some(Ok(b)) = parts.next().await {
+        // The channel went: nobody to tell.
+        if out.put(&say(status, content_type.clone(), true, b.to_vec())).await.is_err() {
+            return;
+        }
+    }
+    let _ = out.put(&say(status, content_type, false, Vec::new())).await;
 }
 
 async fn call(
@@ -244,7 +314,7 @@ async fn call(
     head: RequestHead,
     body: Vec<u8>,
     who: crate::acl::Principal,
-) -> anyhow::Result<(u16, Option<String>, Vec<u8>)> {
+) -> anyhow::Result<(u16, Option<String>, Body)> {
     anyhow::ensure!(head.path.starts_with("/api/"), "only the API is reachable this way");
     let mut req = Request::builder().method(head.method.as_str()).uri(head.path.as_str());
     if let Some(ct) = &head.content_type {
@@ -256,6 +326,5 @@ async fn call(
     let res = router.oneshot(req).await?;
     let status = res.status().as_u16();
     let ct = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let body = axum::body::to_bytes(res.into_body(), MAX_MSG - 1024).await?;
-    Ok((status, ct, body.to_vec()))
+    Ok((status, ct, res.into_body()))
 }

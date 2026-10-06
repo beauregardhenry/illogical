@@ -20,6 +20,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # mise's GitHub downloads (nextest, for `just test`): unauthenticated,
+  # they share the runner's IP's rate limit.
+  GITHUB_TOKEN: ${{ github.token }}
+  # Debug and test builds keep line tables only, as upstream's do (#466):
+  # about half the size, which the runners' disks need.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   linux:
@@ -31,10 +38,16 @@ jobs:
       - name: Room for the build
         # The image's preinstalled SDKs we don't use; cargo needs the disk.
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
-      - name: The desktop app's libraries, shellcheck
+      - name: The desktop app's libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev shellcheck
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: shellcheck
+        # Upstream's version: the runner image's changes what it reports.
+        run: |
+          curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz | tar -xJ -C /tmp
+          sudo install /tmp/shellcheck-v0.11.0/shellcheck /usr/local/bin/shellcheck
+          shellcheck --version
       - uses: ./.github/actions/tools
       - uses: taiki-e/install-action@v2
         with:
@@ -63,8 +76,8 @@ jobs:
         run: shellcheck -s sh scripts/install.sh scripts/glibc-floor && shellcheck -s bash scripts/tests/*.sh
       - name: Release scripts and ratchets
         run: just test-scripts
-      - name: The test stack's scripts
-        run: shellcheck -x testnet/*.sh testnet/forges/*.sh testnet/hosts/*.sh testnet/editors/*.sh && shellcheck -s sh testnet/editors/box/entrypoint.sh testnet/sshd/entrypoint.sh testnet/sshd-systemd/keys.sh testnet/git/entrypoint.sh testnet/tailnet/entrypoint.sh
+      - name: The CI's and the test stack's scripts
+        run: shellcheck -x scripts/ci-* scripts/free-port testnet/*.sh testnet/forges/*.sh testnet/hosts/*.sh testnet/editors/*.sh testnet/macos/*.sh && shellcheck -s sh testnet/editors/box/entrypoint.sh testnet/sshd/entrypoint.sh testnet/sshd-systemd/keys.sh testnet/git/entrypoint.sh testnet/tailnet/entrypoint.sh
       - name: THIRD_PARTY.md is current
         run: just notices && git diff --exit-code THIRD_PARTY.md crates/desktop/THIRD_PARTY.md
       - name: No secrets

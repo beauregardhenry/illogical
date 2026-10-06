@@ -62,6 +62,8 @@ pub struct App {
     pub mcp: Arc<crate::mcp::Tokens>,
     /// Invites for guests with only OpenSSH (M65).
     pub guests: Arc<crate::guest_ssh::Guests>,
+    /// Devices lending their tools to agents (S33).
+    pub hands: Arc<crate::hand::Hands>,
     next_client: AtomicU64,
     /// The owner has reached us over the tailnet (#110: the phone step).
     pub tailnet_seen: std::sync::atomic::AtomicBool,
@@ -82,6 +84,7 @@ impl App {
         acl: Arc<crate::acl::Acl>,
         mcp: Arc<crate::mcp::Tokens>,
         guests: Arc<crate::guest_ssh::Guests>,
+        hands: Arc<crate::hand::Hands>,
     ) -> Arc<Self> {
         Arc::new(Self {
             access,
@@ -97,6 +100,7 @@ impl App {
             acl,
             mcp,
             guests,
+            hands,
             next_client: AtomicU64::new(1),
             tailnet_seen: Default::default(),
         })
@@ -116,8 +120,10 @@ fn own_routes(app: &Arc<App>) -> Router<Arc<App>> {
         .merge(crate::share::api_routes())
         .merge(crate::guest_ssh::routes())
         .merge(crate::acl::api::routes())
+        .merge(crate::invite::routes())
         .merge(crate::setup::routes())
         .merge(crate::update::routes())
+        .merge(crate::selfupdate::routes())
 }
 
 /// Plus what makes it a home daemon: hosts dialing in and pushing history,
@@ -165,11 +171,15 @@ pub fn local_router(app: Arc<App>) -> Router {
         .route("/api/editors/connect", get(crate::editor::link::connect))
         // `illogical web`: only over the socket, which is the owner's.
         .route("/api/signin-link", get(signin_link))
+        // Stop: save every pane and exit, as on Ctrl-C (an upgrade on
+        // Windows, where there's no service manager to ask; M59).
+        .route("/api/daemon/stop", axum::routing::post(stop))
         .merge(api_routes(&app))
         .layer(middleware::from_fn(whole_body))
         .with_state(app)
 }
 
+#[cfg(unix)]
 /// Editors only (M28): `<state>/editors/sock`, the one socket a dev
 /// container gets (its directory mounted): joining the swarm as an editor
 /// is all it can do there, not drive the daemon.
@@ -440,6 +450,11 @@ async fn signin(State(app): State<Arc<App>>, axum::extract::Query(q): axum::extr
         .unwrap()
 }
 
+async fn stop() -> &'static str {
+    crate::STOP.notify_one();
+    "stopping"
+}
+
 /// `illogical web`'s link: the local token in a sign-in link.
 async fn signin_link(State(app): State<Arc<App>>) -> Response {
     match app.access.signin_link() {
@@ -491,7 +506,10 @@ async fn connection(app: Arc<App>, mut socket: WebSocket, who: Principal) {
     info!(client, who = who.id(), "client connected");
     let (data_tx, mut data_rx) = client_queue();
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
-    app.mux.send(Cmd::Connect { sub: Subscriber { client, data: data_tx, ctrl: ctrl_tx, principal: who, name: None } });
+    app.hands.connect(client, ctrl_tx.clone(), who.is_owner(), None);
+    app.mux.send(Cmd::Connect {
+        sub: Subscriber { client, data: data_tx, ctrl: ctrl_tx, principal: who, name: None, device: None },
+    });
 
     loop {
         tokio::select! {
@@ -514,15 +532,17 @@ async fn connection(app: Arc<App>, mut socket: WebSocket, who: Principal) {
         }
     }
     app.mux.send(Cmd::Disconnect { client });
+    app.hands.disconnect(client);
     info!(client, "client disconnected");
 }
 
 pub(crate) fn handle(app: &App, client: ClientId, msg: Message) -> anyhow::Result<()> {
     match msg {
-        Message::Text(text) => {
-            let msg = serde_json::from_str::<ClientMsg>(&text)?;
-            app.mux.send(Cmd::Msg { client, msg });
-        }
+        Message::Text(text) => match serde_json::from_str::<ClientMsg>(&text)? {
+            ClientMsg::Hand { tools, name } => app.hands.offer(client, tools, name),
+            ClientMsg::HandReply { id, result, error } => app.hands.reply(client, id, result, error),
+            msg => app.mux.send(Cmd::Msg { client, msg }),
+        },
         Message::Binary(bytes) => {
             let frame = Frame::decode(&bytes)?;
             match frame.kind {

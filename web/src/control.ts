@@ -12,6 +12,7 @@
 import { certBody, deviceId, evaluate, hex, joinCode, normalizeCode, type Cert, type Revocation, revocationBody, unhex } from "./e2e/cert.ts";
 import { forget, loadEnrollment, loadKeys, saveEnrollment, saveWorkerDirectory, signText, type DeviceKeys, type Enrollment } from "./e2e/keys.ts";
 import type { E2ETarget } from "./client";
+import { desktopApp } from "./desktop";
 import {
   follows,
   inviteKey,
@@ -140,6 +141,23 @@ class HttpError extends Error {
   }
 }
 
+/** An approval control refused (#327): its reason code, and what to do. */
+export class RefusedError extends Error {
+  reason: string;
+  constructor(reason: string, message: string) {
+    super(message);
+    this.reason = reason;
+  }
+}
+
+/** The machine was approved, but a device approved with it wasn't
+ * (#326): the machine's prompt is done, and that device asks on its own. */
+export class AlongsideError extends Error {
+  constructor(name: string, why: string) {
+    super(`The machine is approved, but not ${name}: ${why}`);
+  }
+}
+
 export async function api<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method: body === undefined ? "GET" : "POST",
@@ -249,7 +267,40 @@ export function restoreInvite() {
 /** How long a presigned invite lasts unless the owner says otherwise. */
 const PRESIGNED_TTL_MS = 24 * 3600_000;
 
-export type Phase = "loading" | "signed-out" | "waiting" | "turned-down" | "lost-key" | "ready" | "error";
+export type Phase = "loading" | "signed-out" | "waiting" | "turned-down" | "lost-key" | "untrusted" | "ready" | "error";
+
+/** What the person reads when control refuses an approval (#327), by its
+ * reason code: which check failed, and what to do next. `revoked` isn't
+ * here: control's own words say it (#330), and a removed machine asks
+ * again with a new key by itself. */
+const REFUSED: Record<string, string> = {
+  approver_untrusted:
+    "This browser isn't one your account trusts any more, so its approvals are refused. Forget it and enroll it again (another of your devices or a recovery code approves it), then try again.",
+  bad_signature: "This browser's key isn't the one your account approved. Forget it and enroll it again, then try again.",
+  cant_approve: "A machine can't approve devices. Approve from a browser, phone or the illogical CLI.",
+  recovery_for_machine: "A recovery code approves browsers and phones, not machines. Approve the machine from one of your devices.",
+  no_chain: "Control's records for your account don't add up from here (the approval doesn't chain to your first device). Reload and try again; if it keeps happening, approve from another device.",
+  no_devices: "This account has no devices yet. Reload: this browser becomes its first.",
+};
+
+/** Refusals that mean this browser itself isn't trusted. */
+const SELF_REFUSED = new Set(["approver_untrusted", "bad_signature"]);
+
+/** Where `enrollAgain` leaves a note for the next page: open the recovery
+ * form (#327). */
+const RECOVER_KEY = "illogical.control.recover";
+
+/** The page came from forgetting a stale browser: offer the recovery code
+ * at once. Read once. */
+export function cameToRecover(): boolean {
+  try {
+    const yes = sessionStorage.getItem(RECOVER_KEY) === "1";
+    sessionStorage.removeItem(RECOVER_KEY);
+    return yes;
+  } catch {
+    return false;
+  }
+}
 
 // ---- recovery codes: an Ed25519 seed each, on paper only.
 
@@ -301,14 +352,26 @@ async function recoveryKey(seed: Uint8Array): Promise<CryptoKey> {
 const NO_NOISE = "0".repeat(64);
 
 /** A browser's name in its account's device list. */
-function deviceName(): string {
+export function deviceName(): string {
   // M48: the desktop app says what it is ("illogical app on jake-air").
-  const app0 = (globalThis as { __illogicalApp?: { name?: string } }).__illogicalApp?.name;
+  const app0 = desktopApp()?.name;
   if (app0) return app0;
   const ua = navigator.userAgent;
   const os = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android" : /Mac/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "browser";
   const app = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "";
   return `${app ? `${app} on ` : ""}${os}`;
+}
+
+/** The machine's join code this page was opened to approve
+ * (`#join=CODE`), if any. */
+export function joinInHash(hash: string = location.hash): string | null {
+  const m = /^#join=([A-Za-z0-9-]+)$/.exec(hash);
+  return m ? normalizeCode(m[1]) : null;
+}
+
+/** Whether this page is the desktop app's window (M48). */
+export function inApp(): boolean {
+  return !!desktopApp();
 }
 
 /** M48: the desktop app's window, after the person allowed its sign-in in
@@ -319,7 +382,7 @@ async function redeemAppLogin() {
   const m = /^#app-redeem=([0-9a-f]+)\.([0-9a-f]+)\.([0-9a-f]+)$/.exec(location.hash);
   if (!m) return;
   history.replaceState(null, "", location.pathname + location.search);
-  if (!(globalThis as { __illogicalApp?: unknown }).__illogicalApp) return;
+  if (!inApp()) return;
   await api(`/auth/app/${m[1]}/redeem`, { grant: m[2], verifier: m[3] }).catch(() => {});
 }
 
@@ -358,6 +421,9 @@ export class ControlSession {
   trusted = new Map<string, Cert>();
   /** Devices asking to join, for this one to approve. */
   pending: Cert[] = [];
+  /** #326: the machine's join code a waiting device came to approve, by
+   * the device's id, while that join is open: approved together. */
+  pendingJoins = new Map<string, string>();
   revocations: Revocation[] = [];
   daemons: DirDaemon[] = [];
   /** Shares waiting for this account's yes. */
@@ -367,6 +433,9 @@ export class ControlSession {
   /** Control says the account's root is a different device than the one
    * this browser pinned: don't trust anything new from it. */
   rootMismatch = false;
+  /** Why the account doesn't trust this browser (#327), in the
+   * `untrusted` phase: a device removed it, or it's missing. */
+  untrustedWhy: "removed" | "missing" = "missing";
   private listeners = new Set<() => void>();
   private timer: number | undefined;
   readonly info: ControlInfo;
@@ -428,7 +497,8 @@ export class ControlSession {
         this.usedRecovery = null;
       }
       await this.refresh();
-      this.set("ready");
+      // #327: a browser the account no longer trusts says so at once.
+      this.set(this.phase === "untrusted" ? "untrusted" : "ready");
       this.timer = window.setInterval(() => void this.refresh(), 10_000);
     } catch (e) {
       this.set("error", String((e as Error).message ?? e));
@@ -455,8 +525,13 @@ export class ControlSession {
       cert.sig = await signText(k, certBody(cert));
     }
     this.request = cert;
-    const ask = () => api<{ approved: boolean; cert?: Cert }>("/api/devices", { cert });
+    // #326: here to approve a machine, which this browser can't until it's
+    // one of the account's devices: the device that approves it is shown
+    // the machine alongside, and approves both at once.
+    const join = joinInHash();
+    const ask = () => api<{ approved: boolean; cert?: Cert }>("/api/devices", { cert, join });
     let r = await ask();
+    if (!r.approved) this.brought = join;
     while (!r.approved) {
       this.set("waiting");
       await new Promise((res) => setTimeout(res, 2000));
@@ -514,6 +589,10 @@ export class ControlSession {
 
   /** This browser's request, as it asks to join. */
   private request: Cert | null = null;
+
+  /** #326: the machine's join code this browser waited with, which the
+   * device that approved it may have approved alongside. */
+  brought: string | null = null;
 
   /** After a turn-down: ask again. */
   tryAgain() {
@@ -603,13 +682,21 @@ export class ControlSession {
     if (!e) return;
     try {
       const [devs, dir] = await Promise.all([
-        api<{ trust: { account: string; root: string } | null; certs: Cert[]; revocations: Revocation[]; pending: Cert[] }>("/api/devices"),
+        api<{ trust: { account: string; root: string } | null; certs: Cert[]; revocations: Revocation[]; pending: Cert[]; joins?: Record<string, string> }>("/api/devices"),
         api<{ daemons: ForeignEntry[]; offers?: ShareOffer[] }>("/api/directory"),
       ]);
       this.rootMismatch = !!devs.trust && devs.trust.root !== e.root;
       this.trusted = await evaluate({ account: e.account, root: e.root }, devs.certs, devs.revocations);
       this.revocations = devs.revocations;
+      // #327: this browser's own place, checked like any other device's.
+      // (A different root is said elsewhere, and isn't fixed by enrolling
+      // again under control's.)
+      const mine = this.trusted.has(this.keys.id) || this.rootMismatch;
+      if (!mine) this.untrustedWhy = devs.revocations.some((r) => r.device === this.keys.id) ? "removed" : "missing";
+      if (!mine && (this.phase === "ready" || this.phase === "loading")) this.phase = "untrusted";
+      else if (mine && this.phase === "untrusted") this.phase = "ready";
       this.pending = devs.pending;
+      this.pendingJoins = new Map(Object.entries(devs.joins ?? {}));
       const daemons: DirDaemon[] = [];
       for (const d of dir.daemons) {
         const { chain, ...entry } = d;
@@ -734,14 +821,19 @@ export class ControlSession {
    * was deleted), oldest first. */
   notices: { id: number; title: string; body: string }[] = [];
 
+  /** Whether the last load of the teams worked: an empty list is then
+   * this account's, not a failure. */
+  teamsLoaded = false;
+
   async loadTeams() {
+    let loaded = true;
     const r = await api<{ teams: Omit<Team, "verified">[]; asked?: ControlSession["asked"]; notices?: ControlSession["notices"] }>(
       "/api/teams",
-    ).catch(() => ({
-      teams: [] as Omit<Team, "verified">[],
-      asked: this.asked,
-      notices: this.notices,
-    }));
+    ).catch(() => {
+      loaded = false;
+      return { teams: [] as Omit<Team, "verified">[], asked: this.asked, notices: this.notices };
+    });
+    this.teamsLoaded = loaded;
     this.notices = r.notices ?? [];
     const out: Team[] = [];
     for (const t of r.teams) {
@@ -755,6 +847,21 @@ export class ControlSession {
     if (yes) this.joined = { team: yes.team, name: yes.name };
     this.asked = now;
     this.teams = out;
+  }
+
+  /** The teams this browser pinned and checked, for a machine of this
+   * account's to check their rosters by (#233): `<founder>.<founder's
+   * root>` by team. */
+  teamPins(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const t of this.teams) if (t.verified && t.role !== null) out[t.team] = `${t.pin.founder}.${t.pin.founder_root}`;
+    return out;
+  }
+
+  /** A machine of this account's own: not a team's, not someone else's. */
+  owns(id: string): boolean {
+    const d = this.daemons.find((x) => x.id === id);
+    return !!d && (!d.account || d.account === this.account) && !d.team;
   }
 
   sawJoined() {
@@ -918,6 +1025,7 @@ export class ControlSession {
   /** Hand control a push subscription, signed by this device (M21). */
   async subscribePush(sub: { endpoint: string; p256dh: string; auth: string }) {
     const s = { v: 1, account: this.account, device: this.keys.id, endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth, at: Date.now(), sig: "" };
+    // Frozen (#504): signed.
     const body = `illogical push v1\naccount ${s.account}\ndevice ${s.device}\nendpoint ${s.endpoint}\np256dh ${s.p256dh}\nauth ${s.auth}\nat ${s.at}\n`;
     s.sig = await signText(this.keys, body);
     await api("/api/push/subscribe", { sub: s });
@@ -953,10 +1061,30 @@ export class ControlSession {
 
   /** Approve another device's request: sign its certificate. */
   async approve(c: Cert) {
+    await this.approveDevice(c);
+    await this.refresh();
+  }
+
+  private async approveDevice(c: Cert) {
     const signed: Cert = { ...c, account: this.account, approver: this.keys.id, sig: "" };
     signed.sig = await signText(this.keys, certBody(signed));
-    await api(`/api/devices/${c.device}/approve`, { cert: signed });
-    await this.refresh();
+    await this.approving(api(`/api/devices/${c.device}/approve`, { cert: signed }));
+  }
+
+  /** An approval's request: refused, it says which check failed and what
+   * to do (#327); one that says this browser isn't trusted shows that
+   * screen. */
+  private async approving(req: Promise<unknown>) {
+    try {
+      await req;
+    } catch (e) {
+      const reason = e instanceof HttpError && typeof e.body.reason === "string" ? e.body.reason : "";
+      if (!reason) throw e;
+      // Checked here too: if this browser's own reckoning agrees, refresh
+      // switches to the screen that says so.
+      if (SELF_REFUSED.has(reason)) await this.refresh();
+      throw new RefusedError(reason, REFUSED[reason] ?? (e as Error).message);
+    }
   }
 
   async reject(c: Cert) {
@@ -975,28 +1103,47 @@ export class ControlSession {
     return j;
   }
 
-  /** Approve a daemon into this account, or into `team` (one I own): this
-   * device signs the team in, so control can't pick one (#100). */
-  async approveJoin(code: string, c: Cert, team: string | null = null) {
+  /** Teams I can put my machines in (#332): any I'm in, but only those I
+   * own while they're locked. */
+  addableTeams(): Team[] {
+    return this.teams.filter((t) => t.verified && (t.role === "owner" || !t.locked));
+  }
+
+  /** Approve a daemon into this account, or into `team` (one I'm in): this
+   * device signs the team in, so control can't pick one (#100). `devices`
+   * waiting with its code (#326) are approved with it, before the page
+   * hears of either, so its prompt stays up until both are done. */
+  async approveJoin(code: string, c: Cert, team: string | null = null, devices: Cert[] = []) {
     const signed: Cert = { ...c, account: this.account, approver: this.keys.id, sig: "" };
     signed.sig = await signText(this.keys, certBody(signed));
     let teamSig: string | null = null;
     if (team) {
-      const t = this.teams.find((x) => x.team === team && x.role === "owner" && x.verified);
-      if (!t) throw new Error("only the team's owners add its machines");
+      const t = this.addableTeams().find((x) => x.team === team);
+      if (!t) throw new Error("only the team's members add machines to it");
       teamSig = await signText(this.keys, teamJoinBody(c.device, t.pin));
     }
-    await api(`/api/joins/${code}/approve`, { cert: signed, team, team_sig: teamSig });
-    await this.refresh();
+    await this.approving(api(`/api/joins/${code}/approve`, { cert: signed, team, team_sig: teamSig }));
+    try {
+      for (const d of devices) {
+        try {
+          await this.approveDevice(d);
+        } catch (e) {
+          throw new AlongsideError(d.name, (e as Error).message);
+        }
+      }
+    } finally {
+      await this.refresh();
+    }
   }
 
-  /** Move a machine of this account into `team` (one I own), or back to
-   * the account (null). This device signs it for the daemon to check. */
+  /** Move a machine of this account into `team` (one I'm in), or back to
+   * the account (null). This device signs it for the daemon to check. A
+   * team's owner takes someone else's machine out of it the same way. */
   async moveDaemon(daemon: string, team: string | null) {
     let pin: TeamPin | null = null;
     if (team) {
-      const t = this.teams.find((x) => x.team === team && x.role === "owner" && x.verified);
-      if (!t) throw new Error("only the team's owners add its machines");
+      const t = this.addableTeams().find((x) => x.team === team);
+      if (!t) throw new Error("only the team's members add machines to it");
       pin = t.pin;
     }
     const at = Date.now();
@@ -1043,9 +1190,17 @@ export class ControlSession {
   }
 
   /** After a lost key (#94): forget this browser's place in the account
-   * and ask to join again, as a new device. */
-  async enrollAgain() {
+   * and ask to join again, as a new device. One the account stopped
+   * trusting (#327) asks with the recovery form open; a lost key asks as
+   * before, the form a button away. */
+  async enrollAgain(recover = false) {
     await forget(location.origin);
+    if (recover)
+      try {
+        sessionStorage.setItem(RECOVER_KEY, "1");
+      } catch {
+        // The form stays a button away.
+      }
     location.reload();
   }
 

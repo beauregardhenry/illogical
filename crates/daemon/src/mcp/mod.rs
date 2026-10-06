@@ -105,6 +105,23 @@ pub struct Caller {
     pub scope: Scope,
     /// The token it came with, for the log (`None`: the owner's own).
     pub token: Option<String>,
+    /// The caller's own pane, which a tool uses where it's left out: an
+    /// agent block's own id, or for the others the pane `illogical mcp` says
+    /// it runs in (`x-illogical-pane`). It only fills defaults, and is no credential:
+    /// what a caller may reach is its scope's alone.
+    pub pane: Option<PaneId>,
+}
+
+impl Caller {
+    /// A caller with `scope`. An agent block is always its own pane, whatever
+    /// `from_header` says; the others take the header's, if there was one.
+    fn new(scope: Scope, token: Option<String>, from_header: Option<PaneId>) -> Self {
+        let pane = match scope {
+            Scope::Block(id) => Some(id),
+            Scope::Full | Scope::Read => from_header,
+        };
+        Caller { scope, token, pane }
+    }
 }
 
 /// `/mcp`, for one of the daemon's routers.
@@ -125,7 +142,7 @@ pub fn pipe_server(app: &Arc<App>) -> relay::Serve {
     let app = Arc::downgrade(app);
     Arc::new(move |id, io| {
         let Some(app) = app.upgrade() else { return };
-        let caller = Caller { scope: Scope::Block(id), token: Some(format!("%{id}")) };
+        let caller = Caller::new(Scope::Block(id), Some(format!("%{id}")), None);
         let server = McpServer { app, fallback: Some(caller) };
         tokio::spawn(async move {
             match rmcp::ServiceExt::serve(server, tokio::io::split(io)).await {
@@ -156,22 +173,23 @@ async fn authenticate(State(app): State<Arc<App>>, mut req: Request, next: Next)
             }
         }
     };
+    let pane = illogical_proto::rename::either(illogical_proto::rename::PANE, |n| req.headers().get(n))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().trim_start_matches('%').parse::<PaneId>().ok());
     let caller = match bearer {
-        None => Caller { scope: Scope::Full, token: None },
+        None => Caller::new(Scope::Full, None, pane),
         // The daemon's local token: the owner, as the server already found.
-        Some(t) if app.access.is_local_token(&t) => Caller { scope: Scope::Full, token: None },
+        Some(t) if app.access.is_local_token(&t) => Caller::new(Scope::Full, None, pane),
         Some(t) => match app.mcp.check(&t) {
             Some(Bearer::Client { name, scope }) => {
                 let scope = match scope {
                     TokenScope::Full => Scope::Full,
                     TokenScope::Read => Scope::Read,
                 };
-                Caller { scope, token: Some(name) }
+                Caller::new(scope, Some(name), pane)
             }
             Some(Bearer::Block(id)) => match app.mux.api(|r| Api::Block(id, r)).await.flatten() {
-                Some(b) if b.kind() == BlockType::Agent => {
-                    Caller { scope: Scope::Block(id), token: Some(format!("%{id}")) }
-                }
+                Some(b) if b.kind() == BlockType::Agent => Caller::new(Scope::Block(id), Some(format!("%{id}")), pane),
                 _ => return refuse(StatusCode::UNAUTHORIZED, &format!("agent block %{id} is gone; its token with it")),
             },
             None => return refuse(StatusCode::UNAUTHORIZED, "unknown or revoked MCP token"),
@@ -190,13 +208,19 @@ pub struct McpServer {
 }
 
 impl McpServer {
+    /// This machine has the `labs` file: read on each call, so it needs no
+    /// restart.
+    fn labs(&self) -> bool {
+        illogical_proto::hosts::labs(self.app.control.state_dir())
+    }
+
     fn caller(&self, ctx: &RequestContext<RoleServer>) -> Caller {
         ctx.extensions
             .get::<axum::http::request::Parts>()
             .and_then(|p| p.extensions.get::<Caller>().cloned())
             .or_else(|| self.fallback.clone())
             // Never reached through `/mcp`; the least, to be safe.
-            .unwrap_or(Caller { scope: Scope::Read, token: Some("unknown".into()) })
+            .unwrap_or(Caller::new(Scope::Read, Some("unknown".into()), None))
     }
 }
 
@@ -234,19 +258,41 @@ impl CacheHints for ReadResourceResult {
     }
 }
 
-const INSTRUCTIONS: &str = "illogical runs commands in durable terminal panes that the user can watch \
+const INSTRUCTIONS_BASE: &str = "illogical runs commands in durable terminal panes that the user can watch \
 (on the web and the phone) and take over. Use run to start a build or a dev server in a pane (wait: true \
 to wait for it), wait and read_output to follow it (they return \"still running\" with an offset: call \
-again), list to see what's there, open_port to show a dev server in a browser block beside its terminal, \
-open_app to show one of the user's studio apps (its agent's questions come to them; send_input prompts it), open_pr to show a pull request (read_pr reads it; pr_comment, pr_review and pr_merge draft writes the user sends), open_issue to show an issue (read_issue reads it; issue_comment and issue_new draft what the user sends), list_agents and read_agent to see the user's Fountain agents (open_fountain shows them as a catalog; start_agent with a Fountain agent hands one a task), start_agent and agent_respond to supervise another agent, list_conversations and open_conversation to \
-pick up a Claude Code conversation from a terminal or the desktop app, and history and search for what \
-happened before. Output is paged: pass next_offset back as offset.";
+again; read_output with screen: true is what a full-screen program shows), list to see what's there (kind \
+conversations: Claude Code conversations from a terminal or the desktop app), attach to put a file (a \
+screenshot) into a terminal or an agent block, show to put a block in front of the user beside a pane, \
+read_forge to read a PR or issue block and draft for a comment, review, merge or new issue the user sends, \
+invite_person to ask the user to bring someone into the session (read_invite says what became of it), \
+start_agent and agent_respond to supervise another agent, \
+history for what happened before (kind output: what panes printed). Output is paged: pass next_offset \
+back as offset. show's kinds: port (a dev server in a browser block beside its terminal), changes (a \
+diff), file (at a line), pr, issue, conversation (a Claude Code conversation, to continue or fork); show \
+one instead of describing it, and wait (until idle or needs_input) instead of polling output. \
+Claude Code hooks put your questions (illogical ask), permission prompts (illogical hook, which anyone allowed can \
+answer), follow-ups (illogical inbox) and attention on cards; without them your questions stay in the terminal. \
+`illogical hooks install` adds them: ask your person first.";
+
+/// What the people's conversation about a pane or session adds to the
+/// instructions: only on a machine with `labs`, where those tools are listed.
+const THREAD_INSTRUCTIONS: &str = "read_thread and post_thread for the people's conversation about a pane or session (an @agent message there reaches you as a follow-up: answer with post_thread), ";
+
+/// The server's instructions: without `labs`, they leave out threads.
+pub(crate) fn instructions(labs: bool) -> String {
+    if !labs {
+        return INSTRUCTIONS_BASE.to_owned();
+    }
+    let at = INSTRUCTIONS_BASE.find("history for what").expect("the instructions name history");
+    format!("{}{THREAD_INSTRUCTIONS}{}", &INSTRUCTIONS_BASE[..at], &INSTRUCTIONS_BASE[at..])
+}
 
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(Implementation::new("illogical", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(instructions(self.labs()))
     }
 
     async fn list_tools(
@@ -255,7 +301,7 @@ impl ServerHandler for McpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let scope = self.caller(&ctx).scope;
-        Ok(fresh(ListToolsResult::with_all_items(tools::list(scope))))
+        Ok(fresh(ListToolsResult::with_all_items(tools::list(scope, self.labs()))))
     }
 
     async fn call_tool(

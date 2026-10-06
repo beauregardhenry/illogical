@@ -11,31 +11,60 @@ import {
   encodeFrame,
   FrameKind,
   type ActRequest,
+  type Call,
   type AttachPane,
   type ClientId,
   type ClientMsg,
   type Delta,
   type Driver,
+  type GuestInvite,
+  type GuestInviteRequest,
   type HostFeatures,
+  type HostInfo,
   type Intent,
+  type InviteRequest,
+  type Invited,
+  type NotifyPref,
+  type NotifyRequest,
+  type OpenConversationRequest,
+  type OpenConversationResponse,
+  type OpenRequest,
+  type OpenResponse,
   type PaneId,
   type PaneInfo,
   type PaneOp,
   type Presence,
+  type RunRequest,
   type ServerMsg,
   type SessionId,
+  type Share,
+  type ShareRequest,
   type State,
   type TabId,
   type TabView,
+  type ThreadMessages,
+  type ThreadMsg,
+  type ThreadPostRequest,
+  type ThreadPosted,
+  type ThreadReadRequest,
+  type ThreadSummary,
+  type ThreadTarget,
+  threadKey,
+  type Unreached,
+  type Invitable,
 } from "./proto";
 import { decompress } from "fzstd";
 import { SCROLLBACK, TerminalView } from "./terminal-view";
 import { makeBlockView, type BlockView } from "./blocks";
 import { E2ESocket, type DaemonRef } from "./e2e/channel.ts";
 import type { DeviceKeys } from "./e2e/keys.ts";
+import { pick, upload } from "./upload";
 
 /** Ack about this often (bytes drawn); the daemon allows 512 KB. */
 const ACK_EVERY = 64 * 1024;
+/** #369: a link up this long was a good one: the next reconnect starts
+ * from the shortest delay again. */
+const STABLE_MS = 10_000;
 
 export interface PaneEntry {
   view: TerminalView;
@@ -89,8 +118,16 @@ export interface E2ETarget {
 interface Link {
   onText: (t: string) => void;
   onBinary: (b: ArrayBuffer) => void;
-  onClose: () => void;
+  /** #369: part of a message arrived (end to end, a big one comes in
+   * pieces): the daemon is answering, however long the whole takes. */
+  onWire?: () => void;
+  /** #369: the way to the daemon, for the console when it's dropped. */
+  health?(): string;
+  /** `why`: for the console (#369). */
+  onClose: (why: string) => void;
   readonly open: boolean;
+  /** Why it couldn't connect, when control's relay was full (#344). */
+  readonly full?: string;
   sendText(t: string): void;
   sendBinary(b: Uint8Array): void;
   close(): void;
@@ -99,13 +136,13 @@ interface Link {
 class SocketLink implements Link {
   onText: (t: string) => void = () => {};
   onBinary: (b: ArrayBuffer) => void = () => {};
-  onClose: () => void = () => {};
+  onClose: (why: string) => void = () => {};
   private sock: WebSocket;
   constructor(url: string) {
     this.sock = new WebSocket(url);
     this.sock.binaryType = "arraybuffer";
     this.sock.onmessage = (e) => (typeof e.data === "string" ? this.onText(e.data) : this.onBinary(e.data as ArrayBuffer));
-    this.sock.onclose = () => this.onClose();
+    this.sock.onclose = (e) => this.onClose(`socket closed (${e.code}${e.reason ? ` ${e.reason}` : ""})`);
   }
   get open() {
     return this.sock.readyState === WebSocket.OPEN;
@@ -124,8 +161,10 @@ class SocketLink implements Link {
 class E2ELink implements Link {
   onText: (t: string) => void = () => {};
   onBinary: (b: ArrayBuffer) => void = () => {};
-  onClose: () => void = () => {};
+  onWire: () => void = () => {};
+  onClose: (why: string) => void = () => {};
   sock: E2ESocket | undefined;
+  full: string | undefined;
   private closed = false;
   /** Connects in the background; the Client sees it as a socket that opens
    * (or closes, and is retried). */
@@ -141,12 +180,16 @@ class E2ELink implements Link {
         if (this.closed) return sock.close();
         this.sock = sock;
         onPath(target.direct.some((u) => sock.url.startsWith(u.replace(/^http/, "ws").replace(/\/$/, ""))) ? "direct" : "relayed");
+        sock.onWire = () => this.onWire();
         sock.onText = (t) => this.onText(t);
         sock.onBinary = (b) => this.onBinary(b.slice().buffer as ArrayBuffer);
-        sock.onClose = () => this.onClose();
+        sock.onClose = () => this.onClose(sock.why);
         sock.start();
       },
-      () => this.onClose(),
+      (e: Error & { full?: boolean }) => {
+        if (e.full) this.full = e.message;
+        this.onClose(`couldn't connect: ${e.message}`);
+      },
     );
   }
   get open() {
@@ -158,11 +201,17 @@ class E2ELink implements Link {
   sendBinary(b: Uint8Array) {
     this.sock?.sendBinary(b);
   }
+  health(): string {
+    return this.sock?.health() ?? "no socket";
+  }
   close() {
     this.closed = true;
     this.sock?.close();
   }
 }
+
+/** The host features that follow `labs`: also off without it. */
+const LABS_FEATURES: (keyof HostFeatures)[] = ["vms", "fountain", "studio"];
 
 export class Client {
   /** The daemon's origin (`https://box.….ts.net`), or "" for the one this
@@ -177,6 +226,11 @@ export class Client {
      * pane output, just what every pane is up to. */
     readonly summary = false,
   ) {}
+
+  /** S33: a hand's connection is told when it's up and when an agent
+   * calls (see hand.ts). */
+  onHello?: () => void;
+  onHandCall?: (msg: Extract<ServerMsg, { type: "hand_call" }>) => void;
 
   /** How an end-to-end client is connected, for the host chip. */
   path: "direct" | "relayed" | null = null;
@@ -217,7 +271,34 @@ export class Client {
   /** M25: ask the daemon to answer (it pongs), which keeps `lastHeard`
    * fresh on a quiet daemon. */
   heartbeat() {
+    this.asked ||= Date.now();
     this.send({ type: "ping", id: this.nextId++ });
+  }
+
+  /** #369: when the first heartbeat still unanswered was sent (ms), or 0.
+   * Anything the daemon sends answers it. */
+  private asked = 0;
+
+  /** M25: keep a quiet link honest, every second or so: ask a daemon
+   * that's been quiet `heartbeatMs` to answer, and drop the link when an
+   * ask went unanswered for `answerMs`. Judged on the ask, not on the
+   * quiet alone (#369): a hidden page's timers run late, and a tick 15s
+   * after the last one found every quiet link "silent" and dropped it
+   * before it was asked. True if it dropped the link. */
+  keepAlive(now: number, heartbeatMs: number, answerMs: number): boolean {
+    if (!this.connected) return false;
+    if (this.asked && now - this.asked > answerMs) {
+      // What it was waiting on, to tell a lost answer from a stuck socket
+      // or a slowed page.
+      const health = this.link?.health?.();
+      this.drop(
+        `no answer to a heartbeat (asked ${now - this.asked}ms ago, last heard ${now - this.lastHeard}ms ago` +
+          `${health ? `, ${health}` : ""}${document.hidden ? ", page hidden" : ""})`,
+      );
+      return true;
+    }
+    if (!this.asked && now - this.lastHeard > heartbeatMs) this.heartbeat();
+    return false;
   }
 
   /** M25: a connection is up or being made. */
@@ -227,11 +308,12 @@ export class Client {
 
   /** M25: give up on the link now (it went quiet) and reconnect as after
    * any drop. */
-  drop() {
+  drop(why = "dropped") {
     const link = this.link;
     if (!link) return;
+    // Its reason first: closing it would report its own.
+    link.onClose(why);
     link.close();
-    link.onClose();
   }
 
   /** A request to the daemon's API: fetch, or through the channel. */
@@ -247,7 +329,11 @@ export class Client {
       // Another daemon (on this machine, its sign-in cookie; it allows
       // credentials only from our exact origin).
       credentials: /^https?:/.test(this.base) ? "include" : "same-origin",
-      ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+      ...(body === undefined
+        ? {}
+        : body instanceof Uint8Array
+          ? { headers: { "Content-Type": "application/octet-stream" }, body: body as BodyInit }
+          : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
     });
     return { ok: res.ok, status: res.status, json: <T,>() => res.json() as Promise<T>, text: () => res.text() };
   }
@@ -282,11 +368,17 @@ export class Client {
     this.send({ type: "focus", pane });
   }
 
-  /** Set by the UI: make this client's size the tab's size. */
-  claim: (tab: TabId) => void = () => {};
+  /** Set by the UI: make this client's size the tab's size. `typed`: for
+   * typing, which the daemon holds off while the size's owner is still
+   * typing (#333). */
+  claim: (tab: TabId, typed?: boolean) => void = () => {};
 
   private link: Link | undefined;
   private retry = 0;
+  /** When this link's daemon said hello (ms). */
+  private helloAt = 0;
+  /** The version the first `hello` said: another one means an update (#419). */
+  private daemonVersion: string | undefined;
   private nextId = 1;
   private listeners = new Set<() => void>();
   private errorTimer: number | undefined;
@@ -393,6 +485,122 @@ export class Client {
     return this.state?.presence?.find((p) => p.client === this.clientId)?.who ?? "owner";
   }
 
+  // ---- threads
+
+  private threadListeners = new Map<string, Set<(m: ThreadMsg) => void>>();
+
+  /** A thread as this person has it, if it has messages (and this machine
+   *  has labs: without them nothing here shows threads, however many there
+   *  are). */
+  thread(t: ThreadTarget): ThreadSummary | undefined {
+    if (!this.hasThreads()) return undefined;
+    const key = threadKey(t);
+    return this.state?.threads?.find((x) => threadKey(x.target) === key);
+  }
+
+  /** New messages in a thread, as they come. */
+  onThread(t: ThreadTarget, fn: (m: ThreadMsg) => void): () => void {
+    const key = threadKey(t);
+    let set = this.threadListeners.get(key);
+    if (!set) this.threadListeners.set(key, (set = new Set()));
+    set.add(fn);
+    return () => set.delete(fn);
+  }
+
+  async loadThread(t: ThreadTarget): Promise<ThreadMsg[]> {
+    const r = await this.request("GET", `/api/threads/${threadKey(t)}`);
+    if (!r.ok) throw new Error((await r.json<{ error?: string }>().catch(() => ({ error: undefined }))).error ?? `HTTP ${r.status}`);
+    return (await r.json<ThreadMessages>()).messages;
+  }
+
+  /** Post in a thread: the message, the `@`s that reached no one, and for
+   *  the owner whom of those they may invite (#297). */
+  async postThread(
+    t: ThreadTarget,
+    text: string,
+    quote?: { pane: PaneId; text: string },
+  ): Promise<{ message: ThreadMsg; unreached: Unreached[]; invitable: Invitable[] }> {
+    const r = await this.request("POST", `/api/threads/${threadKey(t)}`, { text, quote } satisfies ThreadPostRequest);
+    if (!r.ok) throw new Error((await r.json<{ error?: string }>().catch(() => ({ error: undefined }))).error ?? `HTTP ${r.status}`);
+    const body = await r.json<ThreadPosted>();
+    if (body.agent?.error) this.showError(`the agent didn't get it: ${body.agent.error}`);
+    return { message: body.message, unreached: body.unreached ?? [], invitable: body.invitable ?? [] };
+  }
+
+  /** Invite someone a message named into its thread (#297), as a viewer:
+   *  they see that message and what follows there, or the whole thread.
+   *  What to tell the owner about it. */
+  async inviteToThread(t: ThreadTarget, who: string, msg: ThreadMsg, wholeThread: boolean): Promise<string> {
+    const session = "session" in t ? t.session : this.sessionOfPane(t.pane);
+    if (session === null) throw new Error("that pane is gone");
+    const r = await this.request("POST", "/api/invite", {
+      session,
+      who,
+      role: "viewer",
+      thread: threadKey(t),
+      msg: msg.id,
+      whole_thread: wholeThread,
+      note: msg.text,
+    } satisfies InviteRequest);
+    const body = await r.json<Partial<Invited> & { error?: string }>().catch(() => null);
+    if (!r.ok || !body?.delivery) throw new Error(body?.error ?? `HTTP ${r.status}`);
+    const n = (body.grant?.name ?? who).split("@")[0];
+    const why = body.reason ? `: ${body.reason}` : "";
+    if (body.delivery === "sent") return `${n} is in, and was notified`;
+    if (body.delivery === "pending") return `${n} is in, and will be notified${why}`;
+    return `${n} is in, but wasn't notified${why}`;
+  }
+
+  markThreadRead(t: ThreadTarget, upto: number) {
+    const s = this.thread(t);
+    if (!s || (!s.unread && !s.mention)) return;
+    void this.request("POST", `/api/threads/${threadKey(t)}/read`, { upto } satisfies ThreadReadRequest).catch(() => {});
+  }
+
+  // ---- huddles (M63)
+
+  private callListeners = new Set<(m: Extract<ServerMsg, { type: "call_signal" }>) => void>();
+
+  /** The huddle on a session, if there is one (and this machine has labs). */
+  call(session: SessionId): Call | undefined {
+    if (!this.hasCalls()) return undefined;
+    return this.state?.calls?.find((c) => c.session === session);
+  }
+
+  /** Descriptions from other huddle members, as they come. */
+  onCallSignal(fn: (m: Extract<ServerMsg, { type: "call_signal" }>) => void): () => void {
+    this.callListeners.add(fn);
+    return () => this.callListeners.delete(fn);
+  }
+
+  /** Whether this machine has huddles: labs, and a daemon that has them
+   *  (unknown means no, like threads). */
+  hasCalls(): boolean {
+    return this.hasLabs() && this.features?.calls === true;
+  }
+
+  /** Whether this page talks to the daemon with a device key: what it
+   * says in a huddle is signed. */
+  signs(): boolean {
+    return !!this.e2e;
+  }
+
+  /** The device key this page signs with, through control. */
+  deviceKeys(): DeviceKeys | undefined {
+    return this.e2e?.keys;
+  }
+
+  /** Whether this person may post in a thread (drivers and owners). */
+  mayPost(t: ThreadTarget): boolean {
+    const session = "session" in t ? t.session : this.sessionOfTab(this.tabOfPane(t.pane)?.id ?? -1);
+    return this.role(session ?? null) !== "viewer";
+  }
+
+  /** The session a pane is in. */
+  sessionOfPane(pane: PaneId): SessionId | null {
+    return this.sessionOfTab(this.tabOfPane(pane)?.id ?? -1) ?? null;
+  }
+
   /** Everyone else connected, within what this client sees. */
   others(): Presence[] {
     const me = this.me();
@@ -472,7 +680,7 @@ export class Client {
     try {
       const res = await this.request("GET", "/api/host");
       if (!res.ok) return;
-      const h = await res.json<{ features?: HostFeatures; fountain_runner?: unknown }>();
+      const h = await res.json<HostInfo>();
       const features = h.features ?? null;
       const runner = !!h.fountain_runner;
       if (JSON.stringify(features) === JSON.stringify(this.features) && runner === this.fountainRunner) return;
@@ -484,9 +692,25 @@ export class Client {
     }
   }
 
-  /** Is `f` set up here? Yes when the daemon didn't say. */
+  /** Is `f` set up here? Yes when the daemon didn't say, except for what
+   * labs turns on (VMs, Fountain, studio): those need `hasLabs()` as well. */
   has(f: keyof HostFeatures): boolean {
+    if (LABS_FEATURES.includes(f) && !this.hasLabs()) return false;
     return this.features?.[f] ?? true;
+  }
+
+  /** Whether this machine has a `labs` file, which turns on what a stranger
+   * doesn't get: chat, huddles, Fountain, studio, VMs, guest ssh and the
+   * swarm's extra views. Unlike `has`, unknown means no: control serves this
+   * page to older daemons too, which never say. */
+  hasLabs(): boolean {
+    return this.features?.labs === true;
+  }
+
+  /** Whether this machine keeps threads: labs, and a daemon that has them.
+   * Unknown means no. */
+  hasThreads(): boolean {
+    return this.hasLabs() && this.features?.threads === true;
   }
 
   /** POST to the API; a failure shows as a toast. */
@@ -505,8 +729,8 @@ export class Client {
    * to the clipboard when the browser lets us. */
   async share(pane: PaneId, ttlSecs = 3600): Promise<string | null> {
     try {
-      const res = await this.request("POST", "/api/shares", { pane, ttl_secs: ttlSecs });
-      const body = await res.json<{ url?: string; path?: string; error?: string }>().catch(() => null);
+      const res = await this.request("POST", "/api/shares", { pane, ttl_secs: ttlSecs } satisfies ShareRequest);
+      const body = await res.json<Partial<Share> & { error?: string }>().catch(() => null);
       if (!res.ok || !body) {
         this.toast(body?.error ?? `couldn't share it (${res.status})`);
         return null;
@@ -525,8 +749,8 @@ export class Client {
    * clipboard when the browser lets us. */
   async guestInvite(pane: PaneId): Promise<string | null> {
     try {
-      const res = await this.request("POST", "/api/guests", { pane });
-      const body = await res.json<{ command?: string; error?: string }>().catch(() => null);
+      const res = await this.request("POST", "/api/guests", { pane } satisfies GuestInviteRequest);
+      const body = await res.json<Partial<GuestInvite> & { error?: string }>().catch(() => null);
       if (!res.ok || !body?.command) {
         this.toast(body?.error ?? `couldn't make an invite (${res.status})`);
         return null;
@@ -558,7 +782,7 @@ export class Client {
         from_pane: fromPane,
         session: fromPane === null ? (where.session?.toString() ?? null) : null,
         split: where.tab ? null : (where.split ?? null),
-      },
+      } satisfies RunRequest,
       "couldn't start a VM",
     );
   }
@@ -575,7 +799,7 @@ export class Client {
         split: o.split ?? null,
         from_pane: o.from ?? null,
         session: o.from === undefined ? (o.session?.toString() ?? null) : null,
-      },
+      } satisfies OpenRequest,
       "couldn't start the agent",
     );
   }
@@ -592,8 +816,8 @@ export class Client {
         split: o.split ?? null,
         from_pane: o.split ?? null,
         session: o.split === undefined ? (o.session?.toString() ?? null) : null,
-      });
-      const v = await res.json<{ block?: PaneId; opened?: boolean; error?: string }>().catch(() => null);
+      } satisfies OpenConversationRequest);
+      const v = await res.json<Partial<OpenConversationResponse>>().catch(() => null);
       if (!res.ok || typeof v?.block !== "number") {
         this.toast(v?.error ?? `couldn't open it (${res.status})`);
         return null;
@@ -609,11 +833,11 @@ export class Client {
 
   /** Open a block (`POST /api/blocks`) and show it: its id, or null (and
    * the error as a toast). */
-  async openBlock(body: Record<string, unknown>, failure = "couldn't open that"): Promise<PaneId | null> {
+  async openBlock(body: OpenRequest, failure = "couldn't open that"): Promise<PaneId | null> {
     this.lastIntentAt = Date.now();
     try {
       const res = await this.request("POST", "/api/blocks", body);
-      const v = await res.json<{ block?: PaneId; error?: string }>().catch(() => null);
+      const v = await res.json<Partial<OpenResponse> & { error?: string }>().catch(() => null);
       if (res.ok && typeof v?.block === "number") return v.block;
       this.toast(v?.error ?? `${failure} (${res.status})`);
     } catch {
@@ -636,22 +860,22 @@ export class Client {
   }
 
   /** M29: which agents this person is told about here (not the owner). */
-  notifyPref: { all: boolean; sessions: SessionId[] } | null = null;
+  notifyPref: NotifyPref | null = null;
 
   async loadNotify() {
     try {
       const res = await this.request("GET", "/api/notify");
-      if (res.ok) this.notifyPref = await res.json();
+      if (res.ok) this.notifyPref = await res.json<NotifyPref>();
       this.emit();
     } catch {
       // not connected yet
     }
   }
 
-  async setNotify(body: { session?: SessionId; on: boolean }) {
+  async setNotify(body: NotifyRequest) {
     try {
       const res = await this.request("POST", "/api/notify", body);
-      if (res.ok) this.notifyPref = await res.json();
+      if (res.ok) this.notifyPref = await res.json<NotifyPref>();
       else this.toast((await res.json<{ error?: string }>().catch(() => null))?.error ?? "couldn't change that");
       this.emit();
     } catch {
@@ -710,21 +934,45 @@ export class Client {
       link = new SocketLink(url);
     }
     this.link = link;
+    const started = Date.now();
     link.onText = (t) => {
       this.lastHeard = Date.now();
+      this.asked = 0;
       this.onMessage(JSON.parse(t) as ServerMsg);
     };
     link.onBinary = (b) => {
       this.lastHeard = Date.now();
+      this.asked = 0;
       this.onFrame(b);
     };
-    link.onClose = () => {
+    // #369: a piece of a big message answers too: the pong is behind it.
+    link.onWire = () => {
+      this.lastHeard = Date.now();
+      this.asked = 0;
+    };
+    link.onClose = (why) => {
       if (this.link !== link) return;
+      const up = this.connected ? Date.now() - this.helloAt : null;
       if (!this.connected) this.failures++;
+      // #369: back off from the shortest delay again only after a link
+      // that lasted; one that dies right after hello keeps backing off.
+      if (up !== null && up > STABLE_MS) this.retry = 0;
+      console.info(
+        `illogical: link to ${this.base || location.host} closed ` +
+          `${up === null ? `before hello, ${Date.now() - started}ms in` : `after ${up}ms up`}: ${why}` +
+          ` (try ${this.retry + 1})`,
+      );
       this.link = undefined;
       this.connected = false;
       this.clientId = null;
-      const delay = Math.min(250 * 2 ** this.retry, 5000);
+      this.asked = 0;
+      // Control's relay is full (#344): say so, and wait half a minute or
+      // so (spread out, as everyone's page is waiting) rather than seconds.
+      const delay = link.full ? 30_000 + Math.random() * 30_000 : Math.min(250 * 2 ** this.retry, 5000);
+      if (link.full) {
+        console.warn(`relay: ${link.full}`);
+        this.showError(link.full);
+      }
       this.retry++;
       this.emit();
       this.schedule(() => this.connect(), delay);
@@ -761,11 +1009,13 @@ export class Client {
     this.emit();
   }
 
-  /** Reconnect now if the socket is down (a phone coming back). */
-  wake() {
+  /** Reconnect now if the socket is down (a phone coming back), from the
+   * shortest delay again. `fresh: false` keeps the backoff: a reconnect
+   * the fleet queued (#369), which otherwise never backed off. */
+  wake(fresh = true) {
     this.asleep = false;
     if (!this.link && !this.closed) {
-      this.retry = 0;
+      if (fresh) this.retry = 0;
       this.connect();
     }
   }
@@ -790,14 +1040,15 @@ export class Client {
     this.send({ type: "intent", id: this.nextId++, intent });
   }
 
-  view(tab: TabId, cols: number, rows: number, zoom: PaneId | null, claim: boolean) {
-    this.send({ type: "view", tab, cols, rows, zoom, claim });
+  view(tab: TabId, cols: number, rows: number, zoom: PaneId | null, claim: boolean, typed = false) {
+    this.send({ type: "view", tab, cols, rows, zoom, claim, typed });
   }
 
   input(pane: PaneId, data: Uint8Array) {
     const tab = this.tabOfPane(pane);
-    // Typing here makes this window the one whose size counts.
-    if (tab && tab.owner !== this.clientId) this.claim(tab.id);
+    // Typing here makes this window the one whose size counts, once
+    // whoever has it stops typing for a moment.
+    if (tab && tab.owner !== this.clientId) this.claim(tab.id, true);
     data = this.applyModifiers(data);
     if (this.link?.open) this.link.sendBinary(encodeFrame(FrameKind.Input, pane, data));
   }
@@ -836,17 +1087,26 @@ export class Client {
   private onMessage(msg: ServerMsg) {
     switch (msg.type) {
       case "hello":
+        // The daemon that served this page came back as another version (an
+        // update restarted it, #419): its web client changed too, so load the
+        // new one. Not for a page from elsewhere (a host's, control's).
+        if (!this.base && !this.e2e && this.daemonVersion && this.daemonVersion !== msg.version) {
+          location.reload();
+          return;
+        }
+        this.daemonVersion = msg.version;
         this.revoked = false;
         this.clientId = msg.client;
         this.connected = true;
         this.focused = undefined;
-        this.retry = 0;
+        this.helloAt = Date.now();
         if (this.summary) this.send({ type: "subscribe", summary: true });
         // A new connection: follow again what was followed.
         for (const pane of this.editorFollows.keys()) this.send({ type: "follow", pane, on: true });
         this.applyState(msg.state, true);
         if (msg.state.roles) void this.loadNotify();
         void this.loadFeatures();
+        this.onHello?.();
         break;
       case "state":
         this.applyState(msg.state, false);
@@ -884,8 +1144,18 @@ export class Client {
         ];
         this.emit();
         break;
+      case "hand_call":
+        if (this.onHandCall) this.onHandCall(msg);
+        else this.send({ type: "hand_reply", id: msg.id, error: "this page doesn't lend tools" });
+        break;
       case "follow":
         for (const fn of this.editorFollows.get(msg.pane) ?? []) fn(msg.msg);
+        break;
+      case "thread":
+        for (const fn of this.threadListeners.get(threadKey(msg.target)) ?? []) fn(msg.msg);
+        break;
+      case "call_signal":
+        for (const fn of this.callListeners) fn(msg);
         break;
       case "block": {
         const b = this.blocks.get(msg.block);
@@ -921,6 +1191,8 @@ export class Client {
       panes: [...byId.values()].sort((a, b) => a.id - b.id),
       machines: d.machines ?? old.machines,
       presence: d.presence ?? old.presence,
+      threads: d.threads ?? old.threads,
+      calls: d.calls ?? old.calls,
     };
     if (added || d.gone?.length) return this.applyState(state, false);
     this.state = state;
@@ -983,7 +1255,7 @@ export class Client {
     for (const t of state.tabs) {
       for (const [id, r] of t.layout.panes) {
         this.panes.get(id)?.view.resize(r.cols, r.rows);
-        this.blocks.get(id)?.view.layout?.(r.cols, r.rows, t.owner === this.clientId);
+        this.blocks.get(id)?.view.layout?.(r.cols, r.rows);
       }
     }
     this.fixSelection();
@@ -1021,8 +1293,24 @@ export class Client {
       this.emit();
     });
     view.onFocus(() => this.setActive(id));
+    view.onFiles((files) => void this.sendFiles(id, files));
     this.panes.set(id, entry);
     return entry;
+  }
+
+  /** M70: files onto the pane's host, their paths pasted into it. */
+  sendFiles(pane: PaneId, files: File[]): Promise<void> {
+    if (!this.mayType(pane)) {
+      this.toast("you can't type in this pane, so you can't paste files into it");
+      return Promise.resolve();
+    }
+    return upload((m, p, b) => this.request(m, p, b), pane, files, this.panes.get(pane)?.view.chip);
+  }
+
+  /** M70: pick files (a phone's photos or camera too) for the pane. */
+  async attachFiles(pane: PaneId) {
+    const files = await pick();
+    if (files.length) await this.sendFiles(pane, files);
   }
 
   private fixSelection() {

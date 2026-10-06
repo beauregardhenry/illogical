@@ -416,16 +416,44 @@ pub async fn open_ws(url: &reqwest::Url, headers: &[(&str, &str)]) -> anyhow::Re
     let mut config = tungstenite::protocol::WebSocketConfig::default();
     config.max_message_size = Some(1 << 20);
     let (ws, _) = tokio_tungstenite::client_async_with_config(req, io, Some(config)).await.map_err(|e| match e {
-        tungstenite::Error::Http(r) => anyhow::anyhow!(
-            "{} said {}: {}",
-            url.host_str().unwrap_or("it"),
-            r.status(),
-            r.body().as_deref().map(String::from_utf8_lossy).unwrap_or_default()
-        ),
+        tungstenite::Error::Http(r) => {
+            let said = format!(
+                "{} said {}: {}",
+                url.host_str().unwrap_or("it"),
+                r.status(),
+                r.body().as_deref().map(String::from_utf8_lossy).unwrap_or_default()
+            );
+            let wait = r.headers().get("retry-after").and_then(|v| v.to_str().ok()?.trim().parse().ok());
+            match wait {
+                Some(secs) if r.status() == 503 => {
+                    anyhow::Error::new(Busy { wait: Duration::from_secs(secs).min(MOST_WAIT), said })
+                }
+                _ => anyhow::anyhow!(said),
+            }
+        }
         e => e.into(),
     })?;
     Ok(ws)
 }
+
+/// The other end is full for now and said how long to wait (`503` with
+/// `Retry-After`: control's relay at its ceiling, #344), up to
+/// [`MOST_WAIT`].
+#[derive(Debug)]
+pub struct Busy {
+    pub wait: Duration,
+    said: String,
+}
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.said)
+    }
+}
+
+impl std::error::Error for Busy {}
+
+const MOST_WAIT: Duration = Duration::from_secs(600);
 
 fn tls_connector() -> anyhow::Result<tokio_rustls::TlsConnector> {
     use tokio_rustls::rustls;
@@ -442,36 +470,63 @@ fn tls_connector() -> anyhow::Result<tokio_rustls::TlsConnector> {
 async fn connect_once(opts: &PeerOpts, accept: &mpsc::UnboundedSender<DuplexStream>) -> anyhow::Result<()> {
     let ws = open_socket(opts).await?;
     info!(peer = opts.url, "tunnel to the home daemon up");
-    serve_mux(ws, accept, None, None).await
+    serve_mux(ws, accept, None, None, None).await
 }
 
-/// Text messages on control's relay socket besides `trust` (M40): what
-/// to do with those that come, and the latest one to send (sent on
-/// connect and whenever it changes).
+/// Text messages on control's relay socket besides `trust` (M40, M65):
+/// what to do with those that come, and messages to send: the latest of
+/// each `out` (sent on connect and whenever it changes).
 pub struct Texts<'a> {
     pub on_text: &'a (dyn Fn(&str) + Send + Sync),
-    pub out: tokio::sync::watch::Receiver<Option<String>>,
+    pub out: Vec<tokio::sync::watch::Receiver<Option<String>>>,
 }
 
 /// The host end of a mux over `ws`: streams the other end opens go to
-/// `accept`, until the socket closes or goes quiet.
+/// `accept` (raw streams to `raw`, with their kind, when given), until the
+/// socket closes or goes quiet.
 /// A text message `trust` (control's relay) wakes `nudge`; others go to
 /// `texts`.
 pub async fn serve_mux(
     ws: Ws,
     accept: &mpsc::UnboundedSender<DuplexStream>,
+    raw: Option<&mpsc::UnboundedSender<(Vec<u8>, DuplexStream)>>,
     nudge: Option<&Notify>,
     texts: Option<Texts<'_>>,
 ) -> anyhow::Result<()> {
-    let (mux, mut out) = Mux::new(Some(accept.clone()));
+    let (mux, mut out) = Mux::with_raw(Some(accept.clone()), raw.cloned());
     let (mut tx, mut rx) = ws.split();
-    let (on_text, mut say) = match texts {
-        Some(t) => (Some(t.on_text), Some(t.out)),
-        None => (None, None),
+    // Each `out`'s latest message, now and as it changes, in one queue.
+    let (say_tx, mut say) = mpsc::unbounded_channel::<String>();
+    let mut sayers = Vec::new();
+    let on_text = match texts {
+        Some(t) => {
+            for mut w in t.out {
+                let say_tx = say_tx.clone();
+                sayers.push(tokio::spawn(async move {
+                    loop {
+                        if let Some(m) = w.borrow_and_update().clone()
+                            && say_tx.send(m).is_err()
+                        {
+                            return;
+                        }
+                        if w.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                }));
+            }
+            Some(t.on_text)
+        }
+        None => None,
     };
-    if let Some(m) = say.as_mut().and_then(|s| s.borrow_and_update().clone()) {
-        tx.send(tungstenite::Message::Text(m.into())).await?;
+    drop(say_tx);
+    struct Abort(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for Abort {
+        fn drop(&mut self) {
+            self.0.iter().for_each(|h| h.abort());
+        }
     }
+    let _sayers = Abort(sayers);
     let mut ping = tokio::time::interval(PING_EVERY);
     let mut heard = Instant::now();
     let result = loop {
@@ -500,21 +555,8 @@ pub async fn serve_mux(
             Some(f) = out.recv() => {
                 if let Err(e) = tx.send(tungstenite::Message::Binary(f.into())).await { break Err(e.into()) }
             }
-            changed = async {
-                match say.as_mut() {
-                    Some(s) => s.changed().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match changed {
-                    Ok(()) => {
-                        let m = say.as_mut().and_then(|s| s.borrow_and_update().clone());
-                        if let Some(m) = m && let Err(e) = tx.send(tungstenite::Message::Text(m.into())).await {
-                            break Err(e.into());
-                        }
-                    }
-                    Err(_) => say = None,
-                }
+            Some(m) = say.recv() => {
+                if let Err(e) = tx.send(tungstenite::Message::Text(m.into())).await { break Err(e.into()) }
             }
             _ = ping.tick() => {
                 if heard.elapsed() > DEAD_AFTER {
@@ -558,6 +600,29 @@ mod tests {
         json.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         defang(&mut json);
         assert_eq!(json[header::CONTENT_TYPE], "application/json");
+    }
+
+    #[tokio::test]
+    async fn a_full_relay_says_how_long_to_wait() {
+        // Control's relay at its ceiling (#344); and a plain refusal.
+        let full = || async {
+            let mut r =
+                (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"control is full: try again shortly"}"#).into_response();
+            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+            r
+        };
+        let app = Router::new()
+            .route("/full", get(full))
+            .route("/no", get(|| async { (StatusCode::TOO_MANY_REQUESTS, "slow down") }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let url = |p: &str| reqwest::Url::parse(&format!("ws://{at}{p}")).unwrap();
+        let e = open_ws(&url("/full"), &[]).await.err().unwrap();
+        assert_eq!(e.downcast_ref::<Busy>().unwrap().wait, Duration::from_secs(30));
+        assert!(e.to_string().contains("503 Service Unavailable: {\"error\":\"control is full"), "{e}");
+        let e = open_ws(&url("/no"), &[]).await.err().unwrap();
+        assert!(e.downcast_ref::<Busy>().is_none(), "{e}");
     }
 
     #[test]

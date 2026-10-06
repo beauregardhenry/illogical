@@ -30,7 +30,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{io::AsyncReadExt, sync::OnceCell};
+#[cfg(unix)]
+use tokio::io::AsyncReadExt;
+use tokio::sync::OnceCell;
 
 use crate::provider::Provider;
 
@@ -178,6 +180,7 @@ fn done(host: &str, shell: &str, r: Result<Vec<(String, String)>, String>, t: In
 /// A machine runs `bash -l` in its panes, so that's what's read there.
 const MACHINE_SH: &str = r#"exec bash -l -i -c "$1" </dev/null 2>/dev/null"#;
 
+#[cfg(unix)]
 /// The arguments before the script, for shells that take `-l -i -c`.
 fn flags(shell: &str) -> Option<[&'static str; 3]> {
     let name = Path::new(shell).file_name()?.to_str()?.trim_start_matches('-');
@@ -235,6 +238,20 @@ fn clean(vars: Vec<(String, String)>, given: &[(String, String)]) -> Vec<(String
 }
 
 /// Run `shell` as a login shell, interactive, and read its environment.
+/// Windows: a program's environment is the user's (the registry's), which
+/// the daemon has already; PowerShell has no login environment to add.
+#[cfg(windows)]
+async fn resolve(
+    _shell: &str,
+    _args: &[String],
+    _home: &Path,
+    _env: &[(String, String)],
+    _timeout: Duration,
+) -> Result<Vec<(String, String)>, String> {
+    Ok(vec![])
+}
+
+#[cfg(unix)]
 async fn resolve(
     shell: &str,
     args: &[String],
@@ -255,6 +272,7 @@ async fn resolve(
         .kill_on_drop(true);
     // SAFETY: setsid is async-signal-safe; nothing else runs between fork
     // and exec. A session of its own: no controlling terminal to take.
+    #[cfg(unix)]
     unsafe {
         c.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::from));
     }
@@ -289,9 +307,12 @@ async fn resolve(
         }
         Err(_) => {
             // The shell, and whatever its rc files started with it.
+            #[cfg(unix)]
             if let Some(pid) = pid {
                 let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::SIGKILL);
             }
+            #[cfg(not(unix))]
+            let _ = (pid, child.start_kill());
             let _ = child.wait().await;
             Err(format!("{shell} took longer than {}s to start (an rc file waits for something?)", timeout.as_secs()))
         }
@@ -322,10 +343,12 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     /// A HOME of its own, removed when dropped (after the shell is gone:
     /// `resolve` waits for it or kills it).
     struct Home(PathBuf);
 
+    #[cfg(unix)]
     impl Home {
         fn new(name: &str, bashrc: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("illogical-shellenv-{name}-{}", std::process::id()));
@@ -343,12 +366,15 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Home {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
+    // Unix: runs bash.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_rc_file_adds_to_path_and_its_noise_is_ignored() {
         let home =
@@ -374,6 +400,8 @@ mod tests {
         assert!(env.contains(&("ILLOGICAL_PANE".into(), "7".into())));
     }
 
+    // Unix: runs bash.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_slow_rc_file_falls_back() {
         let home = Home::new("slow", "sleep 30\nexport PATH=\"$HOME/tools/bin:$PATH\"\n");
@@ -387,6 +415,8 @@ mod tests {
         assert_eq!(merge(&block, &r, None), block);
     }
 
+    // Unix: runs bash.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_broken_shell_falls_back() {
         let home = Home::new("broken", "exit 3\n");

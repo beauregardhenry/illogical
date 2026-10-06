@@ -18,7 +18,7 @@
 // - A heartbeat notices a link that died without closing.
 
 import { Client } from "./client";
-import type { Driver, PaneInfo, Presence, State } from "./proto";
+import type { Driver, PaneInfo, Presence, State, ThreadSummary } from "./proto";
 import { RelayMux } from "./e2e/relaymux";
 
 export type HostStatus = "connecting" | "connected" | "stale" | "offline" | "asleep" | "capped";
@@ -78,6 +78,10 @@ export interface FleetPane {
   driver: Driver | null;
   /** M30: who has it open now (M13 presence), other than summaries. */
   watchers: Presence[];
+  /** M61: messages in its thread this person hasn't read, and whether
+   * one mentions them. */
+  unread: number;
+  mention: boolean;
 }
 
 /** Most summary connections one page holds (S16: about 14 MB a page for
@@ -91,10 +95,12 @@ const SLOT_MS = 3000;
 const SPREAD_MS = 1500;
 /** Ask quiet hosts to answer this often... */
 const HEARTBEAT_MS = 3000;
-/** ...and give up on a link that said nothing for this long. */
-const SILENT_MS = 6000;
+/** ...and give up on a link that hasn't answered in this long. */
+const ANSWER_MS = 3000;
 /** A host away this long is offline, not just stale. */
 const OFFLINE_MS = 60_000;
+/** Hidden this long, the page lets go of sandboxes (as the tab view does). */
+const HIDDEN_GRACE_MS = 10_000;
 const CACHE_KEY = "illogical.fleet";
 
 interface Entry {
@@ -116,8 +122,13 @@ export class Fleet {
   private queue: Client[] = [];
   /** Clients connecting now, and how to give back their slot. */
   private trying = new Map<Client, () => void>();
+  /** Queued by a wake: reconnect from the shortest delay again. */
+  private fresh = new Set<Client>();
   private timer: number | undefined;
   private lastBeat = Date.now();
+  private hidden: number | undefined;
+  /** The page is hidden: sandboxes aren't held awake, or woken. */
+  private away = false;
   private merged: FleetPane[] | null = null;
   /** Shown when the cap leaves hosts out. */
   notice: string | null = null;
@@ -204,7 +215,13 @@ export class Fleet {
   start() {
     if (this.timer !== undefined) return;
     this.timer = window.setInterval(() => this.tick(), 1000);
-    document.addEventListener("visibilitychange", () => document.visibilityState === "visible" && this.wake());
+    document.addEventListener("visibilitychange", () => {
+      clearTimeout(this.hidden);
+      if (document.visibilityState === "visible") {
+        this.away = false;
+        this.wake();
+      } else this.hidden = window.setTimeout(() => this.letGo(), HIDDEN_GRACE_MS);
+    });
     window.addEventListener("online", () => this.wake());
   }
 
@@ -228,6 +245,13 @@ export class Fleet {
     }
   }
 
+  /** A sandbox sleeps when nothing holds it awake, and a summary
+   * connection does: let go of those while the page is hidden. */
+  private letGo() {
+    this.away = true;
+    for (const e of this.hosts.values()) if (e.ref.transport === "provider") e.client?.sleep();
+  }
+
   private asleep(e: Entry): boolean {
     return e.ref.transport === "provider" && !!e.ref.status && e.ref.status !== "running";
   }
@@ -247,6 +271,7 @@ export class Fleet {
     e.off = null;
     if (e.client) {
       this.queue = this.queue.filter((c) => c !== e.client);
+      this.fresh.delete(e.client);
       this.trying.get(e.client)?.();
       e.client.close();
     }
@@ -264,6 +289,8 @@ export class Fleet {
       const c = this.queue.shift()!;
       // Connected meanwhile, or already trying: nothing to do.
       if (c.linked || this.trying.has(c)) continue;
+      // Hidden: a sandbox's reconnect would wake it.
+      if (this.away && [...this.hosts.values()].some((e) => e.client === c && e.ref.transport === "provider")) continue;
       this.stats.started++;
       let freed = false;
       const free = () => {
@@ -277,7 +304,10 @@ export class Fleet {
       // a host that doesn't answer doesn't hold up the rest.
       const timer = window.setTimeout(free, SLOT_MS);
       this.trying.set(c, free);
-      c.wake();
+      // Its backoff carries on, unless a wake started it over (#369: this
+      // reset it on every try, so a host whose channel kept dying was
+      // tried again every 250–500ms for as long as it did).
+      c.wake(this.fresh.delete(c));
     }
   }
 
@@ -316,21 +346,15 @@ export class Fleet {
 
   private tick() {
     const now = Date.now();
-    // A long gap between ticks: the machine slept.
+    // A long gap between ticks: the machine slept (or the page was hidden
+    // and its timers slowed).
     if (now - this.lastBeat > 5000) this.wake();
     this.lastBeat = now;
     let changed = false;
     for (const e of this.hosts.values()) {
       const c = e.client;
-      if (c?.connected) {
-        if (now - c.lastHeard > SILENT_MS) {
-          // Gone quiet without closing: treat it as dropped.
-          c.drop();
-          changed = true;
-        } else if (now - c.lastHeard > HEARTBEAT_MS) {
-          c.heartbeat();
-        }
-      }
+      // Gone quiet without closing: treat it as dropped.
+      if (c?.keepAlive(now, HEARTBEAT_MS, ANSWER_MS)) changed = true;
       if ((e.state === "stale" || e.state === "connecting") && e.lostAt !== null && now - e.lostAt > OFFLINE_MS) {
         e.state = "offline";
         changed = true;
@@ -353,6 +377,7 @@ export class Fleet {
         c.heartbeat();
         continue;
       }
+      this.fresh.add(c);
       window.setTimeout(() => this.enqueue(c), Math.random() * SPREAD_MS);
     }
   }
@@ -408,6 +433,11 @@ export class Fleet {
     const c = this.hosts.get(host)?.client;
     if (!c) throw new Error(`${host} isn't connected`);
     return c.request(method, path, body);
+  }
+
+  /** A host's summary connection, for its threads (the chat view). */
+  clientOf(host: string): Client | null {
+    return this.hosts.get(host)?.client ?? null;
   }
 
   /** Follow an editor on a host (M28). */
@@ -492,6 +522,10 @@ export class Fleet {
       const person = this.personOf(e.ref);
       const watchers = new Map<number, Presence[]>();
       for (const p of st.presence ?? []) if (p.pane !== undefined) (watchers.get(p.pane) ?? watchers.set(p.pane, []).get(p.pane)!).push(p);
+      const threads = new Map<number, ThreadSummary>();
+      // Only where the machine has threads (labs): a cached summary has no
+      // client to ask, so shows none.
+      if (e.client?.hasThreads()) for (const t of st.threads ?? []) if ("pane" in t.target) threads.set(t.target.pane, t);
       for (const info of st.panes) {
         // Someone else's private pane (M14): not even a tile.
         if (info.private && st.roles) continue;
@@ -509,6 +543,8 @@ export class Fleet {
           person,
           driver: info.driver ?? null,
           watchers: watchers.get(info.id) ?? [],
+          unread: threads.get(info.id)?.unread ?? 0,
+          mention: !!threads.get(info.id)?.mention,
         });
       }
     }

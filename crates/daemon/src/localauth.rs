@@ -20,8 +20,7 @@
 
 use std::{
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -48,11 +47,11 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<String> {
             if !m.file_type().is_file() {
                 anyhow::bail!("{} isn't a plain file", path.display());
             }
-            if m.uid() != nix::unistd::geteuid().as_raw() {
+            if !crate::perm::mine(&m) {
                 anyhow::bail!("{} belongs to another account", path.display());
             }
-            if m.mode() & 0o077 != 0 {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            if crate::perm::mode(&m) & 0o077 != 0 {
+                crate::perm::set(path, 0o600)?;
             }
             let mut s = String::new();
             std::fs::File::open(path)?.read_to_string(&mut s)?;
@@ -70,10 +69,18 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<String> {
             // Written aside and linked in: whoever starts beside us (two
             // daemons sharing a file) reads a whole token, never half of one.
             let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            let mut f =
+                crate::perm::open_mode(std::fs::OpenOptions::new().write(true).create_new(true), 0o600).open(&tmp)?;
             f.write_all(token.as_bytes())?;
             f.sync_all()?;
-            let linked = std::fs::hard_link(&tmp, path);
+            let mut linked = std::fs::hard_link(&tmp, path);
+            // Android's SELinux refuses hard links (S31). Renaming in loses
+            // the "theirs wins" race, which a phone's one daemon never runs.
+            if cfg!(target_os = "android")
+                && linked.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied)
+            {
+                linked = std::fs::rename(&tmp, path);
+            }
             let _ = std::fs::remove_file(&tmp);
             match linked {
                 Ok(()) => Ok(token),
@@ -88,18 +95,34 @@ pub fn load_or_create(path: &Path) -> anyhow::Result<String> {
 
 /// Whether a loopback connection carrying `tailscale serve`'s identity
 /// header can be serve's: its other end is tailscaled's (root) or the
-/// owner's own. Where that can't be told (not Linux), it is.
+/// owner's own. Where that can't be told (macOS), it is.
+#[cfg(unix)]
 pub fn serve_peer_ok(peer: SocketAddr, port: u16) -> bool {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
         return true;
     }
-    let me = nix::unistd::geteuid().as_raw();
     match loopback_uid(peer, port) {
-        Some(uid) => uid == 0 || uid == me,
+        Some(uid) => uid == 0 || Some(uid) == euid(),
         None => false,
     }
 }
 
+/// Windows: its TCP table names the client's process, and so its user
+/// (tailscaled runs as SYSTEM).
+#[cfg(windows)]
+pub fn serve_peer_ok(peer: SocketAddr, port: u16) -> bool {
+    crate::pipe::loopback_peer_ok(peer, port)
+}
+
+#[cfg(unix)]
+fn euid() -> Option<u32> {
+    #[cfg(unix)]
+    return Some(nix::unistd::geteuid().as_raw());
+    #[cfg(not(unix))]
+    None
+}
+
+#[cfg(unix)]
 /// The account that owns the client end of a loopback TCP connection to
 /// our `port` (Linux: `/proc/net/tcp{,6}`, which has both ends).
 pub fn loopback_uid(peer: SocketAddr, port: u16) -> Option<u32> {
@@ -109,6 +132,7 @@ pub fn loopback_uid(peer: SocketAddr, port: u16) -> Option<u32> {
         .find_map(|table| uid_in(&table, peer, port))
 }
 
+#[cfg(any(unix, test))]
 fn uid_in(table: &str, peer: SocketAddr, port: u16) -> Option<u32> {
     let want = (peer.ip().to_canonical(), peer.port());
     table.lines().skip(1).find_map(|line| {
@@ -119,6 +143,7 @@ fn uid_in(table: &str, peer: SocketAddr, port: u16) -> Option<u32> {
     })
 }
 
+#[cfg(any(unix, test))]
 /// `0100007F:1E01` (IPv4) or 32 hex digits and a port (IPv6): each 32-bit
 /// word as the kernel holds it, printed as a native number.
 fn parse_addr(s: &str) -> Option<SocketAddr> {
@@ -126,13 +151,13 @@ fn parse_addr(s: &str) -> Option<SocketAddr> {
     let port = u16::from_str_radix(port, 16).ok()?;
     let word = |h: &str| u32::from_str_radix(h, 16).ok().map(u32::to_ne_bytes);
     let ip = match ip.len() {
-        8 => IpAddr::V4(Ipv4Addr::from(word(ip)?)),
+        8 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(word(ip)?)),
         32 => {
             let mut b = [0u8; 16];
             for i in 0..4 {
                 b[4 * i..4 * i + 4].copy_from_slice(&word(&ip[8 * i..8 * i + 8])?);
             }
-            IpAddr::V6(Ipv6Addr::from(b))
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
         }
         _ => return None,
     };
@@ -144,7 +169,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn the_token_file_is_private_and_kept() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = std::env::temp_dir().join(format!("ilg-localauth-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let p = dir.join(FILE);
@@ -187,7 +214,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_real_connection_is_ours() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

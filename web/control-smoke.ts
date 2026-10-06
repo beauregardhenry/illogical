@@ -4,7 +4,7 @@
 // daemon's code, and reach the daemon both directly and through the relay.
 //   just control-smoke
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
 import { createServer as createTcp, connect } from "node:net";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -28,7 +28,7 @@ async function freePort(): Promise<number> {
   await new Promise((ok) => s.close(ok));
   return port;
 }
-const [CONTROL, GITHUB, DAEMON, SPY, PUSH, STRIPE, SPRITES, DAEMON2] = await Promise.all(Array.from({ length: 8 }, freePort));
+const [CONTROL, GITHUB, DAEMON, SPY, PUSH, STRIPE, SPRITES, DAEMON2, DAEMON3] = await Promise.all(Array.from({ length: 9 }, freePort));
 const WHSEC = "whsec_smoke";
 const base = `http://127.0.0.1:${CONTROL}`;
 const target = process.env.TARGET_DIR ?? "../target/debug";
@@ -45,6 +45,48 @@ const temp = (w: string) => {
   return d;
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Every process the smoke started, however deep. A daemon's panes run in
+// sessions of their own on purpose, so a process group would miss them:
+// find them by the temp dirs on their command lines (the daemon, and each
+// pane's shim), then walk down to their children. Taken before anything
+// dies, since orphans move to init.
+function smokeProcesses(): number[] {
+  const all = new Map<number, { ppid: number; command: string }>();
+  for (const line of execFileSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" }).split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (m) all.set(Number(m[1]), { ppid: Number(m[2]), command: m[3] });
+  }
+  const found = [...all].filter(([, p]) => dirs.some((d) => p.command.includes(d))).map(([pid]) => pid);
+  for (const pid of found) for (const [c, p] of all) if (p.ppid === pid && !found.includes(c)) found.push(c);
+  return found.filter((pid) => pid !== process.pid);
+}
+
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Kill it all and wait for it to be gone, so nothing is still writing when
+// the dirs are deleted. The waits are bounded.
+async function cleanup() {
+  const pids = smokeProcesses();
+  const exits = procs.filter((p) => p.exitCode === null && p.signalCode === null).map((p) => new Promise((r) => p.once("exit", r)));
+  for (const p of procs) p.kill("SIGKILL");
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // gone already
+    }
+  }
+  await Promise.race([Promise.all(exits), sleep(5000)]);
+  for (let i = 0; i < 50 && pids.some(alive); i++) await sleep(100);
+}
 
 // A fake GitHub: authorize redirects straight back, signing in whoever
 // the device asks for.
@@ -225,6 +267,43 @@ try {
         await sleep(200);
       }
       check(`--host ${name} capture`, cap.out.includes(`M49-${name}-42`), (cap.err + cap.out).trim().slice(-200));
+      // Streams (#254): an answer with no end comes back as it's written.
+      const follow = (args: string[]) => {
+        const p = spawn(`${target}/illogical`, ["--host", name, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+        procs.push(p);
+        const got = { out: "", err: "", code: null as number | null };
+        p.stdout!.on("data", (d) => (got.out += d));
+        p.stderr!.on("data", (d) => (got.err += d));
+        p.on("exit", (c) => (got.code = c ?? 1));
+        return { p, got };
+      };
+      const until = async (ok: () => boolean, ms = 15_000) => {
+        for (let t = 0; t < ms && !ok(); t += 100) await sleep(100);
+        return ok();
+      };
+      const ev = follow(["events", "--follow", "--type", "bell"]);
+      await until(() => ev.got.err.includes(`${name}: `));
+      await sleep(500);
+      await cli(["--host", name, "run", "--", "sleep 1; printf '\\a'"]);
+      check(`--host ${name} events --follow streams`, (await until(() => ev.got.out.includes('"bell"'))) && ev.got.code === null, (ev.got.err + ev.got.out).trim().slice(-200));
+      ev.p.kill();
+      const counting = await cli(["--host", name, "--json", "run", "--", `for i in 1 2 3; do sleep 1; echo TAIL-${name}-$((40+i)); done; sleep 30`]);
+      const tl = follow(["tail", "--follow", `${JSON.parse(counting.out).pane}`]);
+      check(`--host ${name} tail --follow streams`, (await until(() => tl.got.out.includes(`TAIL-${name}-43`))) && tl.got.code === null, (tl.got.err + tl.got.out).trim().slice(-200));
+      tl.p.kill();
+      // attach: the channel's own protocol messages, as /ws.
+      const at = follow(["attach", `${pane}`]);
+      await until(() => at.got.err.includes(`${name}: `));
+      await sleep(1000);
+      // The pane's command ended: Enter gives it a shell.
+      at.p.stdin!.write("\r");
+      await sleep(1500);
+      at.p.stdin!.write(`echo ATTACH-${name}-$((6*7))\r`);
+      const typed = await until(() => at.got.out.includes(`ATTACH-${name}-42`));
+      at.p.stdin!.write("\x1d");
+      const detached = await until(() => at.got.code !== null, 5000);
+      check(`--host ${name} attach: typed and seen, then detached`, typed && detached && at.got.code === 0, (at.got.err + at.got.out).trim().slice(-200));
+      at.p.kill();
     }
   }
 
@@ -299,7 +378,7 @@ try {
   // #94: the self-approval refused in 2 is logged, with why and whose,
   // and not its signature.
   const refusal = logs.split("\n").find((l) => l.includes("refused") && l.includes(phone.id)) ?? "";
-  check("a refused approval is logged with its reason and ids", refusal.includes("isn't a device this account trusts") && refusal.includes(me.account), refusal);
+  check("a refused approval is logged with its reason and ids", refusal.includes("isn't one the account trusts") && refusal.includes(me.account), refusal);
   check("but not its signature", !logs.includes(forged.sig));
   spy.close();
 
@@ -368,6 +447,42 @@ try {
   check("a join into an account other than the one expected is refused", (await joinAs("elsewhere", elsewhere, "0123-4567-89ab-cdef")) !== 0);
   check("... and pins nothing", !readdirSync(elsewhere).includes("control.json"));
 
+  // 9b. A machine removed from a browser (#330): its key never counts
+  // again. The daemon hears so, sets the key aside, makes a new one and
+  // asks to join again; /api/setup shows why, with the new code. Approved
+  // into the same account, it's back without anyone checking a
+  // fingerprint again.
+  {
+    const st = temp("removed");
+    check("illogicald join finished (removable)", (await joinAs("removable", st, laptop.id)) === 0);
+    procs.push(
+      spawn(`${target}/illogicald`, [
+        ...["--listen", `127.0.0.1:${DAEMON3}`, "--name", "removable", "--state-dir", st],
+        ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent", "--no-claude-ide"],
+      ], { stdio: "ignore" }),
+    );
+    const was = await me.waitOnline("removable", 10_000);
+    await me.revoke(was.id);
+    const token = readFileSync(join(st, "local-token"), "utf8").trim();
+    type Setup = { control: { pending?: { code: string }; removed?: { said: string; by?: string; old_key: string; new_key: string; kept: string } } };
+    let setup: Setup | undefined;
+    for (let i = 0; i < 150 && !setup?.control.pending; i++) {
+      await sleep(200);
+      setup = await fetch(`http://127.0.0.1:${DAEMON3}/api/setup?part=control`, { headers: { authorization: `Bearer ${token}` } }).then((r) => r.json() as Promise<Setup>, () => undefined);
+    }
+    const removed = setup?.control.removed;
+    check("removed from a browser, the daemon asks to join again with a new key", !!setup?.control.pending && !!removed, JSON.stringify(setup));
+    check("... and says why: removed, by which device", !!removed?.said.includes("removed") && removed?.by === "laptop", removed?.said);
+    check("... keeping the old key aside", readdirSync(st).some((f) => f.startsWith("daemon.key.removed-")) && removed!.old_key !== removed!.new_key);
+    const again = await me.approveJoin(setup!.control.pending!.code);
+    check("the new code is for a new key", again.device !== was.id);
+    const back = await me.waitOnline(again.device, 15_000).catch(() => undefined);
+    check("approved once, it's back online", back?.online === true, JSON.stringify(back));
+    const listed = (await me.directory()).filter((d) => d.name === "removable");
+    check("listed once, with the new key", listed.length === 1 && listed[0].id === again.device, JSON.stringify(listed));
+    check("the old key stays out", !(await me.trusted()).has(was.id));
+  }
+
   // 10. Deleting an account (#173): someone with a machine leaves. The
   // machine is refused from then on, and nothing of theirs is left.
   const leaver = await Device.signIn({ control: base, login: "leaver", name: "laptop" });
@@ -405,10 +520,10 @@ try {
   check("signed out: the account is gone", await leaver.api("/api/me").then(() => false, (e: Error) => / 401 /.test(e.message)));
   // Hung up on, and refused when it dials again.
   const since = () => Buffer.concat(daemon2Log).subarray(before).toString().replace(/\x1b\[[0-9;]*m/g, "");
-  // It's told why (#208).
-  const refused2 = /can't reach control's relay.*401.*this machine's account was deleted/;
+  // It's told why (#208): control dropped it (#325), with what control said.
+  const refused2 = /control dropped this machine.*this machine's account was deleted/;
   for (let i = 0; i < 100 && !refused2.test(since()); i++) await sleep(100);
-  check("its machine is refused from then on", refused2.test(since()), since().split("\n").filter((l) => /relay/.test(l)).slice(-1)[0]);
+  check("its machine is refused from then on", refused2.test(since()), since().split("\n").filter((l) => /relay|control/.test(l)).slice(-3).join("\n"));
   const rows = new DatabaseSync(db, { readOnly: true });
   const left: string[] = [];
   for (const { name } of rows.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]) {
@@ -423,8 +538,19 @@ try {
   console.log("FAIL", e);
   failed++;
 } finally {
-  for (const p of procs) p.kill("SIGKILL");
+  // A cleanup error is noise: the checks have already said what they said.
+  try {
+    await cleanup();
+  } catch (e) {
+    console.log("cleanup:", e);
+  }
   gh.close();
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  for (const d of dirs) {
+    try {
+      rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch (e) {
+      console.log("cleanup:", e);
+    }
+  }
 }
 process.exit(failed ? 1 : 0);

@@ -13,11 +13,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use illogical_control_wire as wire;
 use illogical_e2e::{
-    Cert, Kind, Revocation, Trust,
+    Cert, Kind, Refusal, Revocation, Trust,
     cert::{join_code, normalize_code},
     now_ms,
-    team::TeamPin,
+    team::{TeamPin, TeamRole},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,7 +27,7 @@ use tracing::warn;
 use crate::{
     ApiError, App,
     auth::{DaemonAuth, Session, hash, token},
-    err,
+    err, refusal,
 };
 
 type R = Result<Json<Value>, ApiError>;
@@ -87,41 +88,69 @@ fn refused(what: &str, account: &str, c: &Cert, why: &str) {
     warn!(what, account, device = ?clip(&c.device), kind = c.kind.as_str(), approver = ?clip(&c.approver), why, "refused");
 }
 
+/// A removed key, approved again (#330's words).
+const REVOKED: &str = "that key was removed from this account, so it can't be approved again: it needs a new key";
+
+/// What the person who approved reads when control refuses (#327): what
+/// failed and what to do. Pages show their own words by the reason code.
+fn refused_say(r: Refusal) -> &'static str {
+    match r {
+        Refusal::Revoked => REVOKED,
+        Refusal::ApproverUntrusted => {
+            "the approving device isn't one this account trusts any more: approve from another of your devices, or enroll this one again (a recovery code approves it)"
+        }
+        Refusal::BadSignature => {
+            "the approval isn't signed by the approving device's key (its key changed?): enroll that device again, then approve"
+        }
+        Refusal::CantApprove => "a machine can't approve devices: approve from a browser, phone or the CLI",
+        Refusal::RecoveryForMachine => {
+            "a recovery code approves browsers and phones, not machines: approve the machine from one of your devices"
+        }
+        Refusal::NoChain => {
+            "the approval doesn't chain to this account's first device (its form, kind or time): reload and try again"
+        }
+    }
+}
+
 /// `cert` checks out against the account's trusted devices. `what` names
-/// the request, for the log.
+/// the request, for the log. Refused, the 403 says which check failed, as
+/// a `reason` code and a sentence (#327).
 fn approval_ok(app: &App, account: &str, cert: &Cert, what: &str) -> Result<(), ApiError> {
-    let (trust, mut certs, revs) = trusted(app, account)?;
+    let (trust, certs, revs) = trusted(app, account)?;
     let Some(trust) = trust else {
         refused(what, account, cert, "the account has no devices yet");
-        return Err(err(StatusCode::CONFLICT, "this account has no devices yet"));
+        return Err(refusal(StatusCode::CONFLICT, "no_devices", "this account has no devices yet"));
     };
-    certs.push(cert.clone());
-    if trust.evaluate(&certs, &revs).get(&cert.device).is_none_or(|c| c != cert) {
-        certs.pop();
-        let why = match trust.evaluate(&certs, &revs).get(&cert.approver) {
-            None => "the approver isn't a device this account trusts",
-            Some(a) if !cert.signed_by(a) => "the signature doesn't verify with the approver's key",
-            Some(a) if !a.kind.approves() => "the approver can't approve",
-            Some(_) => "it doesn't chain to the account's root (form, kind or time)",
-        };
-        refused(what, account, cert, why);
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            "that approval doesn't check out (signed by a device this account trusts?)",
-        ));
+    // A removed key never counts again (#330): say so, not that it
+    // doesn't chain. `revoked` says so to pages (#327).
+    if revs.iter().any(|r| r.device == cert.device) {
+        refused(what, account, cert, "this device was removed from the account (revoked): it needs a new key");
+        return Err(refusal(StatusCode::FORBIDDEN, Refusal::Revoked.code(), REVOKED));
     }
-    Ok(())
+    match trust.refusal(&certs, &revs, cert) {
+        None => Ok(()),
+        Some(r) => {
+            refused(what, account, cert, r.check());
+            Err(refusal(StatusCode::FORBIDDEN, r.code(), refused_say(r)))
+        }
+    }
 }
 
 #[derive(Deserialize)]
 pub struct Enroll {
     cert: Cert,
+    /// The machine's join code this browser came to approve (#326): a
+    /// browser that isn't one of the account's devices yet can't, so the
+    /// device that approves it is shown the machine alongside.
+    #[serde(default)]
+    join: Option<String>,
 }
 
 /// A browser or CLI asks to join the account. The first device is
 /// self-signed and trusted on first use; later ones wait for an approval.
 pub async fn enroll(State(app): State<Arc<App>>, s: Session, Json(b): Json<Enroll>) -> R {
     let c = b.cert;
+    let join = b.join.as_deref().and_then(|j| normalize_code(j).ok());
     if let Err(e) = c.check_request() {
         refused("enroll", &s.account, &c, &e.to_string());
         return Err(err(StatusCode::BAD_REQUEST, &e.to_string()));
@@ -153,16 +182,21 @@ pub async fn enroll(State(app): State<Arc<App>>, s: Session, Json(b): Json<Enrol
                 app.limits.check_account(crate::limit::ENROLLS, &s.account)?;
             }
             app.db.put_device(&Cert { approver: String::new(), sig: String::new(), ..c.clone() }, false, now_ms())?;
+            app.db.set_device_join(&s.account, &c.device, join.as_deref())?;
             // The account's other devices hear of it once (#104), not on
             // every reload of the waiting page.
             if new {
-                crate::push::notify(
-                    &app,
-                    vec![s.account.clone()],
-                    "control-device",
-                    "A new browser wants into your account".into(),
-                    "Open illogical to check its fingerprint and approve it.".into(),
-                );
+                let (title, body) = match join {
+                    Some(_) => (
+                        "A new browser and a machine want into your account",
+                        "Open illogical to check them and approve both at once.",
+                    ),
+                    None => (
+                        "A new browser wants into your account",
+                        "Open illogical to check its fingerprint and approve it.",
+                    ),
+                };
+                crate::push::notify(&app, vec![s.account.clone()], "control-device", title.into(), body.into());
             }
             Ok(Json(json!({ "approved": false, "root": root })))
         }
@@ -224,7 +258,11 @@ pub async fn add_recovery(State(app): State<Arc<App>>, s: Session, Json(b): Json
 pub async fn devices(State(app): State<Arc<App>>, s: Session) -> R {
     let (trust, certs, revs) = trusted(&app, &s.account)?;
     let (_, pending) = app.db.devices(&s.account)?;
-    Ok(Json(json!({ "trust": trust, "certs": certs, "revocations": revs, "pending": pending })))
+    // #326: the machine a waiting browser came to approve, by its code,
+    // while that join is open.
+    let joins: serde_json::Map<String, Value> =
+        app.db.device_joins(&s.account, now_ms())?.into_iter().map(|(d, code)| (d, Value::String(code))).collect();
+    Ok(Json(json!({ "trust": trust, "certs": certs, "revocations": revs, "pending": pending, "joins": joins })))
 }
 
 pub async fn device(State(app): State<Arc<App>>, s: Session, Path(id): Path<String>) -> Result<Response, ApiError> {
@@ -287,42 +325,44 @@ pub async fn revoke(State(app): State<Arc<App>>, s: Session, Json(b): Json<Revok
     if signer.is_none() {
         return Err(err(StatusCode::FORBIDDEN, "that revocation doesn't check out"));
     }
-    app.db.add_revocation(&r)?;
-    nudge(&app, &s.account);
+    // Only its own: a revoked machine is refused everywhere (#330), so
+    // another account's isn't for this one to remove.
+    if !app.db.is_accounts(&s.account, &r.device)? {
+        return Err(err(StatusCode::FORBIDDEN, "that device isn't this account's"));
+    }
     // A revoked daemon leaves the directory and the relay.
     if app.db.daemon_account(&r.device)?.as_deref() == Some(s.account.as_str()) {
+        app.db.add_machine_revocation(&r)?;
+        nudge(&app, &s.account);
         app.db.drop_daemon(&r.device)?;
         app.relay.drop_daemon(&r.device);
+    } else {
+        app.db.add_revocation(&r)?;
+        nudge(&app, &s.account);
     }
     Ok(Json(json!({})))
 }
 
+/// Why a removed key can't come back (#330), when `device` was revoked:
+/// the words, and when and by which device (that by name only with
+/// `detail`, for the key's holder).
+pub fn removed(app: &App, device: &str, kind: Kind, detail: bool) -> anyhow::Result<Option<(String, wire::RemovedAt)>> {
+    let Some(r) = app.db.revoked(device)? else { return Ok(None) };
+    let day = crate::day(r.at);
+    if !detail {
+        let msg = format!("this key was removed from its account on {day}: it needs a new key, then join again");
+        return Ok(Some((msg, wire::RemovedAt { at: r.at, by: None })));
+    }
+    let what = if kind == Kind::Daemon { "this machine" } else { "this device" };
+    let by = app.db.device(&r.account, &r.by)?.map(|(c, _)| c.name).filter(|n| !n.is_empty());
+    let by_words = by.as_deref().map(|n| format!(" by {n}")).unwrap_or_default();
+    let msg = format!(
+        "{what} was removed from its account on {day}{by_words}, so its key can't join again: it needs a new key"
+    );
+    Ok(Some((msg, wire::RemovedAt { at: r.at, by })))
+}
+
 // ---------------------------------------------------------------- joining
-
-#[derive(Deserialize)]
-pub struct JoinReq {
-    cert: Cert,
-    #[serde(default)]
-    urls: Vec<String>,
-    /// A machine that belongs to a team (M19), not a person.
-    #[serde(default)]
-    team: Option<String>,
-    /// A hosted sandbox's one-time ticket (M20).
-    #[serde(default)]
-    ticket: Option<String>,
-    /// What the daemon understands, comma-separated (older ones send none).
-    #[serde(default)]
-    features: String,
-    /// Its signature with the key it asks with (0.17 and newer).
-    #[serde(default)]
-    proof: Option<JoinProof>,
-}
-
-#[derive(Deserialize)]
-pub struct JoinProof {
-    ms: u64,
-    sig: String,
-}
 
 /// How far a join proof's time may be from control's clock.
 const PROOF_SKEW_MS: u64 = 5 * 60 * 1000;
@@ -333,7 +373,7 @@ const JOIN_NEEDS_UPDATE: &str =
 
 /// Whether the join request comes from the key's holder: an error if it
 /// says so and doesn't, `false` if it doesn't say (an older daemon).
-fn join_proven(app: &App, b: &JoinReq) -> Result<bool, ApiError> {
+fn join_proven(app: &App, b: &wire::JoinRequest) -> Result<bool, ApiError> {
     let Some(p) = &b.proof else { return Ok(false) };
     let body = illogical_e2e::cert::join_proof_body(&b.cert, p.ms);
     if !illogical_e2e::cert::verify_hex(&b.cert.sign, body.as_bytes(), &p.sig) {
@@ -376,8 +416,8 @@ pub async fn join(
     State(app): State<Arc<App>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
-    Json(b): Json<JoinReq>,
-) -> R {
+    Json(b): Json<wire::JoinRequest>,
+) -> Result<Response, ApiError> {
     app.limits.check(crate::limit::JOINS, app.limits.client_ip(peer, &headers))?;
     b.cert.check_request().map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
     // A daemon, or the CLI (M49), which joins the same way: a code shown
@@ -394,6 +434,13 @@ pub async fn join(
     // A daemon control knows joins again only with its key: anyone may
     // have its certificate.
     let proven = join_proven(&app, &b)?;
+    // A removed key never joins again (#330), and gets no code: it says
+    // when it was removed (and by which device, to the key's holder), and
+    // that it needs a new key. `removed` says so to the program asking.
+    if let Some((msg, removed)) = removed(&app, &b.cert.device, b.cert.kind, proven)? {
+        let said = wire::RemovedAnswer { error: Some(msg), removed: Some(removed) };
+        return Ok((StatusCode::GONE, crate::reply(&said)?).into_response());
+    }
     if !proven && app.db.device_known(&b.cert.device)? {
         return Err(err(StatusCode::UPGRADE_REQUIRED, JOIN_NEEDS_UPDATE));
     }
@@ -413,7 +460,7 @@ pub async fn join(
         }
         None => None,
     };
-    app.db.add_join(
+    let asked = app.db.add_join(
         &code,
         &b.cert,
         &hash(&poll),
@@ -424,41 +471,62 @@ pub async fn join(
         proven,
         now_ms(),
     )?;
-    Ok(Json(
-        json!({ "code": code, "poll": poll, "expires_in_secs": crate::db::JOIN_TTL_MS / 1000, "team_name": team_name }),
-    ))
-}
-
-#[derive(Deserialize)]
-pub struct Poll {
-    poll: String,
+    // Another join from this machine is waiting (#329), and this request
+    // didn't prove it holds the key: it doesn't take that one over.
+    if asked == crate::db::Asked::Taken {
+        return Err(err(
+            StatusCode::CONFLICT,
+            &format!(
+                "this machine has a join waiting already (code {code}): finish it there, or wait for it to expire"
+            ),
+        ));
+    }
+    let started = wire::JoinStarted { code, poll, expires_in_secs: crate::db::JOIN_TTL_MS / 1000, team_name };
+    Ok(crate::reply(&started)?.into_response())
 }
 
 /// The daemon waits for someone to approve its code.
-pub async fn join_poll(State(app): State<Arc<App>>, Path(code): Path<String>, Query(q): Query<Poll>) -> R {
+pub async fn join_poll(State(app): State<Arc<App>>, Path(code): Path<String>, Query(q): Query<wire::PollQuery>) -> R {
     let code = normalize_code(&code).map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
     let j =
         app.db.join(&code, now_ms())?.ok_or_else(|| err(StatusCode::NOT_FOUND, "that code expired; run join again"))?;
     if j.poll_hash != hash(&q.poll) {
+        // A later request from this machine took it over (#329).
+        if j.replaced.split(' ').any(|h| h == hash(&q.poll)) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "replaced by another join from this machine (Getting started, or `illogicald join`): finish it there",
+            ));
+        }
         return Err(err(StatusCode::FORBIDDEN, "not your join"));
     }
     if let Some(on) = j.rejected {
         app.db.drop_join(&code)?;
-        return Ok(Json(json!({ "approved": false, "rejected": on })));
+        return crate::reply(&wire::JoinPoll::turned_down(on));
     }
-    let Some(account) = j.account else { return Ok(Json(json!({ "approved": false }))) };
+    let Some(account) = j.account else { return crate::reply(&wire::JoinPoll::waiting()) };
     let (trust, certs, revs) = trusted(&app, &account)?;
     app.db.drop_join(&code)?;
     // A team daemon pins the team's founder too, if the approver signed it in.
     let team = match &j.team {
-        Some(t) => app.db.team(t)?.map(|t| {
-            json!({ "team": t.id, "founder": t.founder, "founder_root": t.founder_root, "name": t.name, "sig": j.team_sig })
+        Some(t) => app.db.team(t)?.map(|t| wire::JoinTeam {
+            team: t.id,
+            founder: t.founder,
+            founder_root: t.founder_root,
+            name: t.name,
+            sig: j.team_sig,
         }),
         None => None,
     };
-    Ok(Json(
-        json!({ "approved": true, "cert": j.cert, "trust": trust, "certs": certs, "revocations": revs, "team": team }),
-    ))
+    crate::reply(&wire::JoinPoll {
+        approved: true,
+        rejected: None,
+        cert: Some(j.cert),
+        trust,
+        team,
+        certs,
+        revocations: revs,
+    })
 }
 
 /// What a signed-in person sees before approving a code.
@@ -525,11 +593,11 @@ pub async fn join_approve(
         refused("join_approve", &s.account, &c, "a known daemon's join without its key");
         return Err(err(StatusCode::CONFLICT, JOIN_NEEDS_UPDATE));
     }
-    // A team's machine: only its owners add one, and the approving device
-    // signs it in, for the daemon to check.
+    // A team's machine: any member adds one of their own (#332), and the
+    // approving device signs it in, for the daemon to check.
     let team = match &b.team {
         Some(id) => {
-            let pin = owned_team(&app, &s.account, id, "only the team's owners add its machines")?;
+            let pin = in_team(&app, &s.account, id, false, "only the team's members add machines to it")?;
             can_follow(&app, id, &j.features, &c.name)?;
             let sig = b.team_sig.as_deref().unwrap_or_default();
             let (trust, certs, revs) = trusted(&app, &s.account)?;
@@ -585,13 +653,19 @@ pub async fn join_reject(
     Ok(Json(json!({})))
 }
 
-/// A team `account` owns, as a daemon pins it; `no` when they don't.
-fn owned_team(app: &App, account: &str, id: &str, no: &str) -> Result<TeamPin, ApiError> {
+/// A team `account` is in, as a daemon pins it; `no` when it isn't. Any
+/// member adds their own machines (#332), but only owners while it's
+/// locked; with `owner`, only owners at all.
+fn in_team(app: &App, account: &str, id: &str, owner: bool, no: &str) -> Result<TeamPin, ApiError> {
     let t = app.db.team(id)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such team"))?;
     let r = app.db.latest_roster(id)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such team"))?;
     let r: illogical_e2e::team::Roster = serde_json::from_str(&r).map_err(anyhow::Error::from)?;
-    if r.member(account).map(|m| m.role) != Some(illogical_e2e::team::TeamRole::Owner) {
-        return Err(err(StatusCode::FORBIDDEN, no));
+    let Some(role) = r.member(account).map(|m| m.role) else { return Err(err(StatusCode::FORBIDDEN, no)) };
+    if role != TeamRole::Owner && (owner || t.locked) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            if owner { no } else { "the team is locked: only its owners add machines until it's unlocked" },
+        ));
     }
     Ok(TeamPin { team: t.id, founder: t.founder, founder_root: t.founder_root })
 }
@@ -599,27 +673,36 @@ fn owned_team(app: &App, account: &str, id: &str, no: &str) -> Result<TeamPin, A
 /// How far a move's time may be from control's clock.
 const MOVE_SKEW_MS: u64 = 10 * 60 * 1000;
 
-/// *Move to…* on a machine (#100): into a team its account owns, or back
-/// to the account. A device of the account signs it; the daemon checks.
+/// *Move to…* on a machine (#100): its own account moves it into a team
+/// it's in, between them, or back to the account (#332: members too).
+/// A device of the account signs it; the daemon checks. A team's owners
+/// may also take a member's machine out, signed by one of their devices,
+/// which the daemon checks against the roster.
 pub async fn move_daemon(
     State(app): State<Arc<App>>,
     s: Session,
     Path(id): Path<String>,
     Json(m): Json<illogical_e2e::team::Move>,
 ) -> R {
-    let (owner, _) = app.db.daemon_row(&id)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such machine"))?;
-    if owner != s.account {
-        return Err(err(StatusCode::FORBIDDEN, "only the machine's own account moves it"));
-    }
-    // Owners of the team it leaves and the team it joins.
+    let (owner, d) = app.db.daemon_row(&id)?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such machine"))?;
     let now = app.db.daemon_team(&id)?;
-    if let Some(t) = &now
-        && m.team.as_ref().map(|p| &p.team) != Some(t)
-    {
-        owned_team(&app, &s.account, t, "only the team's owners take its machines out")?;
+    if owner != s.account {
+        let Some(t) = now.as_ref().filter(|_| m.team.is_none()) else {
+            return Err(err(StatusCode::FORBIDDEN, "only the machine's own account moves it"));
+        };
+        in_team(&app, &s.account, t, true, "only the machine's own account and the team's owners take it out")?;
+        if !crate::teams::has_feature(&app.db.daemon_features(&id)?, crate::teams::OWNER_MOVES) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                &format!(
+                    "{} runs an older illogical: its owner updates it, then the team's owners can take it out",
+                    d.name
+                ),
+            ));
+        }
     }
     let pin = match &m.team {
-        Some(p) => Some(owned_team(&app, &s.account, &p.team, "only the team's owners add its machines")?),
+        Some(p) => Some(in_team(&app, &s.account, &p.team, false, "only the team's members add machines to it")?),
         None => None,
     };
     if pin != m.team {
@@ -628,8 +711,7 @@ pub async fn move_daemon(
     if let Some(p) = &m.team
         && now.as_ref() != Some(&p.team)
     {
-        let name = app.db.daemon_row(&id)?.map(|(_, d)| d.name).unwrap_or_default();
-        can_follow(&app, &p.team, &app.db.daemon_features(&id)?, &name)?;
+        can_follow(&app, &p.team, &app.db.daemon_features(&id)?, &d.name)?;
     }
     let last = app
         .db
@@ -656,18 +738,22 @@ pub async fn move_daemon(
 // ---------------------------------------------------------------- daemons
 
 /// The daemon's account's certificates, to evaluate against its root.
-pub async fn daemon_trust(State(app): State<Arc<App>>, d: DaemonAuth, Query(q): Query<crate::teams::Features>) -> R {
+pub async fn daemon_trust(State(app): State<Arc<App>>, d: DaemonAuth, Query(q): Query<wire::Features>) -> R {
     app.db.set_daemon_features(&d.cert.device, &q.features)?;
     let (trust, certs, revs) = trusted(&app, &d.cert.account)?;
     // Its last move (#100), for the daemon to check and take.
-    let moved: Option<Value> = app.db.daemon_moved(&d.cert.device)?.and_then(|j| serde_json::from_str(&j).ok());
-    Ok(Json(json!({ "trust": trust, "certs": certs, "revocations": revs, "moved": moved })))
+    let moved = app.db.daemon_moved(&d.cert.device)?.and_then(|j| {
+        serde_json::from_str(&j)
+            .inspect_err(|e| warn!(daemon = %d.cert.device, error = %e, "a stored move doesn't parse; not sending it"))
+            .ok()
+    });
+    crate::reply(&wire::TrustAnswer { trust, certs, revocations: revs, moved })
 }
 
 pub async fn daemon_leave(State(app): State<Arc<App>>, d: DaemonAuth) -> R {
     app.db.drop_daemon(&d.cert.device)?;
     app.relay.drop_daemon(&d.cert.device);
-    Ok(Json(json!({})))
+    crate::reply(&wire::Ack {})
 }
 
 // ---------------------------------------------------------------- directory

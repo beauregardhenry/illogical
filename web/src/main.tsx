@@ -1,5 +1,7 @@
 // illogical web client: tabs and splits of terminals owned by the daemon.
 
+import { setLending } from "./hand";
+import type { TeamPins, TeamPinsRequest } from "./proto";
 import { render } from "preact";
 import "./style.css";
 import { Client } from "./client";
@@ -13,6 +15,7 @@ import { ControlSession, detectControl, restoreInvite } from "./control";
 import { ControlGate, ControlOverlay, controlMenuItems, NoMachines, useControl } from "./ui/control";
 import { setFleet, setHostMenuExtras } from "./ui/hosts";
 import { setControlSession } from "./ui/people";
+import { activeHuddle } from "./call";
 import { unhex } from "./e2e/cert.ts";
 import { useSubscribe } from "./ui/hooks";
 import { useEffect, useState } from "preact/hooks";
@@ -20,6 +23,8 @@ import { SwarmView } from "./swarm/view";
 import { fakeSwarm } from "./swarm/fake";
 import { closeSwarm, onSwarmRoute, swarmRoute } from "./swarm/route";
 import { setupDesktop } from "./desktop";
+import { openThread } from "./ui/threads";
+import { openGettingStarted, type Section } from "./ui/welcome";
 
 // Served by illogical control (M17), not a daemon: sign in, enroll this
 // browser, and reach daemons through end-to-end channels. A read-only link
@@ -43,6 +48,8 @@ if (info && linkMatch) {
   // Keep the key out of the address bar (and of anything that reads it).
   history.replaceState(null, "", "/");
 }
+// S33: lend this device's tools to agents, if it was turned on.
+setLending(session);
 if (session) {
   setHostMenuExtras(() => controlMenuItems(session));
   // A tapped notice from control (#104): what waits shows now.
@@ -93,6 +100,23 @@ function makeClient(base: string): Client {
 let client = makeClient(directory.base());
 // Inside the desktop app: its titlebar and keys (M46).
 setupDesktop(() => client);
+/** Hand a machine of yours the teams this browser pinned (#233), and drop
+ * those it has that this account isn't in now (only once the teams have
+ * loaded: a failed load isn't "none"). */
+async function syncPins(c: Client, session: ControlSession) {
+  const pins = session.teamPins();
+  let drop: string[] = [];
+  if (session.teamsLoaded) {
+    const r = await c.request("GET", "/api/team-pins");
+    const had = r.ok ? ((await r.json<TeamPins>()).pins ?? {}) : {};
+    const mine = new Set(session.teams.map((t) => t.team));
+    drop = Object.keys(had).filter((t) => !mine.has(t));
+  }
+  if (!Object.keys(pins).length && !drop.length) return;
+  const r = await c.request("POST", "/api/team-pins", { pins, drop } satisfies TeamPinsRequest);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+}
+
 const connect = () => {
   // In control mode there's nothing to connect to until a daemon is known.
   if (!session || client.e2e) client.connect();
@@ -100,9 +124,18 @@ const connect = () => {
     const c = client;
     directory.setPath(null);
     let hadSessions = false;
+    let pinned = false;
     c.subscribe(() => {
       if (c !== client) return;
       directory.setPath(c.connected ? c.path : null);
+      // A machine of yours learns the teams this browser pinned (#233), so
+      // their members can be invited there, and forgets those this account
+      // left; it checks each roster itself.
+      const id = c.e2e?.daemon.id;
+      if (c.connected && c.state && !c.state.roles && !pinned && id && session.owns(id)) {
+        pinned = true;
+        void syncPins(c, session).catch(() => (pinned = false));
+      }
       // A hosted VM whose last tab closed is done (M20): delete it.
       const n = c.state?.sessions.length ?? 0;
       if (n > 0) hadSessions = true;
@@ -188,13 +221,16 @@ if (!linkTarget) {
 function Swarm() {
   const [, set] = useState(0);
   useEffect(() => onSwarmRoute(() => set((n) => n + 1)), []);
+  // The home machine's name arrives with the directory, after a cold load.
+  useSubscribe((fn) => directory.subscribe(fn));
   const route = swarmRoute();
   if (!route || linkTarget) return null;
   if (session && session.phase !== "ready") return null;
   const f = route.focus;
   // A notification through control names its daemon; else it's this page's.
   const host = f ? (f.daemon ? directory.list?.hosts.find((h) => h.id === f.daemon)?.name : (directory.home ?? directory.names[0])) : undefined;
-  return <SwarmView fleet={fleet} back={closeSwarm} focus={f && host ? { host, pane: f.pane } : null} />;
+  const home = directory.home ?? directory.names[0] ?? null;
+  return <SwarmView fleet={fleet} back={closeSwarm} home={home} focus={f && host ? { host, pane: f.pane } : null} />;
 }
 
 const draw = () =>
@@ -222,9 +258,10 @@ if (!linkTarget) {
 }
 
 
-// Opened from a notification (`#pane=N`), or told to by the service worker.
-// Notifications come from the home daemon, so show it first.
-const openPane = (pane: number, daemon?: string) => {
+// Opened from a notification (`#pane=N`, with `&thread=pane-N` for an
+// @mention, M61), or told to by the service worker. Notifications come
+// from the home daemon, so show it first.
+const openPane = (pane: number, daemon?: string, thread?: string) => {
   // From a notification through control: that daemon's host first.
   const host = daemon ? directory.list?.hosts.find((h) => h.id === daemon)?.name : undefined;
   if (host) directory.select(host);
@@ -232,6 +269,15 @@ const openPane = (pane: number, daemon?: string) => {
   const go = () => {
     if (!client.info(pane)) return false;
     client.setActive(pane);
+    const t = /^(pane|session)-(\d+)$/.exec(thread ?? "");
+    // Only where the machine has threads, which it says in its features:
+    // read them first, so a cold load doesn't open a thread nobody sees.
+    if (t) {
+      const c = client;
+      void c.loadFeatures().then(() => {
+        if (c.hasThreads()) openThread(c, t[1] === "pane" ? { pane: Number(t[2]) } : { session: Number(t[2]) });
+      });
+    }
     return true;
   };
   if (!go()) {
@@ -240,12 +286,12 @@ const openPane = (pane: number, daemon?: string) => {
 };
 // A pane opened on the home daemon from elsewhere (a sandbox shell).
 window.addEventListener("illogical:open-pane", (e) => openPane((e as CustomEvent<number>).detail));
-const fromHash = /^#pane=(?:([0-9a-f]+)\.)?(\d+)$/.exec(location.hash);
+const fromHash = /^#pane=(?:([0-9a-f]+)\.)?(\d+)(?:&thread=((?:pane|session)-\d+))?$/.exec(location.hash);
 if (fromHash) {
-  const [, daemon, pane] = fromHash;
+  const [, daemon, pane, thread] = fromHash;
   // A notification through control names its daemon: once its host is in
   // the list, open the pane there.
-  const go = () => openPane(Number(pane), daemon);
+  const go = () => openPane(Number(pane), daemon, thread);
   if (daemon && !directory.find?.(directory.list?.hosts.find((h) => h.id === daemon)?.name ?? "")) {
     const off = directory.subscribe(() => {
       if (directory.list?.hosts.some((h) => h.id === daemon)) {
@@ -258,6 +304,17 @@ if (fromHash) {
 }
 if (!linkTarget) void registerWorker(openPane);
 
+// The desktop app's notification when control drops this machine, and its
+// Daemon menu (#325): Join… and Join again… open Getting started at the
+// cloud step, on an open page (the event) or a new one
+// (`#getting-started=cloud`).
+window.addEventListener("illogical:getting-started", (e) => openGettingStarted((e as CustomEvent<Section>).detail, client));
+const startAt = /^#getting-started=(\w+)$/.exec(location.hash);
+if (startAt) {
+  openGettingStarted(startAt[1] as Section, client);
+  history.replaceState(null, "", "/");
+}
+
 // For end-to-end tests.
 Object.assign(window, {
   __illogical: {
@@ -269,6 +326,10 @@ Object.assign(window, {
     remotes,
     control: session,
     fleet,
+    /** M63: the huddle this page is in. */
+    get huddle() {
+      return activeHuddle();
+    },
     /** M26: made-up panes in the swarm (frame-rate check, screenshots). */
     swarmFake: (n: number) => fakeSwarm(fleet, n),
     /** M26: the swarm's field, when it's shown. */

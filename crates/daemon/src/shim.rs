@@ -29,6 +29,7 @@
 //! It must run before any threads exist (it forks), so `main` dispatches to
 //! it before starting the async runtime.
 
+#[cfg(unix)]
 use std::{
     ffi::CString,
     fs::OpenOptions,
@@ -37,6 +38,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicI32, Ordering},
 };
 
+#[cfg(unix)]
 use nix::{
     fcntl::{FcntlArg, FdFlag, fcntl},
     libc,
@@ -47,16 +49,22 @@ use nix::{
     unistd::{ForkResult, execvp, fork, pipe, setsid},
 };
 
+#[cfg(unix)]
 /// What the daemon sends the shim to close the pane.
 pub const CLOSE: Signal = Signal::SIGUSR1;
+#[cfg(unix)]
 /// How long a closed program has to go after its hangup before it's killed.
 const KILL_AFTER: u32 = 3;
 
+#[cfg(unix)]
 /// The program's pid (and process group), for the signal handlers.
 static CHILD: AtomicI32 = AtomicI32::new(0);
+#[cfg(unix)]
 static CLOSING: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static KILLED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn on_close(_: libc::c_int) {
     let child = CHILD.load(Ordering::SeqCst);
     if child > 0 && !CLOSING.swap(true, Ordering::SeqCst) {
@@ -68,6 +76,7 @@ extern "C" fn on_close(_: libc::c_int) {
     }
 }
 
+#[cfg(unix)]
 extern "C" fn on_alarm(_: libc::c_int) {
     let child = CHILD.load(Ordering::SeqCst);
     if child > 0 {
@@ -77,6 +86,7 @@ extern "C" fn on_alarm(_: libc::c_int) {
     KILLED.store(true, Ordering::SeqCst);
 }
 
+#[cfg(unix)]
 pub fn run(args: &[String]) -> ! {
     let (record, hold, argv) = match parse(args) {
         Some(x) => x,
@@ -204,8 +214,10 @@ pub fn run(args: &[String]) -> ! {
 }
 
 /// Where the daemon puts the PTY master for `--hold`.
+#[cfg(unix)]
 pub const HELD_FD: i32 = 3;
 
+#[cfg(any(unix, test))]
 fn parse(args: &[String]) -> Option<(String, Option<String>, Vec<String>)> {
     let mut it = args.iter();
     if it.next()? != "--record" {
@@ -225,6 +237,7 @@ fn parse(args: &[String]) -> Option<(String, Option<String>, Vec<String>)> {
     (!argv.is_empty()).then_some((record, hold, argv))
 }
 
+#[cfg(unix)]
 fn append(path: &str, line: &str) -> bool {
     let Ok(mut f) = OpenOptions::new().create(true).append(true).mode(0o600).open(path) else { return false };
     let written = f.write_all(line.as_bytes()).is_ok();
@@ -239,12 +252,15 @@ pub fn start_time(pid: u32) -> Option<u64> {
 }
 
 /// What a record says about the program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Record {
     pub pid: Option<(u32, u64)>,
-    /// The shim itself, from shims that take [`CLOSE`].
+    /// The shim itself, from shims that take [`CLOSE`] (on Windows, the
+    /// pane's host).
     pub shim: Option<(u32, u64)>,
     pub exit: Option<Ended>,
+    /// Windows: the pane host's pipes (`crate::host`).
+    pub pipe: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +285,7 @@ pub fn read_record(path: &std::path::Path) -> Record {
                     r.shim = Some((p, s));
                 }
             }
+            ["pipe", name] => r.pipe = Some((*name).to_owned()),
             ["exit", code] => r.exit = code.parse().ok().map(Ended::Code),
             ["signal", n] => r.exit = n.parse().ok().map(Ended::Signal),
             _ => {}
@@ -277,11 +294,13 @@ pub fn read_record(path: &std::path::Path) -> Record {
     r
 }
 
+#[cfg(unix)]
 /// Ask the shim to close the program: it hangs the group up, and kills it if
 /// it's still there a few seconds later. False if the shim is gone or too old
 /// to be asked.
 pub fn close(record: &Record) -> bool {
     match record.shim {
+        #[cfg(unix)]
         Some((pid, start)) if record.exit.is_none() && start_time(pid) == Some(start) => {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), CLOSE).is_ok()
         }
@@ -324,7 +343,7 @@ mod tests {
             "a new start replaces the old"
         );
         std::fs::write(&path, "pid 1 5\nshim 2 6\nsignal 9\npid 42 7\nshim 43 8\n").unwrap();
-        assert_eq!(read_record(&path), Record { pid: Some((42, 7)), shim: Some((43, 8)), exit: None });
+        assert_eq!(read_record(&path), Record { pid: Some((42, 7)), shim: Some((43, 8)), exit: None, pipe: None });
         std::fs::write(&path, "pid 42 7\nexit 3\n").unwrap();
         assert_eq!(read_record(&path).exit, Some(Ended::Code(3)));
         std::fs::remove_dir_all(dir).unwrap();
@@ -336,6 +355,7 @@ mod tests {
         let start = start_time(me).unwrap();
         assert!(alive(&Record { pid: Some((me, start)), ..Default::default() }));
         assert!(!alive(&Record { pid: Some((me, start + 1)), ..Default::default() }), "pid reuse guard");
+        #[cfg(unix)]
         assert!(!close(&Record { shim: Some((me, start + 1)), ..Default::default() }), "pid reuse guard");
     }
 }

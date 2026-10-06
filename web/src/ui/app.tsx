@@ -7,9 +7,11 @@ import { drag, startDrag, type Dragged, type Target } from "./drag";
 import { useSubscribe, usePhone } from "./hooks";
 import { closeMenu, MenuLayer, openMenu, PromptLayer, type MenuItem } from "./menu";
 import { KeyBar, PhoneHeader } from "./phone";
+import { ThreadBadge, ThreadLayer } from "./threads";
+import { HuddleBar, HuddleButton } from "./huddle";
+import { ChatPage, Places, useChatOpen } from "./chat";
 import { AttentionBadge, tabAttention } from "./attention";
 import { HostButton, HostPicker } from "./hosts";
-import { openSwarm } from "../swarm/route";
 import { ControlRequests, PaneMarks, PeopleBar, ShareDialog, TabPeople } from "./people";
 import { directory } from "../hosts";
 import { SandboxesLayer } from "./sandboxes";
@@ -25,6 +27,8 @@ import { GettingStartedLayer, useFirstRun } from "./welcome";
 import { machineState, newTabItems, PALETTE_KEY, paneItems, sessionItems, tabItems } from "./commands";
 import { openPalette, PaletteLayer, usePaletteShortcut } from "./palette";
 import { UpdateChip } from "./update";
+import { ControlBanner } from "./control-state";
+import { AgentsNudge } from "./agents-setup";
 import { WindowButtons } from "./window-buttons";
 
 /** Where hidden panes' terminals live: off the page but still alive. */
@@ -43,7 +47,8 @@ export function App({ client, cell }: { client: Client; cell: Cell }) {
   const [renaming, setRenaming] = useState<Renaming>(null);
 
   useEffect(() => {
-    const focus = () => client.tab !== null && client.claim(client.tab);
+    // Focusing the window doesn't take the size from another window
+    // (#333): typing here, showing a tab or "use this size" does.
     // A sandbox host sleeps when nothing holds it awake, and an open
     // connection does: let go of it while the page is hidden.
     let hidden: number | undefined;
@@ -52,11 +57,9 @@ export function App({ client, cell }: { client: Client; cell: Cell }) {
       if (document.visibilityState === "visible") client.wake();
       else if (directory.sleeps) hidden = window.setTimeout(() => client.sleep(), HIDDEN_GRACE_MS);
     };
-    window.addEventListener("focus", focus);
     document.addEventListener("visibilitychange", visible);
     return () => {
       clearTimeout(hidden);
-      window.removeEventListener("focus", focus);
       document.removeEventListener("visibilitychange", visible);
     };
   }, [client]);
@@ -82,23 +85,23 @@ export function App({ client, cell }: { client: Client; cell: Cell }) {
 
   const state = client.state;
   const tab = client.tabView();
+  // M73: the chat page covers the panes, which stay laid out under it (so
+  // their terminals keep their size) but can't be reached.
+  const chatOpen = useChatOpen() && !!state && client.hasThreads();
   return (
     <div class={phone ? "app phone" : "app"}>
-      {state && state.sessions.length > 0 && (phone ? (
+      {state && (phone ? (
         <PhoneHeader client={client} />
       ) : (
-        <TopBar client={client} renaming={renaming} setRenaming={setRenaming} />
+        <TopBar client={client} renaming={renaming} setRenaming={setRenaming} inert={chatOpen} />
       ))}
-      <main class="main">
+      {state && <ControlBanner client={client} />}
+      {state && <AgentsNudge client={client} />}
+      <main class="main" inert={chatOpen}>
         {!state ? (
           <HostPicker />
         ) : state.sessions.length === 0 ? (
-          <div class="empty">
-            <p>No sessions.</p>
-            <button class="primary" onClick={() => client.intent({ op: "new_session", name: null, from_pane: null })}>
-              New session
-            </button>
-          </div>
+          <NoSessions client={client} phone={phone} />
         ) : tab ? (
           <TabArea client={client} tab={tab} cell={cell} phone={phone} />
         ) : null}
@@ -107,6 +110,9 @@ export function App({ client, cell }: { client: Client; cell: Cell }) {
       <MenuLayer />
       <PromptLayer />
       <AgentDialogLayer />
+      <ThreadLayer phone={phone} />
+      <HuddleBar />
+      {state && <ChatPage client={client} />}
       <ConversationsLayer />
       <AppsLayer />
       <SandboxesLayer />
@@ -123,24 +129,48 @@ export function App({ client, cell }: { client: Client; cell: Cell }) {
   );
 }
 
+/** The empty state, below the bar. Through control it says which machine
+ * this is and where to switch, since the machine may not be the one meant. */
+function NoSessions({ client, phone }: { client: Client; phone: boolean }) {
+  useSubscribe((fn) => directory.subscribe(fn));
+  return (
+    <div class="empty">
+      <p>No sessions.</p>
+      {directory.control && (
+        <p data-no-sessions-host>
+          No sessions on {directory.current}. Switch machines from the {phone ? "menu at the top" : "menu at the top left"}.
+        </p>
+      )}
+      <button class="primary" onClick={() => client.intent({ op: "new_session", name: null, from_pane: null })}>
+        New session
+      </button>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------- top bar
 
 function TopBar({
   client,
   renaming,
   setRenaming,
+  inert,
 }: {
   client: Client;
   renaming: Renaming;
   setRenaming: (r: Renaming) => void;
+  inert: boolean;
 }) {
   useSubscribe(drag.subscribe);
   const state = client.state!;
+  // None at all, on a machine with no sessions: the bar is still here for
+  // the host and account menus.
   const session = state.sessions.find((s) => s.id === client.session) ?? state.sessions[0];
   const target = drag.current?.target;
-  const marker = target?.kind === "tabbar" ? Math.min(target.index, session.tabs.length) : null;
+  const marker = session && target?.kind === "tabbar" ? Math.min(target.index, session.tabs.length) : null;
 
   const sessionMenu = (e: MouseEvent) => {
+    if (!session) return;
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     openFresh(client, { clientX: r.left, clientY: r.bottom + 4, preventDefault: () => e.preventDefault() }, () => [
       ...state.sessions.map((s) => ({
@@ -154,52 +184,60 @@ function TopBar({
   };
 
   return (
-    <header class="bar" data-tauri-drag-region>
+    <header class="bar" data-tauri-drag-region inert={inert}>
       <HostButton />
-      <button class="swarm-button" title="Every pane, everywhere (the swarm)" data-open-swarm onClick={openSwarm}>
-        Swarm
-      </button>
-      {renaming?.kind === "session" && renaming.id === session.id ? (
-        <RenameInput
-          value={session.name}
-          onDone={(name) => {
-            setRenaming(null);
-            if (name && name !== session.name) client.intent({ op: "rename_session", session: session.id, name });
-          }}
-        />
-      ) : (
-        <button class="session-button" title="Sessions" onClick={sessionMenu} onContextMenu={sessionMenu}>
-          {session.name} <span class="caret">▾</span>
-        </button>
+      <Places client={client} at="panes" />
+      {session && (
+        <>
+          {renaming?.kind === "session" && renaming.id === session.id ? (
+            <RenameInput
+              value={session.name}
+              onDone={(name) => {
+                setRenaming(null);
+                if (name && name !== session.name) client.intent({ op: "rename_session", session: session.id, name });
+              }}
+            />
+          ) : (
+            <button class="session-button" title="Sessions" onClick={sessionMenu} onContextMenu={sessionMenu}>
+              {session.name}
+              {/* M61: the session's thread has messages you haven't read. */}
+              {client.thread({ session: session.id })?.unread ? (
+                <span class={client.thread({ session: session.id })?.mention ? "session-unread mention" : "session-unread"} title="New in the session thread" />
+              ) : null}{" "}
+              <span class="caret">▾</span>
+            </button>
+          )}
+          <HuddleButton client={client} session={session.id} />
+          <div class="tabbar" role="tablist">
+            {session.tabs.map((id, i) => {
+              const t = client.tabView(id);
+              if (!t) return null;
+              return (
+                <Fragment key={id}>
+                  {marker === i && <div class="drop-marker" />}
+                  <TabItem
+                    client={client}
+                    tab={t}
+                    index={i}
+                    selected={id === client.tab}
+                    renaming={renaming?.kind === "tab" && renaming.id === id}
+                    setRenaming={setRenaming}
+                  />
+                </Fragment>
+              );
+            })}
+            {marker === session.tabs.length && <div class="drop-marker" />}
+            <button
+              class="new-tab"
+              title={client.has("vms") ? "New tab (right-click for a VM tab)" : "New tab (right-click for more)"}
+              onClick={() => client.intent({ op: "new_tab", session: session.id, from_pane: client.active() ?? null })}
+              onContextMenu={(e) => openFresh(client, e, () => newTabItems(client, session.id))}
+            >
+              +
+            </button>
+          </div>
+        </>
       )}
-      <div class="tabbar" role="tablist">
-        {session.tabs.map((id, i) => {
-          const t = client.tabView(id);
-          if (!t) return null;
-          return (
-            <Fragment key={id}>
-              {marker === i && <div class="drop-marker" />}
-              <TabItem
-                client={client}
-                tab={t}
-                index={i}
-                selected={id === client.tab}
-                renaming={renaming?.kind === "tab" && renaming.id === id}
-                setRenaming={setRenaming}
-              />
-            </Fragment>
-          );
-        })}
-        {marker === session.tabs.length && <div class="drop-marker" />}
-        <button
-          class="new-tab"
-          title={client.has("vms") ? "New tab (right-click for a VM tab)" : "New tab (right-click for more)"}
-          onClick={() => client.intent({ op: "new_tab", session: session.id, from_pane: client.active() ?? null })}
-          onContextMenu={(e) => openFresh(client, e, () => newTabItems(client, session.id))}
-        >
-          +
-        </button>
-      </div>
       <div class="bar-fill" data-tauri-drag-region />
       <UpdateChip client={client} />
       <PeopleBar client={client} />
@@ -371,9 +409,9 @@ export function TabArea({ client, tab, cell, phone }: { client: Client; tab: Tab
   size.current = { cols, rows, zoom };
   const shown = useRef<{ tab: TabId; zoom: PaneId | null } | null>(null);
   useEffect(() => {
-    client.claim = (t) => {
+    client.claim = (t, typed) => {
       const s = size.current;
-      if (s.cols) client.view(t, s.cols, s.rows, s.zoom, true);
+      if (s.cols) client.view(t, s.cols, s.rows, s.zoom, true, typed);
     };
   }, [client]);
   useEffect(() => {
@@ -431,6 +469,12 @@ export function TabArea({ client, tab, cell, phone }: { client: Client; tab: Tab
 
 /** CSS length (Preact 11 no longer appends "px" to numbers). */
 const len = (n: number) => `${n}px`;
+
+/** A text box of the page's own, not xterm's hidden one (a terminal's
+ * right-click lands there). */
+function editable(t: EventTarget | null): boolean {
+  return t instanceof HTMLElement && t.matches("textarea, input") && !t.closest(".xterm");
+}
 
 function px(r: Rect, cell: Cell) {
   return {
@@ -504,6 +548,9 @@ function PaneSlot({
   const menu = (e: MouseEvent) => {
     // A program that tracks the mouse gets right-clicks; Shift reaches us.
     if (entry?.view.mouseTracking && !e.shiftKey) return;
+    // A text box's own menu (an agent's composer): on a phone, its Paste
+    // is the one that can paste an image (Chrome refuses ours).
+    if (editable(e.target)) return;
     const items = () => paneItems(client, id, phone, isWorkspace ? workspaceDir : null);
     // A remote pane's menu doesn't depend on this daemon's features.
     if (info?.type === "remote") openMenu(e, items());
@@ -523,6 +570,7 @@ function PaneSlot({
       <HostBadge client={client} id={id} />
       <StartedByBadge client={client} id={id} />
       <PaneMarks client={client} pane={id} />
+      {info?.type !== "remote" && <ThreadBadge client={client} pane={id} />}
       {!active && (info?.attention === "needs_input" || info?.attention === "done") && (
         <div class={`pane-badge ${info.attention}`} title={info.reason?.headline}>
           {info.reason?.kind === "failed" ? "failed" : info.reason?.kind === "exited" ? "exited" : info.attention === "done" ? "done" : "needs you"}

@@ -1,6 +1,6 @@
 # Research notes
 
-Gathered 2026-10-01 to back the decisions in [PLAN.md](../PLAN.md). Items
+Gathered 2026-10-01 to back the decisions in [plan-archive.md](plan-archive.md). Items
 marked *(unverified)* were not checked against a primary source.
 
 ## Server-side VT engine
@@ -17,7 +17,7 @@ marked *(unverified)* were not checked against a primary source.
 its modes extra switches screens before writing content. While vim or htop is
 running, the attach would show the alt screen correctly but an empty primary
 screen and no scrollback. The Zig side can format the screens separately; the
-C API does not expose that *(unverified)*. Fix options are in PLAN.md, spike S1.
+C API does not expose that *(unverified)*. Fix options are in plan-archive.md, spike S1.
 
 Links: [ghostty](https://github.com/ghostty-org/ghostty),
 [formatter.h](https://github.com/ghostty-org/ghostty/blob/main/include/ghostty/vt/formatter.h),
@@ -90,8 +90,8 @@ Links: [ghostty](https://github.com/ghostty-org/ghostty),
   -> WebGL only on visible panes; call `WEBGL_lose_context` on dispose.
   Mobile touch is basic (xterm#5377).
 - **ghostty-web 0.4.0** (Coder). 2D canvas only, with open bugs: grapheme
-  memory corruption (#141), render loop dies after an error (#189), inverted
-  key handler (#192), Korean IME (#119).
+  memory corruption, render loop dies after an error, inverted
+  key handler, Korean IME.
   -> Later swap-in behind a `TerminalView` interface.
 - **Layout.** react-mosaic 7.2 (tabs are in the tree since v7) is fully
   controlled: `value`, `onChange(tree, meta)`, `onRelease`. dockview 8.4 is
@@ -158,7 +158,7 @@ illogical so far, and the same engine bet (a `crates/ghostty-vt` crate).
 resume, run/send/wait/read, multi-host list as in M25). **Theirs only:** runs
 in any terminal (ours: M5's `tmux -CC`), Windows, broad agent detection,
 plugins, agents driving the mux (our M16, not built). **Ours only:** web and
-phone client, push and answering from it, agent blocks (M6), multiplayer
+phone client, push and answering from it, agent blocks, multiplayer
 (M12–M15), control's E2E relay and hosted sandboxes (M17–M22), machines per
 pane or tab (M3b/M3c), OSC 133 command structure and history search, the
 swarm view.

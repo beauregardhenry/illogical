@@ -1,11 +1,24 @@
 # illogical
 
-A terminal multiplexer whose sessions outlive the window, the daemon and the
-reboot. A daemon owns your terminals; the browser (desktop or phone) draws
-tabs and splits you drive with the mouse.
+Keep track of your agents without checking every session. See which agents
+need input and what your teammates are working on. Leave unfinished work
+open, come back later, or join a teammate's session to help.
+
+illogical is a terminal multiplexer whose sessions outlive the window, the
+daemon and the reboot. A daemon owns your terminals; the browser (desktop or
+phone) draws tabs and splits you drive with the mouse.
 
 ![Tabs and splits in the browser](site/img/desktop.png)
 
+- **The swarm.** Every pane on every machine you and your team can see, in
+  one live view, clustered by project, machine, kind or person. Whatever
+  needs someone (an agent asking, a build failing) lifts out to a rail of
+  cards, where anyone on the team who may answer allows, answers or sends
+  the agent its next instruction, and everyone sees who did.
+- **Agents as blocks.** Claude Code, Codex or any
+  [ACP](https://agentclientprotocol.com) agent as a UI beside your
+  terminals: tool calls with their output, approvals and questions as
+  cards big enough for a thumb.
 - **Mouse first.** Click, drag and right-click for tabs and splits. No
   chords to learn, no prefix key.
 - **Durable.** Close the window, lose the connection, restart the daemon or
@@ -16,10 +29,6 @@ tabs and splits you drive with the mouse.
 - **Anywhere on your tailnet.** The same live layout on every window and
   your phone, over [Tailscale](https://tailscale.com). Push notifications
   when a pane rings, a long command finishes, or an agent needs you.
-- **Agents as blocks.** Claude Code, Codex or any
-  [ACP](https://agentclientprotocol.com) agent as a UI beside your
-  terminals: tool calls with their output, approvals and questions as
-  cards big enough for a thumb.
 - **VS Code and dev servers beside your terminals** (opt-in). *Open in
   editor* (or `illogical edit src/main.rs:42`) opens VS Code on the pane's
   machine, in its directory, as a block, back with its file after a
@@ -32,11 +41,6 @@ tabs and splits you drive with the mouse.
   a file for its hunks and a line to see the file there, both updating
   while the agent works. Phone first, and a failed build is a *Rerun* tap
   away.
-- **The swarm.** Every pane on every machine you and your team can see, in
-  one live view, clustered by project, machine, kind or person. Whatever
-  needs someone (an agent asking, a build failing) lifts out to a rail of
-  cards, where anyone on the team who may answer allows, answers or sends
-  the agent its next instruction, and everyone sees who did.
 - **Your editor in the swarm.** VS Code, Cursor or nvim (over Remote-SSH
   too) shows up beside your panes once you ask it to. Follow its cursor
   from your phone; a debugger stopping, or Claude Code wanting to edit a
@@ -51,7 +55,8 @@ tabs and splits you drive with the mouse.
 
 [![A tour of the swarm: every pane clustered by project, then one project's panes up close, then an agent's request on the Needs You rail, then that agent's session opened](site/img/dive.gif)](https://illogical.widgets.wtf)
 
-Linux (x86_64, arm64) and macOS (Apple silicon and Intel). Share a session with
+Linux (x86_64, arm64), macOS (Apple silicon and Intel) and Windows 10 and 11
+(x86_64). Share a session with
 someone, or a whole machine with a team, with roles and presence
 ([docs/teams.md](docs/teams.md)). Remote access is over your tailnet, or
 through [illogical control](docs/control.md) for devices without one: end
@@ -62,26 +67,29 @@ serves ([what holds](docs/control-e2e.md#what-holds-against-control)).
 ## Install
 
 **The desktop app** (macOS 13 or later on Apple silicon or Intel, Linux
-x86_64), from [illogical.widgets.wtf](https://illogical.widgets.wtf) or the
-[latest release](https://github.com/arugula-salad/illogical/releases/latest):
+x86_64, Windows 10 or 11 x86_64), from
+[illogical.widgets.wtf](https://illogical.widgets.wtf) or the
+[newest app release](https://github.com/arugula-salad/illogical/releases/tag/app-latest):
 `illogical-desktop-macos-arm64.zip` (Apple silicon),
 `illogical-desktop-macos-x86_64.zip` (Intel),
 `illogical-desktop-linux-x86_64.AppImage` or `.deb` (the Linux app runs on
-Ubuntu 22.04, Debian 12, Fedora 36 or newer: glibc 2.35 and up). The first
-time it opens it installs `illogicald` and `illogical` in
-`~/.local/bin` and starts the daemon as a service, then *Getting started*
+Ubuntu 22.04, Debian 12, Fedora 36 or newer: glibc 2.35 and up),
+`illogical-desktop-windows-x86_64-setup.exe`. The first time it opens it
+installs `illogicald` and `illogical` (in `~/.local/bin`, or
+`%LOCALAPPDATA%\Programs\illogical` on Windows) and starts the daemon as a
+service, then *Getting started*
 sets up your phone, the cloud and Claude Code, a click each. Once the
 machine is in illogical cloud, the app signs in through your browser on
 the same computer (approve it as a new device once) and shows every machine in your account
 and your teams. The macOS app
 isn't notarized yet: the first time, open it, then choose *Open Anyway* in
 System Settings › Privacy & Security.
+Or, in Terminal, install.sh (below) installs the Mac app too, with no
+*Open Anyway* step (`curl` leaves no quarantine flag), in `/Applications`
+if you can write there and `~/Applications` if not, and opens it.
 
-**On Windows** (x86_64), `illogical-desktop-windows-x86_64-setup.exe` is
-a client for illogical cloud: sign in and it shows the machines in your
-account. Panes don't run on Windows itself yet (the Windows track, #224).
-It isn't signed yet: when SmartScreen stops it, choose *More info*, then
-*Run anyway*.
+The Windows installer isn't signed yet: when SmartScreen stops it, choose
+*More info*, then *Run anyway*.
 
 **Servers and machines without a screen:**
 
@@ -91,7 +99,22 @@ curl -fsSL https://illogical.widgets.wtf/install.sh | sh
 
 This puts `illogicald` and `illogical` in `~/.local/bin` and starts the
 daemon as a service (systemd user unit on Linux, launchd agent on macOS).
+On a Mac with someone at its screen it installs the desktop app too, from
+the newest app release; the app uses the daemon install.sh set up.
+`sh -s -- --no-app` leaves the app out; over ssh it's left out unless you
+add `--app`.
 Run it again to upgrade. `ILLOGICAL_VERSION=vX.Y.Z` picks a version.
+`ILLOGICAL_APP_VERSION=app-vX.Y.Z` picks the app's.
+
+On Windows, in PowerShell:
+
+```
+irm https://illogical.widgets.wtf/install.ps1 | iex
+```
+
+This puts them in `%LOCALAPPDATA%\Programs\illogical` (on your `PATH`) and
+starts the daemon at logon, as a scheduled task. `$env:ILLOGICAL_VERSION`
+picks a version.
 
 **Homebrew** (macOS, Linux):
 
@@ -113,7 +136,7 @@ loginctl enable-linger $USER
 command for how you installed it. Panes keep running while the daemon
 restarts.
 
-- install.sh: run it again.
+- install.sh or install.ps1: run it again (on a Mac at its screen, that updates the app too).
 - Homebrew: `brew upgrade illogical && illogicald install`.
 - The desktop app: download the new one and open it. When it finds an
   older daemon running as the service, it puts its own in its place,
@@ -181,8 +204,11 @@ most twice a day; nothing else is sent. `illogicald install --
    team machines and sharing one session: [docs/teams.md](docs/teams.md).
 6. **Agents.** *Start an agent…* in a pane's menu, or `illogical agent
    "fix the failing test"`. Claude Code and Codex run through an npm
-   adapter (needs Node 20+): *Start an agent…* offers to install it, in a
-   pane you can watch, or install it yourself:
+   adapter (needs Node 20+). `illogical setup claude`, or *Use Claude Code
+   with illogical* in Getting started's Agents step, installs Claude
+   Code's and adds illogical's MCP server (step 7) in one go; *Start an
+   agent…* offers to install it too, in a pane you can watch. Or install
+   it yourself:
 
    ```
    npm install --prefix ~/.local/share/illogical/agents/claude @agentclientprotocol/claude-agent-acp@0.85.0
@@ -208,87 +234,54 @@ most twice a day; nothing else is sent. `illogicald install --
    {
      "permissions": {
        "allow": [
-         "mcp__illogical__read_output", "mcp__illogical__capture_screen", "mcp__illogical__wait",
-         "mcp__illogical__list", "mcp__illogical__history", "mcp__illogical__search",
-         "mcp__illogical__list_conversations", "mcp__illogical__read_pr", "mcp__illogical__read_issue",
-         "mcp__illogical__list_agents", "mcp__illogical__read_agent", "mcp__illogical__read_file"
+         "mcp__illogical__read_output", "mcp__illogical__wait", "mcp__illogical__list",
+         "mcp__illogical__history", "mcp__illogical__read_forge", "mcp__illogical__read_invite",
+         "mcp__illogical__read_file"
        ],
        "ask": [
-         "mcp__illogical__run", "mcp__illogical__send_input", "mcp__illogical__close",
-         "mcp__illogical__open_port", "mcp__illogical__open_app", "mcp__illogical__start_agent",
-         "mcp__illogical__open_conversation", "mcp__illogical__prompt_agent", "mcp__illogical__agent_respond",
-         "mcp__illogical__show_changes", "mcp__illogical__show_file", "mcp__illogical__open_workspace", "mcp__illogical__open_pr",
-         "mcp__illogical__pr_comment", "mcp__illogical__pr_review", "mcp__illogical__pr_merge",
-         "mcp__illogical__open_issue", "mcp__illogical__issue_comment", "mcp__illogical__issue_new",
-         "mcp__illogical__open_fountain"
+         "mcp__illogical__run", "mcp__illogical__send_input", "mcp__illogical__attach", "mcp__illogical__close",
+         "mcp__illogical__show", "mcp__illogical__start_agent", "mcp__illogical__prompt_agent",
+         "mcp__illogical__agent_respond", "mcp__illogical__draft", "mcp__illogical__invite_person",
+         "mcp__illogical__device_call"
        ]
      }
    }
    ```
 
+   `invite_person` is safe to move to `allow`: it only drafts. The card
+   it raises beside the agent, which only the session's owner can send,
+   is the real gate.
+
    What it starts says "started by mcp:claude-code". Agent blocks get the
    same tools by themselves, limited to their own tab. Over HTTP, tokens,
    and the tools: [MCP](docs/cli.md#mcp).
-
-## A Fountain runner (Linux)
-
-A machine can be your Fountain account's runner (M45): Fountain's runner
-conversations then run there, in sandboxes illogical can open a shell on,
-diff and follow.
-
-1. Once, with root, from a checkout:
-   `sudo bash scripts/fountain-runner-setup.sh --fountain "$(command -v fountain)" --node "$(node -p process.execPath)"`.
-   It makes a `fountain` user (its sandboxes under
-   `/home/fountain/sandboxes`), the `fountain-runner` systemd unit, and a
-   sudoers rule: you may run `/bin/bash` as `fountain`, and
-   `systemctl start|stop|restart|status fountain-runner` as root. The
-   unit keeps its agents off this machine's loopback (where illogicald
-   and your other local services listen), but for DNS;
-   `--allow-loopback` lets them use it (a dev server they start and
-   test, say).
-2. Then, as you: `illogical fountain runner install` (makes the runner's key
-   without printing it, and starts the unit); `illogical fountain runner
-   status` shows it.
-3. `illogical fountain --view runner` (or *Fountain runner…* in a pane's
-   menu) shows it as a block: online or not, the other runners, and its
-   sandboxes, each with *Follow*, *Changes* and *Shell*.
-
-Checking it by hand, after a setup (none of this is automated, since the
-tests never run sudo or reach Fountain):
-
-- [ ] `illogical fountain runner status`: the unit is active, and Fountain
-      lists only this runner, online.
-- [ ] The runner view says this host's runner is online, its version
-      matches `fountain --version`, and no attention is raised.
-- [ ] A conversation with an agent on the runner provider appears under
-      the runner's sandboxes, with its directory and agent.
-- [ ] *Changes* opens a diff of each git checkout in its sandbox (one with
-      nothing upstream is diffed from an empty tree, so all of it shows).
-- [ ] *Shell* opens a terminal (bash without profile or rc files, and
-      outside the runner's sandboxing, as its card says) where `whoami;
-      pwd` prints `fountain` and the sandbox's directory; there, `cat ~YOU/.ssh/id_ed25519` and
-      `illogical --socket <your daemon's socket> ls` both fail.
-- [ ] A sandbox agent can't see other users' processes: asked to run
-      `ls /proc | wc -l` (or `ps aux`), a conversation's agent sees only
-      the runner's own processes (the unit has `ProtectProc=invisible`).
-      Ask the agent: illogical's *Shell* isn't in the unit, so it sees
-      everything, as any shell of yours would.
-- [ ] *Follow* opens an agent block with the conversation so far.
-- [ ] `sudo systemctl stop fountain-runner`: within about 5 minutes the
-      rail (and the phone) says *Fountain runner offline*; `sudo systemctl
-      start fountain-runner` clears it.
 
 ## On macOS
 
 Everything above works, except that restarting or upgrading the daemon
 ends the panes' programs (there's no systemd to hold them); scrollback and
-layout still come back. VM tabs are Linux only.
+layout still come back.
+
+## On Windows
+
+Panes run PowerShell (PowerShell 7 if it's installed, else Windows
+PowerShell), with prompts, commands, exit codes and the directory reported
+as in bash, zsh and fish: illogical passes its integration inline, so no
+profile or execution policy change is needed. Each pane has a small host
+process of its own, so panes keep running while the daemon restarts or
+upgrades, as on Linux.
+
+The daemon starts when you log on, and logging off ends it; its panes close
+a minute later. `illogicald install --system` (from an elevated terminal)
+starts it at boot instead, but programs there can't use Windows' protected
+storage, so Credential Manager and Git Credential Manager don't work in its
+panes. `illogical --ssh` doesn't reach Windows yet.
 
 ## More
 
 - [docs/features.md](docs/features.md): everything it does, in detail.
-- [docs/advanced.md](docs/advanced.md): VM tabs (wisp), web apps beside
-  their terminals, more machines and sandboxes, iTerm2 as a tmux client.
+- [docs/advanced.md](docs/advanced.md): web apps beside their terminals,
+  more machines and containers, iTerm2 as a tmux client.
 - [docs/teams.md](docs/teams.md): your machines, your team: roles,
   personal vs team machines, sharing a session.
 - [docs/control.md](docs/control.md): illogical control, hosted or your
@@ -297,7 +290,8 @@ layout still come back. VM tabs are Linux only.
 - [docs/cli.md](docs/cli.md): the CLI and the HTTP API.
 - [docs/development.md](docs/development.md): building, testing, the code's
   layout, and what building it taught us.
-- [PLAN.md](PLAN.md): the decisions and the milestones.
+- [DECISIONS.md](DECISIONS.md): the decisions that still hold.
+- [docs/plan-archive.md](docs/plan-archive.md): the original plan and every milestone.
 
 ## License
 

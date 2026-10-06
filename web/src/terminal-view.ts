@@ -7,6 +7,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { theme } from "./theme";
+import type { Chip } from "./upload";
 
 export const FONT_FAMILY = '"JetBrains Mono", "Fira Code", ui-monospace, Menlo, monospace';
 export const FONT_SIZE = 14;
@@ -71,7 +72,8 @@ export class TerminalView {
     );
     this.swallowQueries();
     this.watchCommands();
-    this.term.attachCustomKeyEventHandler((e) => this.clipboardKeys(e));
+    this.term.attachCustomKeyEventHandler((e) => this.keys(e));
+    this.takeFiles();
     this.term.open(this.host);
     this.touchScroll();
   }
@@ -256,13 +258,104 @@ export class TerminalView {
     return this.term.getSelection();
   }
 
+  /** M61: find text quoted from this terminal (the newest place its lines
+   * appear), scroll to it and select it. False when it's no longer in the
+   * scrollback. */
+  reveal(text: string): boolean {
+    const want = text.split("\n").map((l) => l.trimEnd());
+    while (want.length && !want[want.length - 1]) want.pop();
+    while (want.length && !want[0]) want.shift();
+    if (!want.length) return false;
+    const b = this.term.buffer.active;
+    const line = (i: number) => b.getLine(i)?.translateToString(true).trimEnd() ?? "";
+    for (let i = b.length - want.length; i >= 0; i--) {
+      if (!line(i).includes(want[0])) continue;
+      if (want.every((w, k) => k === 0 || line(i + k).includes(w))) {
+        this.term.scrollToLine(Math.max(0, i - 2));
+        this.term.selectLines(i, i + want.length - 1);
+        return true;
+      }
+    }
+    return false;
+  }
+
   onMarkMenu(cb: (mark: CommandMark, e: MouseEvent) => void) {
     this.markMenu = cb;
   }
 
+  private filesCb: ((files: File[]) => void) | undefined;
+  /** Files pasted or dropped on the terminal (M70). */
+  onFiles(cb: (files: File[]) => void) {
+    this.filesCb = cb;
+  }
+
+  /** A paste or drop with files in it goes to `onFiles`. The listeners
+   * capture on the host, so they run before xterm's paste handler, which
+   * reads only the text and stops the event. */
+  private takeFiles() {
+    const take = (e: Event, files: FileList | undefined | null) => {
+      if (!files?.length || !this.filesCb) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      this.filesCb([...files]);
+    };
+    this.host.addEventListener("paste", (e) => take(e, e.clipboardData?.files), true);
+    this.host.addEventListener(
+      "dragover",
+      (e) => {
+        if (this.filesCb && e.dataTransfer?.types.includes("Files")) e.preventDefault();
+      },
+      true,
+    );
+    this.host.addEventListener("drop", (e) => take(e, e.dataTransfer?.files), true);
+  }
+
+  private chipEl: HTMLDivElement | undefined;
+  private chipTimer: number | undefined;
+  /** A note over the terminal's corner, with buttons (M70: an upload's
+   * progress, then what became of it). */
+  readonly chip: Chip = {
+    show: (text, opts = {}) => {
+      clearTimeout(this.chipTimer);
+      if (!this.chipEl) {
+        this.chipEl = document.createElement("div");
+        this.chipEl.addEventListener("pointerdown", (e) => e.stopPropagation());
+        this.host.append(this.chipEl);
+      }
+      const el = this.chipEl;
+      el.className = opts.error ? "term-chip error" : "term-chip";
+      el.dataset.chip = "";
+      el.replaceChildren(Object.assign(document.createElement("span"), { textContent: text }));
+      for (const a of opts.actions ?? []) {
+        const b = Object.assign(document.createElement("button"), { textContent: a.label });
+        b.addEventListener("click", () => a.run());
+        el.append(b);
+      }
+      if (opts.actions?.length || opts.error) {
+        const x = Object.assign(document.createElement("button"), { textContent: "×", title: "Dismiss" });
+        x.className = "link";
+        x.addEventListener("click", () => this.chip.hide());
+        el.append(x);
+      }
+      if (opts.hideAfterMs) this.chipTimer = window.setTimeout(() => this.chip.hide(), opts.hideAfterMs);
+    },
+    hide: () => {
+      clearTimeout(this.chipTimer);
+      this.chipEl?.remove();
+      this.chipEl = undefined;
+    },
+  };
+
   /** Ctrl+Shift+C copies the selection; Ctrl+Shift+V is left to the
-   * browser's paste event, which xterm.js handles. */
-  private clipboardKeys(e: KeyboardEvent): boolean {
+   * browser's paste event, which xterm.js handles. Shift+Enter sends ESC CR
+   * (Alt+Enter, a new line in Claude Code and line editors, with or without
+   * the kitty protocol, whose state the web can't see) where xterm.js sends
+   * CR; the keypress is stopped too, or it would send CR as well. */
+  private keys(e: KeyboardEvent): boolean {
+    if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing) {
+      if (e.type === "keydown") this.term.input("\x1b\r", true);
+      return false;
+    }
     if (e.type !== "keydown" || !e.ctrlKey || !e.shiftKey) return true;
     if (e.code === "KeyC") {
       const text = this.term.getSelection();

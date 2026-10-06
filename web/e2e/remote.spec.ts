@@ -9,8 +9,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
-import { active, at, dragTo, menu, open, paneEl, panes, ready, run, text, type } from "./helpers";
+import { active, at, dragTo, menu, open, paneEl, panes, ready, run, text, type, closeContexts } from "./helpers";
 import { ANY, daemonPort } from "./ports";
+import { labs } from "./labs";
+
+test.afterAll(closeContexts);
 
 let homeUrl = "";
 let otherUrl = "";
@@ -30,7 +33,7 @@ async function startDaemon(name: string, extra: string[] = []) {
   const d = spawn(
     "../target/debug/illogicald",
     [
-      ...["--listen", known ? `127.0.0.1:${known}` : ANY, "--name", name, "--state-dir", state],
+      ...["--listen", known ? `127.0.0.1:${known}` : ANY, "--name", name, "--state-dir", labs(state)],
       ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/tailscaled.sock"],
       ...extra,
     ],

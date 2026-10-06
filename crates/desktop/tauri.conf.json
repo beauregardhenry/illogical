@@ -43,7 +43,19 @@
     },
     "linux": {
       "deb": {
-        "depends": ["libc6 (>= 2.35)"]
+        "depends": ["libc6 (>= 2.35)", "libasound2", "libstdc++6"],
+        "recommends": ["python3-nautilus"],
+        "desktopTemplate": "linux/illogical.desktop",
+        "files": {
+          "/usr/share/nautilus-python/extensions/illogical.py": "linux/nautilus/illogical.py"
+        }
+      },
+      "rpm": {
+        "recommends": ["nautilus-python"],
+        "desktopTemplate": "linux/illogical.desktop",
+        "files": {
+          "/usr/share/nautilus-python/extensions/illogical.py": "linux/nautilus/illogical.py"
+        }
       }
     },
     "externalBin": [
@@ -65,8 +77,8 @@
       }
     },
     "updater": {
-      "pubkey": "",
-      "endpoints": ["https://github.com/arugula-salad/illogical/releases/latest/download/latest.json"]
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQwRjAyRDZBMDc4RDg3NDQKUldSRWg0MEhhaTN3MEpiYXJGK2Y1NnUzdmZhOGNZdUZHUWFyK0NDQ3M5Z0VsM0xJdE5kQWFGTTkK",
+      "endpoints": ["https://github.com/arugula-salad/illogical/releases/download/app-latest/latest.json"]
     }
   }
 }

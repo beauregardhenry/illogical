@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
 use nix::sys::signal::{SigSet, Signal};
 use serde_json::{Value, json};
 
@@ -33,7 +34,7 @@ pub fn run(sock: Target) -> i32 {
     // pipe.
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
-    let Some(pane) = crate::env_pane() else { return 0 };
+    let Some(pane) = crate::util::env_pane() else { return 0 };
     let Ok(hook) = serde_json::from_str::<Value>(&input) else { return 0 };
     if hook["tool_name"].as_str().is_some_and(|t| t != "AskUserQuestion") {
         return 0;
@@ -81,6 +82,7 @@ fn wait_for_answer(sock: &Target, pane: u32, questions: &Value, id: Option<Strin
 
 /// On SIGTERM (Claude Code interrupting the hook), SIGINT or SIGHUP:
 /// withdraw the card, then exit quietly.
+#[cfg(unix)]
 pub fn withdraw_on_signals(sock: Target, pane: u32, id: Option<String>) {
     let mut set = SigSet::empty();
     for s in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
@@ -97,4 +99,25 @@ pub fn withdraw_on_signals(sock: Target, pane: u32, id: Option<String>) {
             std::process::exit(0);
         }
     });
+}
+
+/// Windows: on Ctrl-C, Ctrl-Break or the console closing, withdraw the
+/// card, then exit quietly. (A hook ended with TerminateProcess gets no say:
+/// the card stays until the question times out.)
+#[cfg(windows)]
+pub fn withdraw_on_signals(sock: Target, pane: u32, id: Option<String>) {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    static CARD: OnceLock<(Target, u32, Option<String>)> = OnceLock::new();
+    if CARD.set((sock, pane, id)).is_err() {
+        return;
+    }
+    unsafe extern "system" fn on_ctrl(_event: u32) -> windows_sys::core::BOOL {
+        if let Some((sock, pane, id)) = CARD.get() {
+            let _ = request(sock, "POST", &format!("/api/panes/{pane}/ask/withdraw"), Some(&json!({ "id": id })));
+        }
+        std::process::exit(0);
+    }
+    // SAFETY: a handler that only makes a request and exits.
+    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
 }

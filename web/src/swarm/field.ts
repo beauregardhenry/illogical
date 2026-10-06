@@ -1,5 +1,5 @@
 // The swarm's field (M26): every pane as a tile on one Canvas 2D, ported
-// from the prototype (spikes/s16-swarm/canvas.html). Tiles are coloured by
+// from the prototype (archive/spikes:spikes/s16-swarm/canvas.html). Tiles are coloured by
 // kind and lit by activity; each is pulled toward its cluster's centre in
 // proportion to how busy it is, so busy panes sit in the middle and idle
 // ones drift out, and they push each other apart through a grid. A pane
@@ -7,9 +7,15 @@
 // card with a thread back to its cluster; one waiting for room pulses in
 // place. S16: physics is half of each frame, so it sleeps once everything
 // has settled and wakes on a regroup, a new pane, attention or a touch.
+// A folded top-right corner: its thread has messages you haven't read
+// (yellow: one mentions you).
 
 import type { WorkKind } from "../proto";
 import { KINDS } from "./model";
+
+/** M61: an unread thread, and one that mentions you. */
+export const UNREAD = "#e6ebf4";
+export const UNREAD_MENTION = "#f9e2af";
 
 export interface FieldPane {
   key: string;
@@ -45,6 +51,10 @@ export interface FieldPane {
    * its driver claim (M13), `typing` when they typed in the last few
    * seconds (#118). */
   people?: { name: string; driving: boolean; typing: boolean }[];
+  /** Messages in its thread (M61) this person hasn't read; `mention`: one
+   * is for them. */
+  unread?: number;
+  mention?: boolean;
 }
 
 /** What the swarm draws its panes with (M41's themes): the field (blocks)
@@ -455,7 +465,9 @@ export class Field implements SwarmScene {
     const up = (e: PointerEvent) => {
       this.ptrs.delete(e.pointerId);
       cv.classList.remove("panning");
-      if (!this.moved && this.ptrs.size === 0 && e.type === "pointerup") this.click(e);
+      // A right-click is the menu's, not a tap: opening the pane on it
+      // would also drop the menu item's click (swallowClick).
+      if (!this.moved && this.ptrs.size === 0 && e.type === "pointerup" && e.button === 0) this.click(e);
     };
     cv.addEventListener("pointerup", up);
     cv.addEventListener("pointercancel", up);
@@ -763,6 +775,16 @@ export class Field implements SwarmScene {
         cx.fillStyle = `rgba(255,255,255,${t.flash * 0.5})`;
         cx.fillRect(x, y, w, h);
       }
+      if (t.unread) {
+        // M61: an unread thread folds the tile's top-right corner.
+        const k = Math.max(4, Math.min(w, h) * 0.22);
+        cx.fillStyle = t.mention ? UNREAD_MENTION : UNREAD;
+        cx.beginPath();
+        cx.moveTo(x + w - k, y);
+        cx.lineTo(x + w, y);
+        cx.lineTo(x + w, y + k);
+        cx.fill();
+      }
       if (t.att) {
         // Waiting for room on the rail: pulsing in place.
         const ph = (now / 500) % 1;
@@ -874,7 +896,9 @@ export class Field implements SwarmScene {
           break;
         }
       }
-      // Still in the way: the shortest form, nudged up or down a little.
+      // Still in the way: the shortest form, nudged up or down a little;
+      // no room even so (clusters close while they move), no name this
+      // frame rather than one over another's.
       if (!chosen) {
         const [meta, need] = variants[variants.length - (needText ? 2 : 1)];
         for (let k = 1; k <= 8 && !chosen; k++) {
@@ -886,9 +910,8 @@ export class Field implements SwarmScene {
             }
           }
         }
-        chosen ??= make("", "", 0);
       }
-      placed.push(chosen);
+      if (chosen) placed.push(chosen);
     }
     return placed;
   }

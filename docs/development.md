@@ -28,7 +28,7 @@ release tarballs in `dist/`.
 alone. [testing.md](testing.md) covers the tests, fakes and fixtures.
 `just test-scripts` tests install.sh and checks that what a release
 ships (targets, desktop downloads) is named the same in release.yml,
-scripts/release, the Homebrew formula, install.sh and the site: add a
+app-release.yml, scripts/release, the Homebrew formula, install.sh and the site: add a
 target or download and it says what else needs it. `just check` is what
 CI runs; `just e2e` drives the system Chrome
 against throwaway daemons, or `just e2e https://home.<tailnet>.ts.net`
@@ -46,18 +46,56 @@ test` runs its claims; `testnet/README.md` lists them.
 
 ## Releasing
 
+The daemon and the desktop app release apart (#388): a daemon or web change
+ships without rebuilding, signing and notarizing the apps, and an app
+release carries the newest daemon without building it.
+`releases/latest` is always the daemon's: install.sh, install.ps1 and the
+daemon's update check read it.
+
+**The daemon (`v*`).**
+
 1. Set the version in the workspace `Cargo.toml` and commit (`just
    notices` if dependencies changed; CI fails if THIRD_PARTY.md is stale).
+   Notes go in `docs/releases/X.Y.Z.md`.
 2. `git tag -a vX.Y.Z -m "illogical X.Y.Z" && git push origin vX.Y.Z`.
-   `.github/workflows/release.yml` builds the Linux tarballs on geek and
-   the macOS ones on jake-mini (Apple silicon natively, Intel
-   cross-compiled with `just build-macos-x86_64` and `just desktop
-   x86_64`), attaches them and `SHA256SUMS` to the
-   GitHub release, and bumps the formula in `arugula-salad/homebrew-tap`
+   `.github/workflows/release.yml` builds the Linux tarballs on geek, the
+   macOS ones on jake-mini (Apple silicon natively, Intel cross-compiled
+   with `just build-macos-x86_64`) and the Windows zip on GitHub's runner,
+   attaches them and `SHA256SUMS` to the GitHub release, publishes it as
+   latest, and bumps the formula in `arugula-salad/homebrew-tap`
    (`scripts/release`; the tap's deploy key is the `HOMEBREW_TAP_KEY`
-   secret).
-3. `install.sh` picks up the latest release by itself. If the page
-   changed, `just site-deploy` publishes it (wrangler's login on geek).
+   secret). It builds no app.
+3. Running daemons find it within 12 hours and offer *Update now*
+   (`illogicald update` from a terminal); `install.sh` picks it up by
+   itself. If the page changed, `just site-deploy` publishes it (wrangler's
+   login on geek).
+
+**The app (`app-v*`)**, only when `crates/desktop` changes:
+
+1. Set the version in `crates/desktop/Cargo.toml` (its own numbering, not
+   the daemon's) and commit. Notes go in `docs/releases/app-X.Y.Z.md`.
+2. `git tag -a app-vX.Y.Z -m "illogical app X.Y.Z" && git push origin
+   app-vX.Y.Z`. `.github/workflows/app-release.yml` downloads illogicald
+   and illogical from the latest daemon release (checked against its
+   `SHA256SUMS`) for the app to carry, builds and signs the apps (Linux on
+   geek, macOS on jake-mini, notarized with the Developer ID when its
+   secrets are set, Windows on GitHub's runner), and publishes the release
+   with its own `SHA256SUMS` and the updater's `latest.json`. It's never
+   marked latest.
+3. It copies the downloads, `SHA256SUMS` and `latest.json` to the rolling
+   `app-latest` release, whose tag follows the newest app's commit. The
+   site's download buttons and the updater's endpoint
+   (`tauri.conf.json`) point there, so they get the new app at once.
+4. Apps from before the split (0.23 and older) have no updater key, so they
+   never check: their people install the new app once, by hand.
+
+`scripts/release` (`check-version`, `sums`, `publish`, `homebrew` for the
+daemon; `check-app-version`, `sidecars`, `app-upload`, `app-publish` for the
+app) checks that `releases/latest` is still a daemon release after each
+publish. `scripts/tests/release-targets.sh` (`just test-scripts`) fails if the
+daemon's workflow builds an app, or if the downloads the app's workflow
+makes, the ones `scripts/release` requires and the ones the site links
+drift apart.
 
 In this repo (beauregardhenry/illogical), `check.yml` runs on GitHub's
 hosted runners instead: Ubuntu, and macOS on both Apple silicon and Intel
@@ -76,10 +114,29 @@ Upstream, CI runs on two self-hosted GitHub Actions runners in the arugula-salad
 org's `illogical` runner group, which only this repo may use: geek
 (`linux-x86_64`, a systemd user service,
 `~/.config/systemd/user/actions-runner-illogical.service`, runner in
-`~/.local/share/actions-runner-illogical`) and jake-mini (`macos-arm64`, a
+`~/.local/share/actions-runner-illogical`), geek's CI pool (eight more,
+`linux-x86_64-ci`, `actions-runner-illogical-e2e@1…8.service` from one
+template unit, runners in `~/.local/share/actions-runner-illogical-e2e-N`,
+which run check.yml's jobs on geek side by side; 9–12 are registered but
+disabled: twelve with no limits kept geek at load 30+ and failed the tests
+that time things. The drop-in `actions-runner-illogical-e2e@.service.d/limits.conf`
+puts them in `illogical-ci.slice` (CPUWeight 50 under the desktop, 96 GB
+for all of CI) and gives each 20 GB; `scripts/ci-env` caps nextest and
+cargo at six threads, rather than a CPUQuota, which stalls a runner for
+the rest of its period and times tests out. The drop-in also sets
+`KillMode=control-group` (the template's `process` stopped `run.sh`
+alone, and the next start ran a second listener beside the old one), so
+stopping a runner cancels its job: drain it first, `gh api -X DELETE
+orgs/arugula-salad/actions/runners/ID/labels` (needs `admin:org`), wait
+for `.busy` false, restart, then `PUT` its three labels back. More is `cp -a` of one
+without `_work`, `.runner` and `.credentials*`, `config.sh --runnergroup
+illogical --labels linux-x86_64,linux-x86_64-e2e,linux-x86_64-ci` with an
+org registration token, and `systemctl --user enable --now` of the next
+number) and jake-mini (`macos-arm64`, releases only: check.yml's macos job
+runs on GitHub's `macos-15`, as one runner kept every run waiting; a
 launchd agent, `~/Library/LaunchAgents/illogical.actions-runner.plist`,
 with `ProcessType` Interactive: launchd's throttling of background agents
-made daemon tests time out). Both run jobs on the host and keep their
+made daemon tests time out; Docker is colima, a Homebrew service). All run jobs on the host and keep their
 build in `~/.cache/illogical-ci/`, which each job deletes first once it
 passes 30 GB (`scripts/ci-cap-target`): cargo never prunes it, and on
 2026-10-02 it grew to 136 GB, filled jake-mini's disk and took the home
@@ -140,56 +197,7 @@ from iTerm2, `<` to it) to `/tmp/cc.log` on geek.
 
 ## Layout
 
-- `crates/core`: sessions, tabs and split trees, the intents that change
-  them, and the cell layout. Pure state, property-tested.
-- `crates/proto`: wire protocol (JSON control messages + binary frames with a
-  per-pane stream offset). Mirrored by hand in `web/src/proto.ts`.
-- `crates/vt`: server-side terminal state on libghostty-vt (libghostty-rs
-  `master`, Zig 0.16). VT snapshots for xterm.js (spike S1's fix-ups),
-  checkpoints for disk (GHOSTSNP + zstd, spike S5), answers to terminal
-  queries limited to what xterm.js can draw, recorded fixtures.
-- `crates/daemon`: `illogicald`. A multiplexer task owning the layout and
-  attention (`mux.rs`), a PTY + VT thread per pane with its log, checkpoints
-  and OSC scanner (`pane.rs`, `store.rs`, `osc.rs`), restore and restart
-  policies, the pane shim and FD store (`shim.rs`, `sys.rs`), shell
-  integration (`shellint.rs`, `shell/`), the HTTP API (`api.rs`, history and
-  search in `history.rs`), Web Push (`push.rs`), VM panes on wisp
-  (`machine.rs`), sandbox providers (`provider/`: the `Provider` trait
-  and its capabilities, and the Sprites API adapter: exec TTY and piped
-  sessions, the proxy, files and services), sandboxes and resident daemons
-  (`resident.rs`), the provider tunnel (`provider_tunnel.rs`), blocks
-  (`block.rs`, `browser.rs`; agents in `agent/`: the ACP client, the
-  transcript, agent definitions, the local and VM pipes), block sites
-  (`sites.rs`: per-block origins and their HTTP proxy; `ports.rs`: reaching
-  a port here or in a VM; `tls.rs`: the wildcard certificate and ACME), the
-  WebSocket server, embedded web client, access checks, `install`.
-  Federation: the host list and invites (`hosts.rs`), tailscaled's local
-  API and WhoIs (`tailscale.rs`), and sandboxes (`sandbox.rs`: `install
-  --tailnet` and the `sandbox` supervisor). M4c: the dial-out transport
-  (`dial.rs`, over `dialout_mux.rs`'s streams), share links (`share.rs`), and
-  history sync (`sync.rs`, sealed by `seal.rs`). M7: files on a host
-  (`fs.rs`), names (`illogical_core::names`). M11: diff and file blocks
-  (`review/`). M6c: questions and forms
-  (`illogical_proto::ask`: the card's shape and how its answer becomes
-  Claude Code's; agent blocks' elicitations in `agent/`; a terminal's
-  questions in `mux.rs` and the `/ask` route). M16: MCP (`mcp/`: the server at `/mcp`, its
-  tools, and client and block tokens).
-- `crates/cli`: `illogical`, over the daemon's Unix socket, or HTTP(S) to
-  another daemon with `--host` (`hosts.rs`); `ask.rs` is Claude Code's
-  AskUserQuestion hook; `mcp.rs` is `illogical mcp`, the stdio bridge to
-  `/mcp`. `tmux/` is the tmux
-  control-mode front end (M5): the command parser and `-F` format expander,
-  layout strings derived from the daemon's ratios (spike S11's converter),
-  and a mirror terminal per pane so captures line up with the output
-  stream. `crates/daemon/tests/tmux.rs` replays iTerm2's command sequence
-  and compares every reply with what tmux 3.6 answered (S11's transcript).
-- `web`: TypeScript client: Preact for the chrome, xterm.js 6 terminals that
-  are moved between slots rather than recreated, Playwright tests (desktop
-  and phone).
-- `vendor/libghostty-vt-sys`: libghostty-rs's sys crate, vendored (the root
-  `Cargo.toml` patches it in) so the build can apply `patches/*.patch` to
-  Ghostty after checkout (M9: no Zig signal stack in every thread).
-- `spikes`: S1–S3 write-ups and code.
+See [AGENTS.md](../AGENTS.md) for the crate map and the daemon's layers. Each crate has a `README.md` with what it is, what it depends on inside the workspace, and where to start reading.
 
 ## Things M0–M4c taught us
 
@@ -207,7 +215,7 @@ from iTerm2, `<` to it) to `/tmp/cc.log` on geek.
   gave every thread a zeroed copy: 1.3 MB per pane. Check `readelf -S`
   for `.tbss` after a libghostty upgrade. glibc also kept about half a busy
   daemon's peak after panes closed, until `heap.rs` fixed the mmap
-  threshold. `crates/daemon/tests/memory.rs` guards both.
+  threshold. `crates/daemon/tests/integration/memory.rs` guards both.
 - **Offsets need an epoch.** A reconnecting client's offset is only valid for
   the stream it came from; the pane's epoch changes when the daemon restarts.
 - **Size travels in order with output.** A client must resize before drawing

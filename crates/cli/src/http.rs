@@ -5,13 +5,14 @@
 //! for a dial-out host, `/tunnel/<host>` for a provider host), or to a box
 //! over ssh (one ssh channel per connection; `crate::ssh`).
 
+#[cfg(unix)]
+use std::os::{
+    fd::{AsFd, BorrowedFd},
+    unix::net::UnixStream,
+};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
-    os::{
-        fd::{AsFd, BorrowedFd},
-        unix::net::UnixStream,
-    },
     path::PathBuf,
     sync::Arc,
 };
@@ -119,7 +120,8 @@ impl Target {
         std::fs::read_to_string(file).ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
     }
 
-    /// A WebSocket handshake request for this target.
+    /// A WebSocket handshake request for this target. (Only the terminal
+    /// front ends use WebSockets, and they're Unix only for now.)
     pub fn ws_request(&self) -> anyhow::Result<tungstenite::handshake::client::Request> {
         use tungstenite::client::IntoClientRequest;
         let mut req = self.ws_url().into_client_request()?;
@@ -138,8 +140,15 @@ impl Target {
 
     pub fn connect(&self) -> anyhow::Result<Box<dyn Stream>> {
         match self {
+            #[cfg(unix)]
             Target::Socket(path) | Target::Via(path, _) => Ok(Box::new(
                 UnixStream::connect(path)
+                    .with_context(|| format!("can't reach illogicald at {} (is it running?)", path.display()))?,
+            )),
+            // Windows: the daemon's named pipe (M56).
+            #[cfg(windows)]
+            Target::Socket(path) | Target::Via(path, _) => Ok(Box::new(
+                crate::pipe::PipeStream::connect(path)
                     .with_context(|| format!("can't reach illogicald at {} (is it running?)", path.display()))?,
             )),
             Target::Ssh(r) => Ok(Box::new(r.channel()?)),
@@ -203,11 +212,19 @@ fn tls_config() -> anyhow::Result<Arc<rustls::ClientConfig>> {
 
 /// A connection to a daemon, whatever it runs over.
 pub trait Stream: Read + Write + Send {
+    /// For polling (the terminal front ends, Unix only for now).
+    #[cfg(unix)]
     fn fd(&self) -> BorrowedFd<'_>;
+    /// Windows: whether a read now would return something (data, or the
+    /// end), for loops that can't poll (`crate::wake`). Asked while the
+    /// stream is non-blocking.
+    #[cfg(windows)]
+    fn readable(&self) -> bool;
     fn set_nonblocking(&self, on: bool) -> std::io::Result<()>;
     fn set_timeout(&self, t: Option<std::time::Duration>) -> std::io::Result<()>;
 }
 
+#[cfg(unix)]
 impl Stream for UnixStream {
     fn fd(&self) -> BorrowedFd<'_> {
         self.as_fd()
@@ -221,9 +238,20 @@ impl Stream for UnixStream {
     }
 }
 
+/// A non-blocking socket's `peek`: something, or the end, is there.
+#[cfg(windows)]
+fn peekable(s: &TcpStream) -> bool {
+    !matches!(s.peek(&mut [0u8; 1]), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+}
+
 impl Stream for TcpStream {
+    #[cfg(unix)]
     fn fd(&self) -> BorrowedFd<'_> {
         self.as_fd()
+    }
+    #[cfg(windows)]
+    fn readable(&self) -> bool {
+        peekable(self)
     }
     fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
         TcpStream::set_nonblocking(self, on)
@@ -252,8 +280,15 @@ impl Write for Tls {
 }
 
 impl Stream for Tls {
+    #[cfg(unix)]
     fn fd(&self) -> BorrowedFd<'_> {
         self.0.sock.as_fd()
+    }
+    #[cfg(windows)]
+    fn readable(&self) -> bool {
+        // What TLS already decrypted is read before WouldBlock comes back,
+        // so only the socket's bytes are left to wait for.
+        peekable(&self.0.sock)
     }
     fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
         self.0.sock.set_nonblocking(on)
@@ -459,6 +494,21 @@ pub fn enc(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(windows)]
+impl Stream for crate::pipe::PipeStream {
+    fn readable(&self) -> bool {
+        crate::pipe::PipeStream::readable(self)
+    }
+    fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {
+        crate::pipe::PipeStream::set_nonblocking(self, on);
+        Ok(())
+    }
+    fn set_timeout(&self, t: Option<std::time::Duration>) -> std::io::Result<()> {
+        crate::pipe::PipeStream::set_timeout(self, t);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

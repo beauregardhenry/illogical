@@ -6,13 +6,16 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { controlPanel, ready, run, text } from "./helpers";
+import { closeContexts, controlPanel, pasteFile, ready, run, text, uploadedPath } from "./helpers";
 import { ANY, controlPort, daemonPort, listen } from "./ports";
+import { labs } from "./labs";
+
+test.afterAll(closeContexts);
 
 let base = "";
 const procs: ChildProcess[] = [];
@@ -112,7 +115,7 @@ async function addMachine(page: Page, name: string, direct: boolean) {
     spawn(
       "../target/debug/illogicald",
       [
-        ...["--listen", ANY, "--name", name, "--state-dir", state],
+        ...["--listen", ANY, "--name", name, "--state-dir", labs(state)],
         ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/sock"],
         ...(direct ? ["--direct-url", "http://127.0.0.1:0"] : []),
       ],
@@ -249,6 +252,31 @@ test("two machines join by code; one direct, one only through the relay", async 
   await shell(laptop, "mac");
   expect(await laptop.evaluate(() => window.__illogical.client.path)).toBe("relayed");
   await expect(laptop.locator(".host-button [data-path]")).toHaveText("relayed");
+
+  // M70: a pasted image goes through the relay in chunks (2.5 MB: three),
+  // inside the end-to-end channel, and lands on the machine whole.
+  const pane = await laptop.evaluate(() => window.__illogical.client.active()!);
+  const png = Buffer.from(Array.from({ length: 2_500_000 }, (_, i) => (i * 7) % 256));
+  await pasteFile(laptop, pane, png, "relayed.png", "image/png");
+  expect(readFileSync(await uploadedPath(laptop, pane))).toEqual(png);
+  // The path waits on the prompt line: clear it for what's typed next.
+  await laptop.evaluate((p) => window.__illogical.client.input(p, new TextEncoder().encode("\x15")), pane);
+});
+
+test("a relayed page that goes leaves the machine's clients (presence) too", async () => {
+  const viewers = () => laptop.evaluate(() => window.__illogical.client.state?.presence?.length ?? 0);
+  const before = await viewers();
+  // Each page that came and went stayed a client of the mux until the
+  // daemon restarted: hundreds, slowing every keystroke.
+  for (let i = 0; i < 3; i++) {
+    const other = await laptop.context().newPage();
+    await other.goto("/");
+    await booted(other);
+    await showHost(other, "mac");
+    await expect.poll(viewers, { timeout: 20_000 }).toBe(before + 1);
+    await other.close();
+    await expect.poll(viewers, { timeout: 20_000 }).toBe(before);
+  }
 });
 
 async function phoneContext(browser: Browser) {
@@ -259,8 +287,10 @@ test("a phone needs the laptop's approval", async ({ browser }) => {
   phone = await (await phoneContext(browser)).newPage();
   await signIn(phone);
   await expect(phone.getByText("Approve this browser")).toBeVisible();
-  // It says where to approve it (#105).
+  // It says where to approve it (#105), and that a machine's join is
+  // another approval that doesn't need this one (#326).
   await expect(phone.locator("[data-control-url]")).toHaveText(base);
+  await expect(phone.locator("[data-waiting-machine]")).toContainText("doesn't need this one");
   await expect(phone.locator("[data-sign-out]")).toBeVisible();
   const fp = await phone.locator("[data-fingerprint]").getAttribute("data-fingerprint");
   // The laptop is asked, and shows the same fingerprint.
@@ -329,7 +359,9 @@ test("the desktop app signs in through the browser, then is approved as a device
   const app = await (await browser.newContext()).newPage();
   await app.addInitScript(() => Object.assign(window, { __illogicalApp: { name: "illogical app on test-mac" } }));
   await app.goto(`${base}/#app-redeem=${t.ticket}.${grant}.${verifier}`);
-  await expect(app.getByText("Approve this browser")).toBeVisible();
+  // It says it's the app being approved, by name (#326).
+  await expect(app.getByText("Approve this app as a device")).toBeVisible();
+  await expect(app.locator("[data-waiting-browser]")).toContainText("the illogical app on test-mac");
   const fp = await app.locator("[data-fingerprint]").getAttribute("data-fingerprint");
   await expect(laptop.locator(`[data-pending="${fp}"]`)).toBeVisible({ timeout: 20_000 });
   await expect(laptop.locator(".prompt")).toContainText("illogical app on test-mac");
@@ -390,14 +422,23 @@ test("devices and machines, grouped; new recovery codes retire the old", async (
   await expect(laptop.locator("[data-account]")).toHaveText("stranger");
   const machines = laptop.locator("[data-machines] li");
   await expect(machines).toHaveCount(2);
-  await expect(machines.filter({ hasText: "box" }).locator("[data-status]")).toContainText("online · direct");
-  await expect(machines.filter({ hasText: "mac" }).locator("[data-status]")).toContainText("online · relayed");
-  // Removing a machine says what happens to it (not confirmed here).
-  await machines.filter({ hasText: "mac" }).locator("[data-remove]").click();
-  await expect(laptop.locator("[data-remove-explain]")).toContainText("keeps running on it, reachable only locally");
+  await expect(machines.filter({ hasText: /^box\b/ }).locator("[data-status]")).toContainText("online · direct");
+  await expect(machines.filter({ hasText: /^mac\b/ }).locator("[data-status]")).toContainText("online · relayed");
+  // Removing a machine asks in a dialog that says what happens to it. A
+  // double-click on Remove only opens it (#328 lost a Mac that way).
+  const mac = await machines.filter({ hasText: /^mac\b/ }).getAttribute("data-device");
+  await machines.filter({ hasText: /^mac\b/ }).locator("[data-remove]").dblclick();
+  await new Promise((r) => setTimeout(r, 1000));
+  expect(await laptop.evaluate((d) => window.__illogical.control!.trusted.has(d), mac!)).toBe(true);
+  const ask = laptop.locator("[data-confirm-dialog]");
+  await expect(ask).toContainText("Remove mac?");
+  await expect(ask.locator("[data-remove-explain]")).toContainText("keeps running on it, reachable only locally");
+  await ask.locator("[data-cancel-remove]").click();
+  await expect(ask).toHaveCount(0);
+  await expect(machines).toHaveCount(2);
   // The laptop, the phone and the browser the recovery code let in.
   await expect(laptop.locator("[data-browsers] li")).toHaveCount(3);
-  await expect(laptop.locator("[data-browsers] li").filter({ hasText: "(this browser)" })).toHaveCount(1);
+  await expect(laptop.locator("[data-browsers] li [data-this-browser]")).toHaveCount(1);
   // One code was spent.
   await expect(laptop.locator("[data-recovery-left]")).toHaveAttribute("data-recovery-left", "1");
   await laptop.locator("[data-new-codes]").click();
@@ -422,14 +463,74 @@ test("devices and machines, grouped; new recovery codes retire the old", async (
   await expect.poll(() => hostNames(other), { timeout: 20_000 }).toEqual(["box", "mac"]);
 });
 
-test("removing the phone cuts it off", async () => {
+test("removing the phone cuts it off, once confirmed in a dialog", async () => {
   const id = await phone.evaluate(() => window.__illogical.control!.keys.id);
-  await laptop.evaluate((d) => window.__illogical.control!.revoke(d), id);
+  await controlPanel(laptop, "devices");
+  // A double-click on Remove opens the dialog and removes nothing.
+  await laptop.locator(`[data-browsers] [data-remove="${id}"]`).dblclick();
+  await new Promise((r) => setTimeout(r, 1000));
+  expect(await laptop.evaluate((d) => window.__illogical.control!.trusted.has(d), id)).toBe(true);
+  expect(await connected(phone)).toBe(true);
+  const ask = laptop.locator("[data-confirm-dialog]");
+  await expect(ask).toContainText("loses access to your machines at once");
+  await ask.locator("[data-confirm-remove]").click();
+  await expect(ask).toHaveCount(0);
+  await expect(laptop.locator(`[data-browsers] [data-remove="${id}"]`)).toHaveCount(0);
+  await laptop.getByRole("button", { name: "Done" }).click();
   // Control nudges the daemons, which refresh, close its channel and
   // refuse it from then on.
   await expect.poll(() => connected(phone), { timeout: 5_000, intervals: [200] }).toBe(false);
   await new Promise((r) => setTimeout(r, 3000));
   expect(await connected(phone)).toBe(false);
+});
+
+test("with no sessions on the machine shown, control's page still has the host and account menus", async () => {
+  await showHost(laptop, "box");
+  const none = () => laptop.evaluate(() => window.__illogical.client.state?.sessions.length ?? -1);
+  await expect.poll(none).toBeGreaterThan(0);
+  const closeAll = () =>
+    laptop.evaluate(() => {
+      const c = window.__illogical.client;
+      for (const s of c.state!.sessions) c.intent({ op: "close_session", session: s.id });
+    });
+  await closeAll();
+  await expect.poll(none).toBe(0);
+  // It says which machine this is and where to switch.
+  await expect(laptop.locator("[data-no-sessions-host]")).toHaveText("No sessions on box. Switch machines from the menu at the top left.");
+  await expect(laptop.locator("header.bar .host-button")).toHaveText(/box/);
+  await laptop.locator(".host-button").click();
+  await expect(laptop.getByRole("menuitem", { name: "Teams…" })).toBeVisible();
+  await expect(laptop.getByRole("menuitem", { name: "Sign out" })).toBeVisible();
+  await laptop.getByRole("menuitem", { name: "Devices and machines…" }).click();
+  await expect(laptop.getByRole("heading", { name: "Devices and machines" })).toBeVisible();
+  await laptop.locator(".prompt").getByRole("button", { name: "Done" }).click();
+  // The other machine is reached from there, with no session made.
+  await laptop.locator(".host-button").click();
+  await laptop.getByRole("menuitem", { name: /^\s*mac\s/ }).click();
+  await expect.poll(() => laptop.evaluate(() => window.__illogical.hosts.current), { timeout: 20_000 }).toBe("mac");
+  await showHost(laptop, "box");
+  // Leave box with a session, as the next tests found it.
+  await expect(laptop.locator("[data-no-sessions-host]")).toBeVisible();
+  await laptop.getByRole("button", { name: "New session" }).click();
+  await expect.poll(none).toBe(1);
+});
+
+test("a browser the account removed says so before offering Approve, and enrolls again (#327)", async () => {
+  // The phone was removed above. Opened again (here on a machine's join
+  // link), it checks its own key first: no Approve button that would fail.
+  await phone.goto(`${base}/#join=AAAAA-AAAAA`);
+  await expect(phone.locator('[data-untrusted="removed"]')).toBeVisible({ timeout: 20_000 });
+  await expect(phone.locator("[data-approve-join]")).toHaveCount(0);
+  await expect(phone.locator("[data-sign-out-forget]")).toBeVisible();
+  // Forgotten, it asks as a new device, with the recovery form open.
+  await phone.locator("[data-enroll-again]").click();
+  // Still on the machine's link, it leads with that (#326).
+  await expect(phone.locator('[data-waiting-join="AAAAA-AAAAA"]')).toBeVisible();
+  await expect(phone.locator("[data-recovery-input]")).toBeVisible();
+  // Not wanted back: the laptop turns it down, so nothing waits on it.
+  await expect(laptop.locator("[data-pending]")).toBeVisible({ timeout: 20_000 });
+  await laptop.locator("[data-reject]").click();
+  await expect(phone.locator("[data-turned-down]")).toBeVisible({ timeout: 10_000 });
 });
 
 test("Getting started asks to check the account's fingerprint before the machine trusts it", async ({ browser }) => {
@@ -438,7 +539,7 @@ test("Getting started asks to check the account's fingerprint before the machine
     spawn(
       "../target/debug/illogicald",
       [
-        ...["--listen", ANY, "--name", "starter", "--state-dir", state, "--control", base],
+        ...["--listen", ANY, "--name", "starter", "--state-dir", labs(state), "--control", base],
         ...["--shell", "bash --norc --noprofile", "--no-manager-env", "--tailscale-socket", "/nonexistent/sock"],
       ],
       { stdio: "ignore" },
@@ -501,6 +602,53 @@ test("Getting started asks to check the account's fingerprint before the machine
     await expect(laptop.locator("[data-account-fingerprint]")).toHaveAttribute("data-account-fingerprint", account, { timeout: 1000 });
   }).toPass({ timeout: 15_000 });
   await laptop.getByRole("button", { name: "Done" }).click();
+});
+
+test("a browser that isn't a device yet, here to approve a machine, leads with its code; one approval covers both (#326)", async ({ browser }) => {
+  const state = temp("rejoiner");
+  const joining = spawn("../target/debug/illogicald", ["join", base, "--name", "rejoiner", "--state-dir", state], { stdio: ["pipe", "pipe", "ignore"] });
+  procs.push(joining);
+  const link = await new Promise<string>((res) => {
+    let out = "";
+    joining.stdout!.on("data", (d) => {
+      out += d;
+      const m = out.match(/(http\S+#join=[A-Z0-9-]+)/);
+      if (m) res(m[1]);
+    });
+  });
+  const code = link.split("#join=")[1];
+  const exited = new Promise<number | null>((r) => joining.on("exit", r));
+
+  // The machine's approval link, in a browser that isn't one of the
+  // account's devices: signed in, it can't approve, so it says where to.
+  const visitor = await (await browser.newContext()).newPage();
+  await visitor.goto(link);
+  await expect(visitor.locator('[data-why="join"]')).toBeVisible();
+  await visitor.locator("[data-signin=github]").click();
+  await expect(visitor.locator(`[data-waiting-join="${code}"]`)).toBeVisible({ timeout: 20_000 });
+  await expect(visitor.getByRole("heading", { name: "Approve the machine on a device you use" })).toBeVisible();
+  await expect(visitor.locator("[data-control-join-link]")).toHaveText(`${base}/#join=${code}`);
+  await expect(visitor.locator("[data-waiting-also]")).toContainText("the machine joins either way");
+  const fp = (await visitor.locator("[data-fingerprint]").getAttribute("data-fingerprint"))!;
+
+  // The laptop gets one prompt with both, side by side.
+  await laptop.goto("/");
+  await expect(laptop.locator("[data-join-both]")).toBeVisible({ timeout: 20_000 });
+  await expect(laptop.locator("[data-join-machine] [data-join-code]")).toHaveText(code);
+  await expect(laptop.locator(`[data-join-alongside="${fp}"] [data-pending="${fp}"]`)).toBeVisible();
+  await expect(laptop.locator(`[data-join-also="${fp}"]`)).toBeChecked();
+  const account = await laptop.locator("[data-join-account]").getAttribute("data-join-account");
+  await expect(laptop.locator("[data-approve-join]")).toHaveText("Approve both");
+  await laptop.locator("[data-approve-join]").click();
+  joining.stdin!.end(`${account}\n`);
+  expect(await exited).toBe(0);
+  // One approval: the browser is in too, and nothing else waits.
+  await booted(visitor);
+  // Its link's code is spent: it says so rather than a bare "no such code".
+  await expect(visitor.locator(`[data-join-done="${code}"]`)).toBeVisible({ timeout: 20_000 });
+  await expect(laptop.locator("[data-pending]")).toHaveCount(0);
+  await expect(laptop.locator(".prompt")).toHaveCount(0);
+  await visitor.context().close();
 });
 
 test("sessions: where you're signed in, and signing out everywhere (#173)", async () => {

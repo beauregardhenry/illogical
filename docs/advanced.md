@@ -2,10 +2,9 @@
 
 Everything here is optional. The [quickstart](../README.md#install) gets you
 durable panes, the phone, your other machines through
-[illogical control](control.md), and agent blocks; these add VMs, web apps
-and VS Code beside your terminals, sandboxes, and iTerm2. The menus offer a
-VM or a sandbox only on a machine set up for them, and *Open a port…* and
-*Open in editor* say how to turn them on until they are.
+[illogical control](control.md), and agent blocks; these add web apps and VS
+Code beside your terminals, containers, and iTerm2. *Open a port…* and *Open
+in editor* say how to turn them on until they are.
 
 Examples call the machine that serves the page `home` and the tailnet
 `<tailnet>.ts.net`; use your own names.
@@ -13,15 +12,13 @@ Examples call the machine that serves the page `home` and the tailnet
 - [Service and logs](#service-and-logs)
 - [Pane environment](#pane-environment)
 - [Claude Code hooks](#claude-code-hooks)
-- [VM tabs and panes (wisp)](#vm-tabs-and-panes-wisp)
 - [Browser blocks on ports](#browser-blocks-on-ports)
 - [Editor blocks](#editor-blocks)
-- [Agents in a VM](#agents-in-a-vm)
 - [More machines](#more-machines)
-- [A sandbox on the tailnet](#a-sandbox-on-the-tailnet)
-- [A sandbox that can only dial out](#a-sandbox-that-can-only-dial-out)
-- [Sandboxes from a provider](#sandboxes-from-a-provider)
+- [A container on the tailnet](#a-container-on-the-tailnet)
+- [A box that can only dial out](#a-box-that-can-only-dial-out)
 - [iTerm2, as a tmux client](#iterm2-as-a-tmux-client)
+- [Labs](#labs)
 
 ## Service and logs
 
@@ -63,18 +60,42 @@ it. Flags after `--` are passed to the daemon on every start
   installed (the agent, the background agent, the LaunchDaemon with sudo,
   or on Linux the systemd user service). The binaries in `~/.local/bin`
   and the state in `~/.local/state/illogical` stay.
+- **From the desktop app:** its *Daemon* menu (in the tray, and on a Mac in
+  the app menu and the Dock icon's menu) says the daemon's version, whether
+  it's running and which service runs it (the app's own launch agent,
+  `wtf.widgets.illogical.daemon`, or what `illogicald install` set up),
+  and whether and where this machine is joined to control. *Restart*,
+  *Stop…* and *Start* go through that service, so a restart keeps the
+  panes; a stop ends them, and the daemon stays stopped until *Start* or
+  the next login (the LaunchDaemon asks for an admin password). *Open log*
+  opens the log. When a newer daemon is out it offers the daemon's own
+  update (below); the app never replaces a running daemon itself. When
+  the daemon and the app don't speak a protocol in common, it says which
+  is behind and opens the page that updates it. `illogical status` says
+  the same from a terminal.
 - **Without systemd on Linux** (a container, a box with another init): pass
   `--keep-panes` for the same behaviour.
 
 **Updates.** At most every 12 hours the daemon asks where GitHub's
 `releases/latest` redirects to (one request, with nothing about you or the
 machine in it) and keeps the answer in `update-check.json` in the state
-directory. When it's newer, the web client's top bar offers the command for
-this install (`GET /api/update` says it too). `--no-update-check`
-(`ILLOGICAL_NO_UPDATE_CHECK=true`) turns it off; a daemon run from where it
-was built (`target/`) doesn't check. The desktop app replaces an older
-daemon with the one it carries when that daemon runs as the service
-(`ILLOGICAL_NO_DAEMON_UPGRADE=1` stops it).
+directory. When it's newer, the web client's top bar offers it (`GET
+/api/update` says so too). The daemon updates itself when you ask: *Update
+now* there, or `illogicald update` in a terminal (`-y` doesn't ask). Either
+downloads this platform's archive from the release, checks it against the
+release's `SHA256SUMS`, and runs the new `illogicald install`, which keeps
+your flags and restarts the service; panes keep running. If anything fails
+before the restart, the old daemon carries on and says why (`update.log` in
+the state directory). The button is for the service `illogicald install`
+set up for you (install.sh, install.ps1 or the desktop app). Homebrew
+installs, `--system` services (they need sudo or an administrator) and
+daemons run by hand show the command instead. On macOS the desktop app's
+login item runs the daemon in the app, and an update goes to
+`~/.local/bin`, which the app's copy runs from then on, as long as it's
+newer. `--no-update-check` (`ILLOGICAL_NO_UPDATE_CHECK=true`) turns the
+check off; a daemon run from where it was built (`target/`) doesn't
+check. The desktop app never replaces a running
+daemon: the daemon it carries is for a machine that has none.
 
 State (layout, logs, checkpoints) is in `~/.local/state/illogical`, private
 to you (0700/0600). `--state-dir` moves it.
@@ -114,11 +135,11 @@ pane should have from boot (`PATH` additions, `EDITOR`), put `KEY=value`
 lines in `~/.config/environment.d/50-illogical.conf`. Panes run `$SHELL -l`,
 so your profile runs too.
 
-Blocks that run your tools for you (a chant workspace, say) don't have a
+Blocks that run your tools for you don't have a
 shell of their own, so the daemon reads your shell's environment once, as
 VS Code does: it runs `$SHELL -l -i` when it starts and keeps the `PATH`
 and variables your rc files set, so node from mise or nvm is found there as
-in a pane. On a VM it does the same once per machine, with `bash -l -i`. If
+in a pane. If
 your shell takes more than 10 seconds or fails, those blocks get the
 daemon's own environment, and the log says why. After changing an rc file,
 `illogical shell-env --refresh` reads it again (`illogical shell-env` shows
@@ -132,23 +153,6 @@ and take follow-ups from them, all through hooks in
 `~/.claude/settings.json`. The whole block, and what each part does, is in
 [the CLI's *Claude Code in a pane*](cli.md#claude-code-in-a-pane). Outside
 an illogical pane the hooks do nothing, so they're safe everywhere.
-
-## VM tabs and panes (wisp)
-
-*New VM tab* and *New VM pane* give a tab or a pane its own throwaway
-Firecracker microVM, for agents and untrusted builds. They need wisp
-(`wispd`, a separate sandbox daemon that isn't published yet) running on
-the same Linux host, and its API token:
-
-```
-illogicald install -- --wisp-url http://127.0.0.1:7788 --wisp-token-file ~/.local/share/wisp/token
-```
-
-Those are the defaults, so with wispd installed the usual way, nothing is
-needed. Without the token, VM panes are off and the menus don't offer them
-(nor *Sandboxes…*).
-The base image is plain Ubuntu 24.04; install what you need in it (Claude
-Code: `curl -fsSL https://claude.ai/install.sh | bash`).
 
 ## Browser blocks on ports
 
@@ -206,8 +210,7 @@ them on.
   an editor opens (about 230 MB) into `$XDG_CACHE_HOME/illogical/code-server`
   and checked against its SHA-256. `--code-server PATH` runs another one
   instead (a recent one: illogical passes `--idle-timeout-seconds` and
-  `--socket-mode`). In a VM the same
-  release is downloaded inside the VM.
+  `--socket-mode`).
 - **Where things are:** settings, extensions and VS Code's state in
   `<state>/editor/` (`user/User/settings.json` is yours after the first
   start), its log in `<state>/editor/code-server.log`, its socket beside
@@ -216,17 +219,6 @@ them on.
 - **Stopping:** `--editor-idle SECONDS` (default 900, at least 60) after the
   last window closes. It runs in a scope of its own, so restarting the daemon
   leaves it, and open windows reconnect.
-
-## Agents in a VM
-
-`illogical agent --vm` (or the dialog's checkbox) runs the agent server on
-a VM; its first start installs Node and the adapter there. Claude Code
-there needs credentials: a token from `claude setup-token` in
-`~/.config/illogical/claude-oauth-token`, or an API key in
-`~/.config/illogical/anthropic-key` (used first). `--claude-token-file` and
-`--anthropic-key-file` move them. They reach the agent on its stdin, into
-its environment only: never the VM's disk, a URL, an argv, the log or the
-layout.
 
 ## More machines
 
@@ -249,18 +241,18 @@ The CLI still reaches only the daemon on its own machine, or one on the
 tailnet with `illogical --host NAME …` once that daemon's list has it
 (`illogical hosts add NAME https://NAME.<tailnet>.ts.net`).
 
-## A sandbox on the tailnet
+## A container on the tailnet
 
-A container or VM without systemd can run the static Linux binaries from a
+A container or box without systemd can run the static Linux binaries from a
 release. Copy `illogicald` and `illogical` into it, then:
 
 ```
 illogical hosts invite                                  # on home: prints a token
 illogical install --tailnet file:KEYFILE \
-  --home https://home.<tailnet>.ts.net --join TOKEN     # in the sandbox
+  --home https://home.<tailnet>.ts.net --join TOKEN     # in the container
 ```
 
-The key is an ephemeral, tagged Tailscale auth key (e.g. `tag:sandbox`), in
+The key is an ephemeral, tagged Tailscale auth key (e.g. `tag:container`), in
 a file (or `-` for stdin; never on a command line). This downloads
 tailscaled if it isn't there, runs it in userspace mode with its own state
 in `~/.local/state/illogical-sandbox`, joins, puts the daemon behind
@@ -269,31 +261,21 @@ sandbox` keeps tailscaled and the daemon running; after a reboot, run
 `illogicald sandbox &` again. Without `--join` it prints the `illogical
 hosts add` line to run on home.
 
-## A sandbox that can only dial out
+## A box that can only dial out
 
-For a sandbox that allows nothing in but outbound HTTPS. On home,
-`illogical hosts token sbx` (or `hosts invite`); in the sandbox:
+For a box that allows nothing in but outbound HTTPS. On home,
+`illogical hosts token sbx` (or `hosts invite`); on the box:
 
 ```
 illogicald --peer wss://home.<tailnet>.ts.net --token ~/.config/illogical/host-token \
   [--join INVITE] [--sync [--sync-live]] &
 ```
 
-The home daemon must be reachable at that URL from the sandbox and accept
-its name as a Host (`--public-host`). The home daemon lists the sandbox and
+The home daemon must be reachable at that URL from the box and accept
+its name as a Host (`--public-host`). The home daemon lists the box and
 answers for it at `/h/sbx/…`, so the host switcher and `illogical --host
 sbx` work as for any host. `--sync` pushes closed panes' history to the
 home daemon, encrypted at rest there; `--sync-live` pushes open ones too.
-
-## Sandboxes from a provider
-
-With a sandbox provider configured (wisp sprites; Fly's Sprites API fits
-the same adapter), *Sandboxes…* lists them, *Shell* opens a disposable
-shell on one with nothing installed, and *Make resident* (`illogical
-sandboxes promote NAME`) copies the static daemon in and runs it as a
-service there. The home daemon looks for the static binaries in
-`--static-dir` (default `~/.local/share/illogical/static`); put a
-release's Linux x86_64 binaries there.
 
 ## iTerm2, as a tmux client
 
@@ -329,3 +311,30 @@ your `PATH`, where it would hide the real tmux.
 
 A manual test script, and how to record the conversation, are in
 [development.md](development.md#testing-iterm2).
+
+## Labs
+
+A file named `labs` in a machine's state directory turns on what a new
+install doesn't show: chat and threads, huddles, Fountain, studio apps,
+chant workspaces, VM tabs and sandboxes, ssh invites for guests, the swarm's
+city, hive and timeline views, and the matching tools, commands and options
+of `illogical mcp`, `illogical --help` and `illogicald --help`. They all keep
+working without it; they just aren't offered.
+
+```
+touch ~/.local/state/illogical/labs
+```
+
+The state directory is `$ILLOGICAL_STATE_DIR` if set, else
+`$XDG_STATE_HOME/illogical`, else `~/.local/state/illogical`; on Windows,
+`%LOCALAPPDATA%\illogical\state`. The file can be empty. Delete it to turn
+labs off again.
+
+- **Per machine.** It's read by the machine that serves the page, so every
+  machine you want them on needs its own. Someone you share a session with
+  sees chat and huddles on your machine if it has labs, and not otherwise.
+- **No restart.** The daemon looks for the file whenever it's asked; reload the
+  page to see the change.
+- **Each feature still needs its own setup.** Fountain needs a login, studio a
+  link, VMs a sandbox provider, guest ssh its listener; labs only stops
+  them from being hidden.
